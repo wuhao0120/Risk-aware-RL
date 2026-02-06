@@ -1,0 +1,13 @@
+{
+  "algo_name": "QPO",
+  "seed": 0,
+  "mean_return": 9.006294569663622,
+  "quantile_return": 6.295464416335661,
+  "learned_risk": -0.7889004945755005,
+  "q_alpha": 0.25,
+  "quantile_threshold": null,
+  "density_estimate": true,
+  "h_n": 0.01,
+  "nu": null,
+  "timestamp": "20251202-124532"
+}
