@@ -373,7 +373,7 @@ class DQCAC(object):
         while len(self.replay_buffer) < self.min_buffer_size:
             state = self._reset_env()
             episode_return = 0
-            disc_factor = 0.99
+            disc_factor = 1.0
 
             while True:
                 state_flat = state.flatten()
@@ -469,11 +469,11 @@ class DQCAC(object):
                     # ==================== 3. 外层更新 (λ) ====================
                     if update_counter % self.outer_interval == 0:
                         self._update_dual()
+                        self.lambda_scheduler.step()
 
                     # 学习率调度
                     self.actor_scheduler.step()
                     self.q_scheduler.step()
-                    self.lambda_scheduler.step()
 
             # ==================== 4. 日志记录 ====================
             density_est = self.estimate_density()
