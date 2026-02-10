@@ -146,7 +146,7 @@ class DistributionalCritic(nn.Module):
         layers = []
         prev_dim = input_dim
         for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.Linear(prev_dim, hidden_dim)) # nn.Linear默认bias=True
             layers.append(nn.ReLU())
             prev_dim = hidden_dim
 
@@ -164,7 +164,7 @@ class DistributionalCritic(nn.Module):
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight, gain=1.0)
                 if module.bias is not None:
-                    module.bias.data.fill_(0.0)
+                    nn.init.constant_(module.bias, 0.0)
 
     def forward(self, state, action):
         """
@@ -178,7 +178,7 @@ class DistributionalCritic(nn.Module):
         - quantiles: [batch_size, num_quantiles], M 个分位数估计
         """
         # 拼接状态和动作
-        x = torch.cat([state, action], dim=-1)
+        x = torch.cat([state, action], dim=-1) # dim=-1表示在最后一个维度上拼接
         return self.network(x)
 
 
@@ -364,7 +364,7 @@ class DQCAC(object):
         """
         [函数简介]: 预热阶段，收集初始数据并估计初始分位数
 
-        运行随机策略填充 Replay Buffer 并估计初始 Q
+        运行初始化策略填充 Replay Buffer 并估计初始 Q
         """
         print("DQC-AC: Starting warmup...")
 
@@ -373,6 +373,7 @@ class DQCAC(object):
         while len(self.replay_buffer) < self.min_buffer_size:
             state = self._reset_env()
             episode_return = 0
+            disc_factor = 0.99
 
             while True:
                 state_flat = state.flatten()
@@ -384,7 +385,9 @@ class DQCAC(object):
                     state_flat, action, reward, next_state.flatten(), float(done)
                 )
 
-                episode_return += reward
+                # 使用折扣回报初始化分位数估计, 与训练阶段的gamma设定保持一致
+                episode_return += disc_factor * reward
+                disc_factor *= self.gamma
                 state = next_state
 
                 if done:
@@ -404,7 +407,7 @@ class DQCAC(object):
                 self.q_est_upper.fill_(q_high)
 
         print(f"DQC-AC: Warmup done. Buffer size: {len(self.replay_buffer)}")
-
+ 
     # ==================================================== 主训练循环 ====================================================
     def train(self):
         """
