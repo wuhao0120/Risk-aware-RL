@@ -196,9 +196,11 @@ class QCPO(object):
         for i_episode in range(self.max_episode + 1):
             # 采样轨迹
             disc_epi_reward, disc_factor, state = 0, 1, self._reset_env()
+            episode_reward = 0
             while True:
                 action = self.choose_action(state)
                 state, reward, done, _ = self._step_env(action)
+                episode_reward += reward
                 disc_epi_reward += disc_factor * reward
                 disc_factor *= self.gamma
                 self.memory.rewards.append(reward)
@@ -222,7 +224,8 @@ class QCPO(object):
             disc_epi_rewards.append(disc_epi_reward)
 
             log_dict = {
-                'disc_reward/raw_reward': disc_epi_reward,
+                'disc_reward/raw_reward': episode_reward,
+                'disc_reward/discounted_reward': disc_epi_reward,
                 'lambda/value': self.lambda_dual.item(),
                 'action/avg_risk_episode': avg_risk_episode
             }

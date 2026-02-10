@@ -330,7 +330,7 @@ class DQCAC(object):
         self.crossing_history = deque(maxlen=max(100, self.log_interval))
 
         # ==================================================== 训练计数器 ====================================================
-        self.learning_steps = 0                        # 累计更新次数
+        self.learning_steps = 0                        # 累计更新次数，用来控制target网络的更新
         self.target_update_interval = getattr(args, 'target_update_interval', 100)  # target 更新间隔
 
         # ==================================================== Wandb日志初始化 ====================================================
@@ -423,8 +423,8 @@ class DQCAC(object):
             3. 每 outer_interval 更新 λ
         """
         disc_epi_rewards = []
-        total_steps = 0
-        update_counter = 0
+        total_steps = 0     # 累计环境交互次数，transition次数
+        update_counter = 0  # 内层累计更新次数，用来控制lambda的更新
 
         for i_episode in range(self.max_episode + 1):
             # ==================== 1. 收集 Episode ====================
@@ -482,13 +482,17 @@ class DQCAC(object):
             crossing_rate = sum(self.crossing_history) / len(self.crossing_history)
 
             wandb.log({
-                'disc_reward/raw_reward': disc_epi_reward,
+                # raw_reward记录未折扣的回合总回报, discounted_reward记录折扣回报
+                'disc_reward/raw_reward': episode_reward,
+                'disc_reward/discounted_reward': disc_epi_reward,
                 'lambda/value': self.lambda_dual.item(),
                 'action/avg_risk_episode': avg_risk_episode,
                 'density/estimate': density_est.item(),
                 'quantile/crossing_rate': crossing_rate,
                 'buffer/size': len(self.replay_buffer),
                 'training/total_steps': total_steps,
+                'training/episode_steps': episode_steps,
+                'training/learning_steps': self.learning_steps,
             }, step=i_episode)
 
             # ==================== 5. 定期详细日志 ====================
