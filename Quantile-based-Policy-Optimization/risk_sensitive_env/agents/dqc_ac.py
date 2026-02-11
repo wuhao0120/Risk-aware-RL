@@ -23,7 +23,6 @@ import numpy as np                                     # 数值计算库
 import torch                                           # PyTorch深度学习框架
 import torch.nn as nn                                  # 神经网络模块
 import torch.nn.functional as F                        # 函数式API
-from torch.distributions import MultivariateNormal    # 多元正态分布
 from torch.optim import Adam                           # Adam优化器
 import wandb                                           # Weights & Biases日志系统
 from torch.optim.lr_scheduler import LambdaLR         # 学习率调度器
@@ -51,7 +50,8 @@ def indicator(threshold, values: torch.Tensor):
     [输入]: threshold(标量或张量), values(张量)
     [输出]: 与values形状相同的张量, values<=threshold的位置是1, 否则是0
     """
-    return torch.where(values <= threshold, torch.ones_like(values), torch.zeros_like(values))
+    # 用布尔比较后直接转float，减少额外中间张量分配
+    return (values <= threshold).to(values.dtype)
 
 
 # ==================================================== Replay Buffer ====================================================
@@ -102,12 +102,13 @@ class ReplayBuffer:
 
         states, actions, rewards, next_states, dones = zip(*batch)
 
+        # as_tensor + asarray 组合能在可能时复用底层内存，减少不必要拷贝
         return {
-            'states': torch.FloatTensor(np.array(states)).to(self.device),
-            'actions': torch.FloatTensor(np.array(actions)).to(self.device),
-            'rewards': torch.FloatTensor(np.array(rewards)).to(self.device),
-            'next_states': torch.FloatTensor(np.array(next_states)).to(self.device),
-            'dones': torch.FloatTensor(np.array(dones)).to(self.device),
+            'states': torch.as_tensor(np.asarray(states), dtype=torch.float32, device=self.device),
+            'actions': torch.as_tensor(np.asarray(actions), dtype=torch.float32, device=self.device),
+            'rewards': torch.as_tensor(np.asarray(rewards), dtype=torch.float32, device=self.device),
+            'next_states': torch.as_tensor(np.asarray(next_states), dtype=torch.float32, device=self.device),
+            'dones': torch.as_tensor(np.asarray(dones), dtype=torch.float32, device=self.device),
         }
 
     def __len__(self):
@@ -257,6 +258,7 @@ class DQCAC(object):
         action_dim = int(np.prod(self.env.action_space.shape))
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self._log_2pi = float(np.log(2.0 * np.pi))     # 高斯log_prob常量项，避免重复计算
 
         # ==================================================== Actor网络 ====================================================
         self.actor = Actor(state_dim, action_dim, args.init_std).to(self.device)
@@ -376,13 +378,13 @@ class DQCAC(object):
             disc_factor = 1.0
 
             while True:
-                state_flat = state.flatten()
+                state_flat = state.reshape(-1)
                 action = self.choose_action(state_flat, store_memory=False)
                 next_state, reward, done, _ = self._step_env(action)
 
                 # 存入 Replay Buffer
                 self.replay_buffer.push(
-                    state_flat, action, reward, next_state.flatten(), float(done)
+                    state_flat, action, reward, next_state.reshape(-1), float(done)
                 )
 
                 # 使用折扣回报初始化分位数估计, 与训练阶段的gamma设定保持一致
@@ -435,13 +437,13 @@ class DQCAC(object):
             episode_steps = 0
 
             while True:
-                state_flat = state.flatten()
+                state_flat = state.reshape(-1)
                 action = self.choose_action(state_flat, store_memory=False)
                 next_state, reward, done, _ = self._step_env(action)
 
                 # 存入 Replay Buffer
                 self.replay_buffer.push(
-                    state_flat, action, reward, next_state.flatten(), float(done)
+                    state_flat, action, reward, next_state.reshape(-1), float(done)
                 )
 
                 episode_reward += reward
@@ -543,7 +545,7 @@ class DQCAC(object):
         # ==================== 1. Critic Update (Distributional TD) ====================
         # Line 11: Sample next action a' ~ π(·|s'; θ_k)
         with torch.no_grad():
-            next_actions = self._sample_actions(next_states)
+            next_actions = self._sample_actions(next_states) # 动作定义为一个连续action_dim维向量，只不过强制从one-hot向量中取值
             # next_actions: [B, action_dim]
 
             # Line 12: Compute distributional targets y_j = r + γ·ψ_j(s', a'; ω_k)
@@ -551,23 +553,23 @@ class DQCAC(object):
             # next_quantiles: [B, M]
 
             # TD targets: y_j = r + γ·ψ_j(s', a') · (1 - done)
-            td_targets = rewards.unsqueeze(1) + self.gamma * next_quantiles * (1 - dones.unsqueeze(1))
+            td_targets = rewards.unsqueeze(1) + self.gamma * next_quantiles * (1 - dones.unsqueeze(1)) # done=1的样本为终止状态，没有next_state，done=0的样本计算它的TD target
             # td_targets: [B, M]
 
         # Line 13: Quantile Huber Loss
         current_quantiles = self.online_critic(states, actions)
         # current_quantiles: [B, M]
 
-        critic_loss = self._compute_quantile_huber_loss(current_quantiles, td_targets)
+        critic_loss = self._compute_quantile_huber_loss(current_quantiles, td_targets) # 做online_critic的监督更新，让online_critic拟合td_target
 
-        self.critic_optimizer.zero_grad()
+        self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_optimizer.step()
 
         # ==================== 2. Global Quantile Estimate Update (公式25) ====================
         # Q_{k+1} ← Q_k + (1/N) Σ_j β_k (α - I{r + γ·ψ_j(s',a') ≤ Q_k})
         # 使用所有 M 个 TD targets 进行更新，而非只用均值
-        self._update_global_quantiles(td_targets.detach())
+        self._update_global_quantiles(td_targets.detach()) # 使用当前batch的td_targets更新三个全局分位数估计
 
         # ==================== 3. Actor Update (公式24) ====================
         # D̃ = (1/N) Σ_j [(y_j - λ·I{y_j≤Q}/f̂_Z)] · ∇θ log π(a|s)
@@ -611,10 +613,11 @@ class DQCAC(object):
 
         # ==================================================== Huber Loss ====================================================
         # L_κ(u) = 0.5u² if |u| <= κ else κ(|u| - 0.5κ)
+        abs_td_errors = td_errors.abs()
         huber_loss = torch.where(
-            td_errors.abs() <= self.huber_kappa,
+            abs_td_errors <= self.huber_kappa,
             0.5 * td_errors ** 2,
-            self.huber_kappa * (td_errors.abs() - 0.5 * self.huber_kappa)
+            self.huber_kappa * (abs_td_errors - 0.5 * self.huber_kappa)
         )
         # huber_loss: [B, M, M]
 
@@ -624,7 +627,7 @@ class DQCAC(object):
         # 权重 |τ_i - I{u < 0}|
         taus = self.quantile_taus.view(1, M, 1)            # [1, M, 1]
         quantile_weight = torch.abs(
-            taus - (td_errors.detach() < 0).float()
+            taus - (td_errors.detach() < 0).to(td_errors.dtype)
         )  # [B, M, M]
 
         # ==================================================== 计算 loss ====================================================
@@ -654,7 +657,7 @@ class DQCAC(object):
         # 展平所有 TD targets: [B, M] -> [B*M]
         all_targets = td_targets.flatten()
 
-        self.q_optimizer.zero_grad()
+        self.q_optimizer.zero_grad(set_to_none=True)
 
         # Q(α-δ) 梯度: -(α-δ) + E[I{y ≤ Q(α-δ)}]
         ind_lower = indicator(self.q_est_lower.detach(), all_targets)
@@ -705,9 +708,7 @@ class DQCAC(object):
         # I{y_j ≤ Q(α)} for all TD targets
         # td_targets: [B, M]
         # 先展平计算，再 reshape 回来
-        all_targets_flat = td_targets.flatten()  # [B*M]
-        indicators_flat = indicator(self.q_est.detach(), all_targets_flat)  # [B*M]
-        indicators = indicators_flat.view(td_targets.shape[0], td_targets.shape[1])  # [B, M]
+        indicators = (td_targets <= self.q_est.detach()).to(td_targets.dtype)  # [B, M]
 
         # ==================================================== 计算约束项 ====================================================
         # 约束项: λ · I{y_j ≤ Q(α)} / f̂_Z
@@ -726,7 +727,7 @@ class DQCAC(object):
         actor_loss = -(log_probs * gradient_weights.detach()).mean()
         # .detach() 确保梯度不回传到 Critic 和 Q
 
-        self.actor_optimizer.zero_grad()
+        self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         self.actor_optimizer.step()
 
@@ -739,7 +740,7 @@ class DQCAC(object):
 
         其中 q 是约束阈值，ϕ 是投影到 [0, ∞)
         """
-        self.lambda_optimizer.zero_grad()
+        self.lambda_optimizer.zero_grad(set_to_none=True)
 
         # Dual loss: λ · (Q - C)
         dual_loss = self.lambda_dual * (self.q_est.detach() - self.quantile_threshold)
@@ -759,17 +760,13 @@ class DQCAC(object):
         [输入]: states [B, state_dim]
         [输出]: actions [B, action_dim]
         """
-        means = self.actor(states)
-        var = torch.diag(torch.exp(2 * self.actor.log_std)).to(self.device)
+        means = self.actor(states)                                  # [B, action_dim]
+        std = torch.exp(self.actor.log_std).unsqueeze(0)           # [1, action_dim]
+        std = std.expand_as(means)                                 # [B, action_dim]
 
-        # 批量采样
-        B = states.shape[0]
-        actions = []
-        for i in range(B):
-            dist = MultivariateNormal(means[i], var)
-            actions.append(dist.sample())
-
-        return torch.stack(actions)
+        # 对角协方差高斯分布可直接重参数化采样，避免逐样本构建分布对象
+        noise = torch.randn_like(means)
+        return means + noise * std
 
     def _compute_log_probs(self, states, actions):
         """
@@ -778,26 +775,27 @@ class DQCAC(object):
         [输入]: states [B, state_dim], actions [B, action_dim]
         [输出]: log_probs [B]
         """
-        means = self.actor(states)
-        var = torch.diag(torch.exp(2 * self.actor.log_std)).to(self.device)
+        means = self.actor(states)                                 # [B, action_dim]
+        std = torch.exp(self.actor.log_std).unsqueeze(0)           # [1, action_dim]
+        std = std.expand_as(means)                                 # [B, action_dim]
+        var = std.pow(2)                                           # [B, action_dim]
 
-        B = states.shape[0]
-        log_probs = []
-        for i in range(B):
-            dist = MultivariateNormal(means[i], var)
-            log_probs.append(dist.log_prob(actions[i]))
-
-        return torch.stack(log_probs)
+        # 对角高斯分布 log_prob 按维求和:
+        # log N(a|μ,σ²) = -0.5 * [((a-μ)^2 / σ²) + 2logσ + log(2π)]
+        log_probs_per_dim = -0.5 * (
+            ((actions - means) ** 2) / var + 2.0 * torch.log(std) + self._log_2pi
+        )
+        return log_probs_per_dim.sum(dim=-1)                       # [B]
 
     def _soft_update_target(self):
         """Target 网络软更新"""
-        for target_param, online_param in zip(
-            self.target_critic.parameters(),
-            self.online_critic.parameters()
-        ):
-            target_param.data.copy_(
-                (1.0 - self.tau) * target_param.data + self.tau * online_param.data
-            )
+        with torch.no_grad():
+            for target_param, online_param in zip(
+                self.target_critic.parameters(),
+                self.online_critic.parameters()
+            ):
+                # lerp_ 等价于 target = (1-tau)*target + tau*online，原地更新更轻量
+                target_param.data.lerp_(online_param.data, self.tau)
 
     def estimate_density(self):
         """
@@ -817,12 +815,13 @@ class DQCAC(object):
         [输入]: state (np.ndarray)
         [输出]: action (np.ndarray)
         """
-        state_tensor = torch.from_numpy(state).float().to(self.device)
-        mean = self.actor(state_tensor)
-        var = torch.diag(torch.exp(2 * self.actor.log_std)).to(self.device)
-        dist = MultivariateNormal(mean, var)
-        action = dist.sample()
-        return action.detach().cpu().numpy()
+        # 环境交互阶段不需要构建反向图，避免额外显存与计算开销
+        with torch.no_grad():
+            state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+            mean = self.actor(state_tensor)
+            std = torch.exp(self.actor.log_std)
+            action = mean + torch.randn_like(mean) * std
+        return action.cpu().numpy()
 
     def select_action(self, state):
         """评估时使用"""
