@@ -1,0 +1,209 @@
+[34m[1mwandb[0m: Detected [agents] in use.
+[34m[1mwandb[0m: Use W&B Weave for improved LLM call tracing. Install Weave with `pip install weave` then add `import weave` to the top of your script.
+[34m[1mwandb[0m: For more information, check out the docs at: https://weave-docs.wandb.ai/
+DQC-AC: Starting warmup...
+DQC-AC: Warmup done. Buffer size: 1000
+DQC-AC (TD): Initialized with α=0.25, δ=0.01
+DQC-AC (TD): Distributional Critic with M=32 quantiles
+DQC-AC (TD): Constraint Q >= 4
+DQC-AC (TD): Initial Q estimates: 4.660, 5.245, 5.430
+Epi:00100 || disc_a_r:8.570 disc_q_r:3.345 λ:0.1875
+Epi:00100 || Q_low:0.392 Q_mid:0.419 Q_high:0.444 density:0.3865
+Epi:00200 || disc_a_r:10.425 disc_q_r:5.274 λ:0.3942
+Epi:00200 || Q_low:0.402 Q_mid:0.427 Q_high:0.449 density:0.4202
+Epi:00300 || disc_a_r:11.580 disc_q_r:3.490 λ:0.5830
+Epi:00300 || Q_low:0.399 Q_mid:0.426 Q_high:0.449 density:0.3953
+Epi:00400 || disc_a_r:9.206 disc_q_r:3.611 λ:0.7653
+Epi:00400 || Q_low:0.442 Q_mid:0.466 Q_high:0.488 density:0.4316
+Epi:00500 || disc_a_r:9.796 disc_q_r:4.587 λ:0.9429
+Epi:00500 || Q_low:0.451 Q_mid:0.475 Q_high:0.497 density:0.4421
+Epi:00600 || disc_a_r:9.859 disc_q_r:4.356 λ:1.1174
+Epi:00600 || Q_low:0.433 Q_mid:0.458 Q_high:0.484 density:0.3952
+Epi:00700 || disc_a_r:10.993 disc_q_r:2.520 λ:1.2889
+Epi:00700 || Q_low:0.428 Q_mid:0.456 Q_high:0.481 density:0.3745
+Epi:00800 || disc_a_r:8.495 disc_q_r:1.383 λ:1.4585
+Epi:00800 || Q_low:0.402 Q_mid:0.434 Q_high:0.461 density:0.3363
+Epi:00900 || disc_a_r:9.604 disc_q_r:3.937 λ:1.6258
+Epi:00900 || Q_low:0.424 Q_mid:0.454 Q_high:0.485 density:0.3328
+Epi:01000 || disc_a_r:8.775 disc_q_r:3.692 λ:1.7908
+Epi:01000 || Q_low:0.416 Q_mid:0.448 Q_high:0.481 density:0.3078
+Epi:01100 || disc_a_r:9.175 disc_q_r:4.557 λ:1.9532
+Epi:01100 || Q_low:0.488 Q_mid:0.525 Q_high:0.559 density:0.2810
+Epi:01200 || disc_a_r:7.611 disc_q_r:0.765 λ:2.1131
+Epi:01200 || Q_low:0.481 Q_mid:0.511 Q_high:0.536 density:0.3639
+Epi:01300 || disc_a_r:9.260 disc_q_r:1.597 λ:2.2710
+Epi:01300 || Q_low:0.492 Q_mid:0.532 Q_high:0.564 density:0.2746
+Epi:01400 || disc_a_r:7.488 disc_q_r:-0.182 λ:2.4268
+Epi:01400 || Q_low:0.508 Q_mid:0.544 Q_high:0.569 density:0.3259
+Epi:01500 || disc_a_r:6.840 disc_q_r:-1.722 λ:2.5809
+Epi:01500 || Q_low:0.500 Q_mid:0.538 Q_high:0.567 density:0.2960
+Epi:01600 || disc_a_r:5.937 disc_q_r:-3.374 λ:2.7333
+Epi:01600 || Q_low:0.462 Q_mid:0.504 Q_high:0.540 density:0.2597
+Epi:01700 || disc_a_r:6.672 disc_q_r:-2.822 λ:2.8850
+Epi:01700 || Q_low:0.466 Q_mid:0.502 Q_high:0.531 density:0.3078
+Epi:01800 || disc_a_r:3.110 disc_q_r:-7.188 λ:3.0359
+Epi:01800 || Q_low:0.444 Q_mid:0.481 Q_high:0.515 density:0.2835
+Epi:01900 || disc_a_r:5.220 disc_q_r:-10.056 λ:3.1868
+Epi:01900 || Q_low:0.387 Q_mid:0.424 Q_high:0.461 density:0.2681
+Epi:02000 || disc_a_r:-2.265 disc_q_r:-17.295 λ:3.3379
+Epi:02000 || Q_low:0.348 Q_mid:0.388 Q_high:0.425 density:0.2604
+Epi:02100 || disc_a_r:3.535 disc_q_r:-6.995 λ:3.4902
+Epi:02100 || Q_low:0.293 Q_mid:0.329 Q_high:0.355 density:0.3260
+Epi:02200 || disc_a_r:1.246 disc_q_r:-13.809 λ:3.6429
+Epi:02200 || Q_low:0.212 Q_mid:0.255 Q_high:0.296 density:0.2369
+Epi:02300 || disc_a_r:-1.319 disc_q_r:-17.375 λ:3.7972
+Epi:02300 || Q_low:0.112 Q_mid:0.160 Q_high:0.206 density:0.2137
+Epi:02400 || disc_a_r:0.826 disc_q_r:-16.100 λ:3.9530
+Epi:02400 || Q_low:-0.007 Q_mid:0.051 Q_high:0.103 density:0.1810
+Epi:02500 || disc_a_r:-6.220 disc_q_r:-25.084 λ:4.1109
+Epi:02500 || Q_low:-0.181 Q_mid:-0.131 Q_high:-0.082 density:0.2032
+Epi:02600 || disc_a_r:-0.825 disc_q_r:-20.106 λ:4.2703
+Epi:02600 || Q_low:-0.297 Q_mid:-0.238 Q_high:-0.187 density:0.1817
+Epi:02700 || disc_a_r:-2.466 disc_q_r:-23.451 λ:4.4321
+Epi:02700 || Q_low:-0.462 Q_mid:-0.402 Q_high:-0.348 density:0.1750
+Epi:02800 || disc_a_r:-6.489 disc_q_r:-34.508 λ:4.5961
+Epi:02800 || Q_low:-0.648 Q_mid:-0.584 Q_high:-0.523 density:0.1600
+Epi:02900 || disc_a_r:-15.583 disc_q_r:-44.220 λ:4.7621
+Epi:02900 || Q_low:-0.895 Q_mid:-0.828 Q_high:-0.762 density:0.1499
+Epi:03000 || disc_a_r:-12.687 disc_q_r:-44.421 λ:4.9303
+Epi:03000 || Q_low:-1.115 Q_mid:-1.045 Q_high:-0.983 density:0.1517
+Epi:03100 || disc_a_r:-11.617 disc_q_r:-44.838 λ:5.1001
+Epi:03100 || Q_low:-1.341 Q_mid:-1.272 Q_high:-1.201 density:0.1431
+Epi:03200 || disc_a_r:-10.690 disc_q_r:-38.840 λ:5.2720
+Epi:03200 || Q_low:-1.660 Q_mid:-1.582 Q_high:-1.505 density:0.1289
+Epi:03300 || disc_a_r:-7.743 disc_q_r:-32.596 λ:5.4447
+Epi:03300 || Q_low:-1.937 Q_mid:-1.859 Q_high:-1.780 density:0.1273
+Epi:03400 || disc_a_r:-19.017 disc_q_r:-50.264 λ:5.6181
+Epi:03400 || Q_low:-2.232 Q_mid:-2.145 Q_high:-2.064 density:0.1188
+Epi:03500 || disc_a_r:-23.152 disc_q_r:-51.398 λ:5.7928
+Epi:03500 || Q_low:-2.563 Q_mid:-2.463 Q_high:-2.364 density:0.1006
+Epi:03600 || disc_a_r:-21.018 disc_q_r:-52.250 λ:5.9677
+Epi:03600 || Q_low:-2.861 Q_mid:-2.763 Q_high:-2.670 density:0.1044
+Epi:03700 || disc_a_r:-13.187 disc_q_r:-49.852 λ:6.1430
+Epi:03700 || Q_low:-3.211 Q_mid:-3.107 Q_high:-3.008 density:0.0989
+Epi:03800 || disc_a_r:-19.436 disc_q_r:-54.007 λ:6.3177
+Epi:03800 || Q_low:-3.609 Q_mid:-3.499 Q_high:-3.394 density:0.0926
+Epi:03900 || disc_a_r:-17.115 disc_q_r:-55.052 λ:6.4926
+Epi:03900 || Q_low:-3.926 Q_mid:-3.816 Q_high:-3.704 density:0.0901
+Epi:04000 || disc_a_r:-32.016 disc_q_r:-71.691 λ:6.6661
+Epi:04000 || Q_low:-4.293 Q_mid:-4.173 Q_high:-4.060 density:0.0858
+Epi:04100 || disc_a_r:-29.667 disc_q_r:-72.140 λ:6.8385
+Epi:04100 || Q_low:-4.696 Q_mid:-4.571 Q_high:-4.455 density:0.0831
+Epi:04200 || disc_a_r:-25.245 disc_q_r:-65.198 λ:7.0103
+Epi:04200 || Q_low:-5.079 Q_mid:-4.955 Q_high:-4.833 density:0.0811
+Epi:04300 || disc_a_r:-23.809 disc_q_r:-60.010 λ:7.1805
+Epi:04300 || Q_low:-5.496 Q_mid:-5.369 Q_high:-5.241 density:0.0783
+Epi:04400 || disc_a_r:-33.169 disc_q_r:-64.346 λ:7.3493
+Epi:04400 || Q_low:-5.920 Q_mid:-5.787 Q_high:-5.658 density:0.0765
+Epi:04500 || disc_a_r:-28.642 disc_q_r:-67.629 λ:7.5174
+Epi:04500 || Q_low:-6.339 Q_mid:-6.206 Q_high:-6.075 density:0.0757
+Epi:04600 || disc_a_r:-29.941 disc_q_r:-70.908 λ:7.6841
+Epi:04600 || Q_low:-6.730 Q_mid:-6.596 Q_high:-6.458 density:0.0735
+Epi:04700 || disc_a_r:-23.893 disc_q_r:-71.745 λ:7.8486
+Epi:04700 || Q_low:-7.214 Q_mid:-7.070 Q_high:-6.932 density:0.0709
+Epi:04800 || disc_a_r:-37.687 disc_q_r:-68.965 λ:8.0118
+Epi:04800 || Q_low:-7.630 Q_mid:-7.488 Q_high:-7.349 density:0.0710
+Epi:04900 || disc_a_r:-41.275 disc_q_r:-76.630 λ:8.1736
+Epi:04900 || Q_low:-8.060 Q_mid:-7.908 Q_high:-7.762 density:0.0670
+Epi:05000 || disc_a_r:-40.616 disc_q_r:-78.677 λ:8.3336
+Epi:05000 || Q_low:-8.460 Q_mid:-8.304 Q_high:-8.158 density:0.0662
+Epi:05100 || disc_a_r:-48.553 disc_q_r:-99.608 λ:8.4927
+Epi:05100 || Q_low:-9.006 Q_mid:-8.851 Q_high:-8.700 density:0.0654
+Epi:05200 || disc_a_r:-41.958 disc_q_r:-89.384 λ:8.6503
+Epi:05200 || Q_low:-9.443 Q_mid:-9.280 Q_high:-9.125 density:0.0628
+Epi:05300 || disc_a_r:-48.881 disc_q_r:-92.288 λ:8.8058
+Epi:05300 || Q_low:-9.919 Q_mid:-9.757 Q_high:-9.597 density:0.0622
+Epi:05400 || disc_a_r:-49.210 disc_q_r:-96.265 λ:8.9601
+Epi:05400 || Q_low:-10.335 Q_mid:-10.175 Q_high:-10.012 density:0.0620
+Epi:05500 || disc_a_r:-36.232 disc_q_r:-84.786 λ:9.1132
+Epi:05500 || Q_low:-10.906 Q_mid:-10.731 Q_high:-10.560 density:0.0578
+Epi:05600 || disc_a_r:-38.974 disc_q_r:-72.069 λ:9.2647
+Epi:05600 || Q_low:-11.373 Q_mid:-11.198 Q_high:-11.024 density:0.0572
+Epi:05700 || disc_a_r:-49.538 disc_q_r:-84.331 λ:9.4145
+Epi:05700 || Q_low:-11.840 Q_mid:-11.654 Q_high:-11.474 density:0.0547
+Epi:05800 || disc_a_r:-49.472 disc_q_r:-98.828 λ:9.5628
+Epi:05800 || Q_low:-12.337 Q_mid:-12.146 Q_high:-11.962 density:0.0534
+Epi:05900 || disc_a_r:-51.775 disc_q_r:-100.984 λ:9.7096
+Epi:05900 || Q_low:-12.816 Q_mid:-12.622 Q_high:-12.433 density:0.0521
+Epi:06000 || disc_a_r:-51.880 disc_q_r:-116.554 λ:9.8552
+Epi:06000 || Q_low:-13.292 Q_mid:-13.094 Q_high:-12.904 density:0.0515
+Epi:06100 || disc_a_r:-59.336 disc_q_r:-118.223 λ:9.9991
+Epi:06100 || Q_low:-13.733 Q_mid:-13.535 Q_high:-13.342 density:0.0511
+Epi:06200 || disc_a_r:-56.099 disc_q_r:-105.092 λ:10.1416
+Epi:06200 || Q_low:-14.284 Q_mid:-14.083 Q_high:-13.884 density:0.0501
+Epi:06300 || disc_a_r:-42.588 disc_q_r:-88.556 λ:10.2827
+Epi:06300 || Q_low:-14.779 Q_mid:-14.572 Q_high:-14.368 density:0.0486
+Epi:06400 || disc_a_r:-55.697 disc_q_r:-113.078 λ:10.4226
+Epi:06400 || Q_low:-15.224 Q_mid:-15.011 Q_high:-14.807 density:0.0480
+Epi:06500 || disc_a_r:-65.232 disc_q_r:-130.555 λ:10.5611
+Epi:06500 || Q_low:-15.719 Q_mid:-15.506 Q_high:-15.298 density:0.0475
+Epi:06600 || disc_a_r:-47.492 disc_q_r:-105.759 λ:10.6984
+Epi:06600 || Q_low:-16.240 Q_mid:-16.026 Q_high:-15.811 density:0.0466
+Epi:06700 || disc_a_r:-40.358 disc_q_r:-94.235 λ:10.8343
+Epi:06700 || Q_low:-16.703 Q_mid:-16.480 Q_high:-16.261 density:0.0452
+Epi:06800 || disc_a_r:-68.390 disc_q_r:-122.728 λ:10.9692
+Epi:06800 || Q_low:-17.255 Q_mid:-17.027 Q_high:-16.808 density:0.0448
+Epi:06900 || disc_a_r:-56.001 disc_q_r:-122.069 λ:11.1028
+Epi:06900 || Q_low:-17.778 Q_mid:-17.546 Q_high:-17.317 density:0.0435
+Epi:07000 || disc_a_r:-58.969 disc_q_r:-120.561 λ:11.2356
+Epi:07000 || Q_low:-18.321 Q_mid:-18.085 Q_high:-17.856 density:0.0430
+Epi:07100 || disc_a_r:-60.063 disc_q_r:-124.383 λ:11.3673
+Epi:07100 || Q_low:-18.819 Q_mid:-18.582 Q_high:-18.351 density:0.0428
+Epi:07200 || disc_a_r:-71.343 disc_q_r:-129.695 λ:11.4978
+Epi:07200 || Q_low:-19.338 Q_mid:-19.092 Q_high:-18.857 density:0.0416
+Epi:07300 || disc_a_r:-34.462 disc_q_r:-97.428 λ:11.6273
+Epi:07300 || Q_low:-19.840 Q_mid:-19.593 Q_high:-19.354 density:0.0411
+Epi:07400 || disc_a_r:-50.900 disc_q_r:-123.126 λ:11.7559
+Epi:07400 || Q_low:-20.378 Q_mid:-20.132 Q_high:-19.889 density:0.0409
+Epi:07500 || disc_a_r:-57.315 disc_q_r:-120.608 λ:11.8833
+Epi:07500 || Q_low:-20.869 Q_mid:-20.618 Q_high:-20.370 density:0.0401
+Epi:07600 || disc_a_r:-51.385 disc_q_r:-110.155 λ:12.0098
+Epi:07600 || Q_low:-21.492 Q_mid:-21.240 Q_high:-20.997 density:0.0404
+Epi:07700 || disc_a_r:-57.242 disc_q_r:-133.066 λ:12.1356
+Epi:07700 || Q_low:-21.991 Q_mid:-21.742 Q_high:-21.500 density:0.0407
+Epi:07800 || disc_a_r:-59.664 disc_q_r:-123.430 λ:12.2603
+Epi:07800 || Q_low:-22.538 Q_mid:-22.290 Q_high:-22.049 density:0.0409
+Epi:07900 || disc_a_r:-69.212 disc_q_r:-134.118 λ:12.3844
+Epi:07900 || Q_low:-23.150 Q_mid:-22.892 Q_high:-22.649 density:0.0400
+Epi:08000 || disc_a_r:-65.065 disc_q_r:-130.686 λ:12.5076
+Epi:08000 || Q_low:-23.683 Q_mid:-23.425 Q_high:-23.170 density:0.0390
+Epi:08100 || disc_a_r:-51.949 disc_q_r:-132.352 λ:12.6299
+Epi:08100 || Q_low:-24.215 Q_mid:-23.951 Q_high:-23.687 density:0.0379
+Epi:08200 || disc_a_r:-83.211 disc_q_r:-151.514 λ:12.7514
+Epi:08200 || Q_low:-24.831 Q_mid:-24.562 Q_high:-24.292 density:0.0371
+Epi:08300 || disc_a_r:-82.606 disc_q_r:-153.554 λ:12.8721
+Epi:08300 || Q_low:-25.354 Q_mid:-25.075 Q_high:-24.800 density:0.0361
+Epi:08400 || disc_a_r:-75.666 disc_q_r:-140.388 λ:12.9918
+Epi:08400 || Q_low:-25.941 Q_mid:-25.651 Q_high:-25.366 density:0.0348
+Epi:08500 || disc_a_r:-52.117 disc_q_r:-122.691 λ:13.1109
+Epi:08500 || Q_low:-26.553 Q_mid:-26.260 Q_high:-25.971 density:0.0344
+Epi:08600 || disc_a_r:-75.299 disc_q_r:-144.674 λ:13.2291
+Epi:08600 || Q_low:-27.097 Q_mid:-26.803 Q_high:-26.512 density:0.0342
+Epi:08700 || disc_a_r:-70.627 disc_q_r:-140.774 λ:13.3466
+Epi:08700 || Q_low:-27.722 Q_mid:-27.414 Q_high:-27.115 density:0.0330
+Epi:08800 || disc_a_r:-59.648 disc_q_r:-133.488 λ:13.4633
+Epi:08800 || Q_low:-28.228 Q_mid:-27.918 Q_high:-27.617 density:0.0327
+Epi:08900 || disc_a_r:-71.668 disc_q_r:-132.365 λ:13.5791
+Epi:08900 || Q_low:-28.817 Q_mid:-28.508 Q_high:-28.201 density:0.0325
+Epi:09000 || disc_a_r:-63.456 disc_q_r:-122.619 λ:13.6942
+Epi:09000 || Q_low:-29.432 Q_mid:-29.112 Q_high:-28.802 density:0.0317
+Epi:09100 || disc_a_r:-75.921 disc_q_r:-164.912 λ:13.8087
+Epi:09100 || Q_low:-29.966 Q_mid:-29.641 Q_high:-29.322 density:0.0311
+Epi:09200 || disc_a_r:-76.082 disc_q_r:-145.238 λ:13.9222
+Epi:09200 || Q_low:-30.553 Q_mid:-30.225 Q_high:-29.905 density:0.0308
+Epi:09300 || disc_a_r:-89.607 disc_q_r:-186.542 λ:14.0353
+Epi:09300 || Q_low:-31.130 Q_mid:-30.800 Q_high:-30.476 density:0.0306
+Epi:09400 || disc_a_r:-63.552 disc_q_r:-140.944 λ:14.1476
+Epi:09400 || Q_low:-31.676 Q_mid:-31.347 Q_high:-31.022 density:0.0306
+Epi:09500 || disc_a_r:-58.119 disc_q_r:-143.133 λ:14.2592
+Epi:09500 || Q_low:-32.304 Q_mid:-31.966 Q_high:-31.633 density:0.0298
+Epi:09600 || disc_a_r:-77.031 disc_q_r:-152.432 λ:14.3701
+Epi:09600 || Q_low:-32.875 Q_mid:-32.530 Q_high:-32.190 density:0.0292
+Epi:09700 || disc_a_r:-69.063 disc_q_r:-159.807 λ:14.4804
+Epi:09700 || Q_low:-33.519 Q_mid:-33.175 Q_high:-32.839 density:0.0294
+Epi:09800 || disc_a_r:-82.133 disc_q_r:-152.029 λ:14.5902
+Epi:09800 || Q_low:-34.034 Q_mid:-33.687 Q_high:-33.343 density:0.0290
+Epi:09900 || disc_a_r:-86.141 disc_q_r:-159.390 λ:14.6992
+Epi:09900 || Q_low:-34.631 Q_mid:-34.275 Q_high:-33.924 density:0.0283
+Epi:10000 || disc_a_r:-65.068 disc_q_r:-133.767 λ:14.8074
+Epi:10000 || Q_low:-35.208 Q_mid:-34.855 Q_high:-34.500 density:0.0282

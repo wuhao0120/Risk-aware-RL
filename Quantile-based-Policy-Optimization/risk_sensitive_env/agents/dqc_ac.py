@@ -223,8 +223,8 @@ class DQCAC(object):
         self.quantile_threshold = args.quantile_threshold    # 分位数约束阈值 C
         self.outer_interval = args.outer_interval            # λ更新间隔
 
-        # 密度估计带宽 δ
-        self.delta = getattr(args, 'density_bandwidth', 0.01)
+        # 密度估计带宽 δ (默认0.1; 过小的δ会导致density极小, λ/density爆炸)
+        self.delta = getattr(args, 'density_bandwidth', 0.1)
         self.alpha_lower = max(0.001, self.q_alpha - self.delta)
         self.alpha_upper = min(0.999, self.q_alpha + self.delta)
 
@@ -328,6 +328,18 @@ class DQCAC(object):
             lr_lambda=lambda k: lr_lambda(k, lambda_a, lambda_b, lambda_c)
         )
 
+        # ==================================================== Critic 冷启动参数 ====================================================
+        # Critic warmup: 在 Critic 收敛到合理精度前，冻结 Q估计 和 λ，Actor只做纯回报最大化
+        # 避免未训练的 Critic 提供错误 TD targets 导致 Q 估计崩塌 → λ爆炸 → 策略退化的死亡螺旋
+        self.critic_warmup_episodes = getattr(args, 'critic_warmup_episodes', 500)
+        self._constraint_enabled = False               # 约束更新开关，warmup 期间关闭
+
+        # ==================================================== 安全网参数 ====================================================
+        # λ 上界: 防止 λ 无限增长导致约束项主导梯度
+        self.lambda_max = getattr(args, 'lambda_max', 10.0)
+        # 约束项裁剪: 限制 λ/density 的最大影响，防止单个约束项淹没 return 信号
+        self.constraint_clip = getattr(args, 'constraint_clip', 20.0)
+
         # ==================================================== Crossing监控 ====================================================
         self.crossing_history = deque(maxlen=max(100, self.log_interval))
 
@@ -429,6 +441,20 @@ class DQCAC(object):
         update_counter = 0  # 内层累计更新次数，用来控制lambda的更新
 
         for i_episode in range(self.max_episode + 1):
+
+            # ==================== 0. Critic Warmup → Constraint 切换 ====================
+            # warmup 结束时: 用真实 episode returns 重新估计 Q，然后启用约束优化
+            # 这样 Q 估计基于真实回报而非未训练 Critic 的 TD targets
+            if (not self._constraint_enabled
+                    and i_episode == self.critic_warmup_episodes):
+                self._reinit_quantiles_from_returns(disc_epi_rewards)
+                self._constraint_enabled = True
+                update_counter = 0                     # 重置 dual 计数器
+                print(f"DQC-AC: Critic warmup done at episode {i_episode}. "
+                      f"Constraint enabled.")
+                print(f"DQC-AC: Re-estimated Q: {self.q_est_lower.item():.3f}, "
+                      f"{self.q_est.item():.3f}, {self.q_est_upper.item():.3f}")
+
             # ==================== 1. 收集 Episode ====================
             state = self._reset_env()
             episode_reward = 0
@@ -469,13 +495,17 @@ class DQCAC(object):
                     update_counter += 1
 
                     # ==================== 3. 外层更新 (λ) ====================
-                    if update_counter % self.outer_interval == 0:
+                    # warmup 期间不更新 λ，避免 Critic 不准导致 λ 提前增长
+                    if (self._constraint_enabled
+                            and update_counter % self.outer_interval == 0):
                         self._update_dual()
                         self.lambda_scheduler.step()
 
                     # 学习率调度
                     self.actor_scheduler.step()
-                    self.q_scheduler.step()
+                    # Q 的 scheduler 只在约束启用后才步进，保持 warmup 后 lr 从高位开始
+                    if self._constraint_enabled:
+                        self.q_scheduler.step()
 
             # ==================== 4. 日志记录 ====================
             density_est = self.estimate_density()
@@ -484,9 +514,8 @@ class DQCAC(object):
             crossing_rate = sum(self.crossing_history) / len(self.crossing_history)
 
             wandb.log({
-                # raw_reward记录未折扣的回合总回报, discounted_reward记录折扣回报
+                # 与QCPO对齐: raw_reward记录未折扣的回合总回报
                 'disc_reward/raw_reward': episode_reward,
-                'disc_reward/discounted_reward': disc_epi_reward,
                 'lambda/value': self.lambda_dual.item(),
                 'action/avg_risk_episode': avg_risk_episode,
                 'density/estimate': density_est.item(),
@@ -495,6 +524,7 @@ class DQCAC(object):
                 'training/total_steps': total_steps,
                 'training/episode_steps': episode_steps,
                 'training/learning_steps': self.learning_steps,
+                'training/constraint_enabled': int(self._constraint_enabled),
             }, step=i_episode)
 
             # ==================== 5. 定期详细日志 ====================
@@ -516,11 +546,12 @@ class DQCAC(object):
                     'constraint/margin': constraint_margin,
                 }, step=i_episode)
 
-                print(f'Epi:{i_episode:05d} || disc_a_r:{disc_a_reward:.03f} '
+                phase = "CONSTRAINT" if self._constraint_enabled else "WARMUP"
+                print(f'Epi:{i_episode:05d} [{phase}] || disc_a_r:{disc_a_reward:.03f} '
                       f'disc_q_r:{disc_q_reward:.03f} λ:{self.lambda_dual.item():.04f}')
-                print(f'Epi:{i_episode:05d} || Q_low:{self.q_est_lower.item():.03f} '
+                print(f'Epi:{i_episode:05d} [{phase}] || Q_low:{self.q_est_lower.item():.03f} '
                       f'Q_mid:{self.q_est.item():.03f} Q_high:{self.q_est_upper.item():.03f} '
-                      f'density:{density_est.item():.04f}')
+                      f'density:{density_est.item():.04f}', '\n')
 
     # ==================================================== 核心学习函数 ====================================================
     def _learn(self):
@@ -555,6 +586,7 @@ class DQCAC(object):
             # TD targets: y_j = r + γ·ψ_j(s', a') · (1 - done)
             td_targets = rewards.unsqueeze(1) + self.gamma * next_quantiles * (1 - dones.unsqueeze(1)) # done=1的样本为终止状态，没有next_state，done=0的样本计算它的TD target
             # td_targets: [B, M]
+            # td_targets[i,j]：这一个batch当中第i个transition的第j个TD Target，对于终止状态TD Target就是immediate reward本身
 
         # Line 13: Quantile Huber Loss
         current_quantiles = self.online_critic(states, actions)
@@ -567,12 +599,16 @@ class DQCAC(object):
         self.critic_optimizer.step()
 
         # ==================== 2. Global Quantile Estimate Update (公式25) ====================
-        # Q_{k+1} ← Q_k + (1/N) Σ_j β_k (α - I{r + γ·ψ_j(s',a') ≤ Q_k})
-        # 使用所有 M 个 TD targets 进行更新，而非只用均值
-        self._update_global_quantiles(td_targets.detach()) # 使用当前batch的td_targets更新三个全局分位数估计
+        # warmup 期间冻结 Q 估计: Critic 未训练时 TD targets 不可靠,
+        # 用它们更新 Q 会导致 Q 暴跌 → λ爆炸 → 死亡螺旋
+        if self._constraint_enabled:
+            # Q_{k+1} ← Q_k + (1/N) Σ_j β_k (α - I{r + γ·ψ_j(s',a') ≤ Q_k})
+            # 使用所有 M 个 TD targets 进行更新，而非只用均值
+            self._update_global_quantiles(td_targets.detach())
 
         # ==================== 3. Actor Update (公式24) ====================
-        # D̃ = (1/N) Σ_j [(y_j - λ·I{y_j≤Q}/f̂_Z)] · ∇θ log π(a|s)
+        # warmup 期间: 纯回报最大化 (gradient_weight = y_j, 无约束项)
+        # constraint 启用后: D̃ = (1/N) Σ_j [(y_j - λ·I{y_j≤Q}/f̂_Z)] · ∇θ log π(a|s)
         self._update_actor(states, actions, td_targets.detach())
 
         # ==================== Target网络软更新 ====================
@@ -683,6 +719,9 @@ class DQCAC(object):
 
         D̃(τ_k, θ_k, Q_k) = (1/N) Σ_j [(r + γ·ψ_j(s',a')) - λ·I{y_j ≤ Q(α)}/f̂_Z] · ∇θ log π(a|s)
 
+        warmup 期间: 约束项为0，退化为纯策略梯度 D̃ = E[y_j] · ∇θ log π
+        constraint 启用后: 完整公式24，约束项有 clamp 安全网
+
         [输入]:
         - states: [B, state_dim]
         - actions: [B, action_dim]
@@ -692,7 +731,7 @@ class DQCAC(object):
         1. 计算 log π(a|s) for each sample in batch
         2. 计算密度估计 f̂_Z = 2δ / (Q(α+δ) - Q(α-δ))
         3. 对每个 TD target y_j 计算 indicator I{y_j ≤ Q(α)}
-        4. 计算约束项 λ·I{y_j ≤ Q(α)} / f̂_Z
+        4. 计算约束项 λ·I{y_j ≤ Q(α)} / f̂_Z (warmup期间跳过)
         5. 梯度权重 = y_j - 约束项，然后对 M 个分位数取均值
         6. Actor loss = -E[log π · gradient_weight]
         """
@@ -700,26 +739,32 @@ class DQCAC(object):
         log_probs = self._compute_log_probs(states, actions)
         # log_probs: [B]
 
-        # ==================================================== 密度估计 f̂_Z ====================================================
-        density = self.estimate_density()
-        # density: 标量 tensor
+        if self._constraint_enabled:
+            # ==================================================== 约束启用: 完整公式24 ====================================================
+            # 密度估计 f̂_Z
+            density = self.estimate_density()                                      # 标量 tensor
 
-        # ==================================================== 计算 indicator ====================================================
-        # I{y_j ≤ Q(α)} for all TD targets
-        # td_targets: [B, M]
-        # 先展平计算，再 reshape 回来
-        indicators = (td_targets <= self.q_est.detach()).to(td_targets.dtype)  # [B, M]
+            # indicator I{y_j ≤ Q(α)}
+            indicators = (td_targets <= self.q_est.detach()).to(td_targets.dtype)   # [B, M]
 
-        # ==================================================== 计算约束项 ====================================================
-        # 约束项: λ · I{y_j ≤ Q(α)} / f̂_Z
-        # 密度 f̂_Z 在分母，用于将 indicator 的影响归一化到分布尺度
-        constraint_term = self.lambda_dual.detach() * indicators / density.detach()
-        # constraint_term: [B, M]
+            # 约束项: λ · I{y_j ≤ Q(α)} / f̂_Z
+            constraint_term = self.lambda_dual.detach() * indicators / density.detach()
+            # constraint_term: [B, M]
 
-        # ==================================================== 计算梯度权重 ====================================================
-        # D̃ = (1/M) Σ_j [y_j - λ·I{y_j≤Q}/f̂_Z]
-        gradient_weights_per_j = td_targets - constraint_term  # [B, M]
-        gradient_weights = gradient_weights_per_j.mean(dim=1)   # [B]
+            # ==================================================== 安全网: clamp 约束项 ====================================================
+            # 防止 λ/density 爆炸时约束项淹没 return 信号
+            # clamp 上界 = constraint_clip, 保证梯度权重中 return 部分(y_j)仍有话语权
+            constraint_term = torch.clamp(constraint_term, max=self.constraint_clip)
+
+            # 梯度权重: D̃ = (1/M) Σ_j [y_j - constraint_term]
+            gradient_weights_per_j = td_targets - constraint_term                  # [B, M]
+        else:
+            # ==================================================== Warmup: 纯回报最大化 ====================================================
+            # 约束项为0, 退化为标准策略梯度: D̃ = E[y_j] · ∇θ log π
+            # Critic + Actor 在此阶段自由学习，建立合理的价值估计基线
+            gradient_weights_per_j = td_targets                                    # [B, M]
+
+        gradient_weights = gradient_weights_per_j.mean(dim=1)                      # [B]
 
         # ==================================================== Actor loss ====================================================
         # 目标: 最大化 E[D̃ · log π(a|s)]
@@ -748,9 +793,46 @@ class DQCAC(object):
         dual_loss.backward()
         self.lambda_optimizer.step()
 
-        # 投影到 [0, ∞)
+        # 投影到 [0, lambda_max]
+        # 上界防止 λ 无限增长: 即使约束持续违反，λ 也不会超过 lambda_max
+        # 这保证约束项 λ/density 有上界，Actor 的 return 最大化信号不会被完全淹没
         with torch.no_grad():
-            self.lambda_dual.clamp_(min=0.0)
+            self.lambda_dual.clamp_(min=0.0, max=self.lambda_max)
+
+    # ==================================================== Q 估计重初始化 ====================================================
+    def _reinit_quantiles_from_returns(self, disc_epi_rewards):
+        """
+        [函数简介]: 用真实 episode returns 重新估计三个全局分位数
+
+        在 Critic warmup 结束时调用，用最近 N 个 episode 的真实折扣回报
+        替代 warmup 阶段（可能已被 _warmup() 设过，但此时策略已改善）的 Q 估计
+
+        [输入]:
+        - disc_epi_rewards: list, 全部已收集的 episode 折扣回报
+
+        [算法]:
+        从最近 est_interval 个 episode 的回报中，计算 (α-δ), α, (α+δ) 三个分位数
+        直接写入 q_est_lower, q_est, q_est_upper (不经过梯度)
+
+        [注意]:
+        warmup 期间 Q optimizer 和 scheduler 从未被 step()，状态仍为初始值，无需重置
+        """
+        # 取最近 est_interval 个 episode (或全部，取较小值)
+        lb = max(0, len(disc_epi_rewards) - self.est_interval)
+        recent_returns = disc_epi_rewards[lb:]
+
+        if len(recent_returns) == 0:
+            print("DQC-AC WARNING: No episode returns for Q re-initialization.")
+            return
+
+        q_low = np.percentile(recent_returns, self.alpha_lower * 100)
+        q_mid = np.percentile(recent_returns, self.q_alpha * 100)
+        q_high = np.percentile(recent_returns, self.alpha_upper * 100)
+
+        with torch.no_grad():
+            self.q_est_lower.fill_(q_low)
+            self.q_est.fill_(q_mid)
+            self.q_est_upper.fill_(q_high)
 
     # ==================================================== 辅助方法 ====================================================
     def _sample_actions(self, states):
