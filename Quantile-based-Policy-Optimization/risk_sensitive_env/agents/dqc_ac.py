@@ -2,21 +2,29 @@
 # DQC-AC (Distributional Quantile-Constrained Actor-Critic) for Risk-Sensitive Environment
 #
 # 核心算法: TD Learning + Distributional Critic + Primal-Dual 约束优化
-# 与 QCPO (Monte-Carlo方法) 不同，DQC-AC 使用 transition 级别的 TD 更新
+# 结合 QCPO 的 episode-level 分位数约束 与 Distributional Critic 的数据效率
 #
-# Algorithm 3 流程:
-# 1. 从 Replay Buffer 采样 transition τ_k = (s, a, r, s')
-# 2. Critic Update: 使用 Quantile Huber Loss 更新 Distributional Critic ω
-# 3. Global Quantile Estimate Update: Q_{k+1} = Q_k + β_k(α - I{y_j ≤ Q_k})
-# 4. Actor Update: 使用 risk-adjusted gradient weight D̃ 更新策略 θ
-# 5. Dual Update: 每 I 步更新拉格朗日乘子 λ
+# ===== 核心设计思想 =====
+# QCPO 使用 Monte-Carlo episode return U(τ) 做约束判断（正确但数据低效）
+# 本算法将梯度拆为两部分，用不同数据源：
+#
+#   ∇θ L = E[∇θ log π · Q_critic(s,a)]           ← Critic 提供 (per-transition, off-policy)
+#         - λ/f_Z · E[I{U(τ)≤Q_α} · ∇θ log π]   ← episode return 提供 (episode-level, 数学正确)
+#
+# 合并后每个 transition 的梯度权重:
+#   w_t = Q_critic_mean(s_t, a_t) - λ · I{U(τ) ≤ Q_α} / f̂_Z
+#
+# 关键区别 vs 旧版:
+# - Q/λ/indicator 全部基于 episode return（与 QCPO 一致），而非 TD targets
+# - Critic 仅用于: (1) Actor梯度中的return估计 (2) 自身的 distributional TD 训练
+# - Replay Buffer 额外存储每个 transition 所属 episode 的 U(τ)
 #
 # 关键公式:
-# - TD targets:     y_j = r + γ·ψ_j(s', a'; ω)       (公式 12)
-# - Critic Loss:    Σ_i Σ_j ρ_{τ_i}^κ(y_j - ψ_i(s,a))  (Quantile Huber Loss)
-# - Q Update:       Q ← Q + β(α - I{y ≤ Q})          (公式 25)
-# - Actor Gradient: D̃ = (y - λ·I{y≤Q}/f̂_Z) · ∇θ log π  (公式 24)
-# - Density:        f̂_Z = 2δ / (Q(α+δ) - Q(α-δ))      (公式 13)
+# - TD targets:     y_j = r + γ·ψ_j(s', a'; ω)             (Critic 训练用)
+# - Critic Loss:    Σ_i Σ_j ρ_{τ_i}^κ(y_j - ψ_i(s,a))     (Quantile Huber Loss)
+# - Q Update:       Q ← Q + β(α - I{U(τ) ≤ Q})             (用 episode return, 非 TD target)
+# - Actor Gradient: w = Q_critic_mean - λ·I{U(τ)≤Q}/f̂_Z    (Critic + episode return 混合)
+# - Density:        f̂_Z = 2δ / (Q(α+δ) - Q(α-δ))
 # ==================================================================================================================
 
 import numpy as np                                     # 数值计算库
@@ -57,9 +65,10 @@ def indicator(threshold, values: torch.Tensor):
 # ==================================================== Replay Buffer ====================================================
 class ReplayBuffer:
     """
-    [类简介]: 经验回放缓冲区，存储 transition (s, a, r, s', done)
+    [类简介]: 经验回放缓冲区，存储 transition (s, a, r, s', done, episode_return)
 
-    用于 TD Learning 的 off-policy 更新，支持随机采样
+    每个 transition 额外存储其所属 episode 的折扣累积回报 U(τ)
+    用于 TD Learning 的 off-policy 更新，同时保留 episode-level 信息用于分位数约束
     """
 
     def __init__(self, capacity, device):
@@ -74,7 +83,7 @@ class ReplayBuffer:
         self.device = device
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, done):
+    def push(self, state, action, reward, next_state, done, episode_return):
         """
         [函数简介]: 添加一个 transition 到缓冲区
 
@@ -84,8 +93,9 @@ class ReplayBuffer:
         - reward: 获得的奖励 (float)
         - next_state: 下一个状态 (np.ndarray)
         - done: 是否终止 (bool)
+        - episode_return: 该 transition 所属 episode 的折扣累积回报 U(τ) (float)
         """
-        self.buffer.append((state, action, reward, next_state, done))
+        self.buffer.append((state, action, reward, next_state, done, episode_return))
 
     def sample(self, batch_size):
         """
@@ -97,10 +107,11 @@ class ReplayBuffer:
         - rewards: [batch_size]
         - next_states: [batch_size, state_dim]
         - dones: [batch_size]
+        - episode_returns: [batch_size]  ← 每个 transition 所属 episode 的 U(τ)
         """
         batch = random.sample(self.buffer, batch_size)
 
-        states, actions, rewards, next_states, dones = zip(*batch)
+        states, actions, rewards, next_states, dones, episode_returns = zip(*batch)
 
         # as_tensor + asarray 组合能在可能时复用底层内存，减少不必要拷贝
         return {
@@ -109,6 +120,7 @@ class ReplayBuffer:
             'rewards': torch.as_tensor(np.asarray(rewards), dtype=torch.float32, device=self.device),
             'next_states': torch.as_tensor(np.asarray(next_states), dtype=torch.float32, device=self.device),
             'dones': torch.as_tensor(np.asarray(dones), dtype=torch.float32, device=self.device),
+            'episode_returns': torch.as_tensor(np.asarray(episode_returns), dtype=torch.float32, device=self.device),
         }
 
     def __len__(self):
@@ -198,12 +210,12 @@ class DQCAC(object):
     - Global Quantile Estimate: 三个分位数 Q(α-δ), Q(α), Q(α+δ)
     - Lagrange Multiplier: λ 用于约束优化
 
-    [更新流程] (Algorithm 3):
-    1. 采样 transition (s, a, r, s') 存入 Replay Buffer
+    [更新流程]:
+    1. 收集 episode，计算 U(τ)，连同 transitions 存入 Replay Buffer
     2. 从 Buffer 采样 batch:
-       - Critic Update: Quantile Huber Loss
-       - Q Update: TD-based quantile gradient
-       - Actor Update: risk-adjusted policy gradient
+       - Critic Update: Distributional TD (Quantile Huber Loss)
+       - Q Update: 用存储的 episode return 更新（非 TD targets）
+       - Actor Update: Critic均值做return + episode return做indicator
     3. 每 I 步更新 λ
     """
 
@@ -223,10 +235,13 @@ class DQCAC(object):
         self.quantile_threshold = args.quantile_threshold    # 分位数约束阈值 C
         self.outer_interval = args.outer_interval            # λ更新间隔
 
-        # 密度估计带宽 δ
-        self.delta = getattr(args, 'density_bandwidth', 0.01)
+        # 密度估计带宽 δ（增大到 0.1，使密度估计更稳定，λ/density 不易爆炸）
+        self.delta = getattr(args, 'density_bandwidth', 0.1)
         self.alpha_lower = max(0.001, self.q_alpha - self.delta)
         self.alpha_upper = min(0.999, self.q_alpha + self.delta)
+
+        # 约束项安全上界: clamp(λ·I/f̂_Z, max=max_constraint)，防止约束项主导 Actor 梯度
+        self.max_constraint = getattr(args, 'max_constraint', 50.0)
 
         # ==================================================== TD Learning 参数 ====================================================
         # 分位数数量 M (Distributional Critic 输出维度)
@@ -341,7 +356,7 @@ class DQCAC(object):
             name=f"DQCAC_{args.seed}",
             config={
                 **vars(args),
-                'algorithm': 'DQC-AC-TD',
+                'algorithm': 'DQC-AC-v2',
                 'num_quantiles': self.num_quantiles,
                 'buffer_capacity': self.buffer_capacity,
                 'batch_size': self.batch_size,
@@ -355,10 +370,10 @@ class DQCAC(object):
         self._warmup()
 
         # ==================================================== 打印初始化信息 ====================================================
-        print(f"DQC-AC (TD): Initialized with α={self.q_alpha}, δ={self.delta}")
-        print(f"DQC-AC (TD): Distributional Critic with M={self.num_quantiles} quantiles")
-        print(f"DQC-AC (TD): Constraint Q >= {self.quantile_threshold}")
-        print(f"DQC-AC (TD): Initial Q estimates: {self.q_est_lower.item():.3f}, "
+        print(f"DQC-AC (v2): Initialized with α={self.q_alpha}, δ={self.delta}")
+        print(f"DQC-AC (v2): Distributional Critic with M={self.num_quantiles} quantiles")
+        print(f"DQC-AC (v2): Constraint Q >= {self.quantile_threshold}")
+        print(f"DQC-AC (v2): Initial Q estimates: {self.q_est_lower.item():.3f}, "
               f"{self.q_est.item():.3f}, {self.q_est_upper.item():.3f}")
 
     # ==================================================== 预热 ====================================================
@@ -367,6 +382,7 @@ class DQCAC(object):
         [函数简介]: 预热阶段，收集初始数据并估计初始分位数
 
         运行初始化策略填充 Replay Buffer 并估计初始 Q
+        注意: 必须等 episode 结束才能知道 U(τ)，所以先暂存 transitions，episode 结束后再批量 push
         """
         print("DQC-AC: Starting warmup...")
 
@@ -376,24 +392,29 @@ class DQCAC(object):
             state = self._reset_env()
             episode_return = 0
             disc_factor = 1.0
+            # 暂存本 episode 的 transitions，等 episode 结束后统一 push（因为 U(τ) 要等结束才知道）
+            episode_transitions = []
 
             while True:
                 state_flat = state.reshape(-1)
                 action = self.choose_action(state_flat, store_memory=False)
                 next_state, reward, done, _ = self._step_env(action)
 
-                # 存入 Replay Buffer
-                self.replay_buffer.push(
-                    state_flat, action, reward, next_state.reshape(-1), float(done)
+                # 暂存 transition（不直接 push，因为还不知道 episode_return）
+                episode_transitions.append(
+                    (state_flat, action, reward, next_state.reshape(-1), float(done))
                 )
 
-                # 使用折扣回报初始化分位数估计, 与训练阶段的gamma设定保持一致
                 episode_return += disc_factor * reward
                 disc_factor *= self.gamma
                 state = next_state
 
                 if done:
                     break
+
+            # episode 结束，现在知道 U(τ) 了，批量 push 所有 transitions
+            for s, a, r, ns, d in episode_transitions:
+                self.replay_buffer.push(s, a, r, ns, d, episode_return)
 
             episode_returns.append(episode_return)
 
@@ -409,19 +430,18 @@ class DQCAC(object):
                 self.q_est_upper.fill_(q_high)
 
         print(f"DQC-AC: Warmup done. Buffer size: {len(self.replay_buffer)}")
- 
+
     # ==================================================== 主训练循环 ====================================================
     def train(self):
         """
         [函数简介]: 主训练循环
 
-        [Algorithm 3 流程]:
         for each episode:
-            1. 收集 episode，存入 Replay Buffer
+            1. 收集 episode，计算 U(τ)，批量存入 Replay Buffer
             2. 执行多次更新:
-               - Critic Update (Quantile Huber Loss)
-               - Global Quantile Update (TD-based)
-               - Actor Update (risk-adjusted gradient)
+               - Critic Update (Distributional TD)
+               - Q Update (episode returns)
+               - Actor Update (Critic mean + episode-level indicator)
             3. 每 outer_interval 更新 λ
         """
         disc_epi_rewards = []
@@ -435,15 +455,17 @@ class DQCAC(object):
             disc_epi_reward = 0
             disc_factor = 1.0
             episode_steps = 0
+            # 暂存本 episode 的 transitions，等 episode 结束后统一 push（因为 U(τ) 要等结束才知道）
+            episode_transitions = []
 
             while True:
                 state_flat = state.reshape(-1)
                 action = self.choose_action(state_flat, store_memory=False)
                 next_state, reward, done, _ = self._step_env(action)
 
-                # 存入 Replay Buffer
-                self.replay_buffer.push(
-                    state_flat, action, reward, next_state.reshape(-1), float(done)
+                # 暂存 transition（不直接 push，因为还不知道 episode_return）
+                episode_transitions.append(
+                    (state_flat, action, reward, next_state.reshape(-1), float(done))
                 )
 
                 episode_reward += reward
@@ -456,6 +478,10 @@ class DQCAC(object):
 
                 if done:
                     break
+
+            # episode 结束，现在知道 U(τ) = disc_epi_reward，批量 push
+            for s, a, r, ns, d in episode_transitions:
+                self.replay_buffer.push(s, a, r, ns, d, disc_epi_reward)
 
             disc_epi_rewards.append(disc_epi_reward)
 
@@ -484,7 +510,6 @@ class DQCAC(object):
             crossing_rate = sum(self.crossing_history) / len(self.crossing_history)
 
             wandb.log({
-                # 与QCPO对齐: raw_reward记录未折扣的回合总回报
                 'disc_reward/raw_reward': episode_reward,
                 'lambda/value': self.lambda_dual.item(),
                 'action/avg_risk_episode': avg_risk_episode,
@@ -526,56 +551,67 @@ class DQCAC(object):
         """
         [函数简介]: 从 Replay Buffer 采样并执行一次更新
 
-        [Algorithm 3 Steps]:
-        1. Critic Update: Quantile Huber Loss (Line 10-13)
-        2. Global Quantile Update: TD-based (Line 14-15)
-        3. Actor Update: risk-adjusted gradient (Line 16-19)
+        [三步更新]:
+        1. Critic Update: Distributional TD (Quantile Huber Loss)
+           - 数据源: replay buffer 的 (s, a, r, s', done)
+           - 目的: 让 Critic 学习 Z(s,a) 的分布
+
+        2. Global Quantile Estimate Update:
+           - 数据源: replay buffer 存储的 episode_return U(τ)  ← 关键改动!
+           - Q ← Q + β(α - I{U(τ) ≤ Q})
+           - 追踪的是 episode return 分布的 α-分位数（与 QCPO 一致）
+
+        3. Actor Update:
+           - return 部分: Critic 的均值估计 Q_critic(s,a)  (per-transition)
+           - 约束部分: I{U(τ) ≤ Q_α}                        (episode-level)
+           - w_t = Q_critic_mean(s,a) - λ·I{U(τ)≤Q}/f̂_Z
         """
         self.learning_steps += 1
 
         # ==================== 采样 Batch ====================
         batch = self.replay_buffer.sample(self.batch_size)
-        states = batch['states']           # [B, state_dim]
-        actions = batch['actions']         # [B, action_dim]
-        rewards = batch['rewards']         # [B]
-        next_states = batch['next_states'] # [B, state_dim]
-        dones = batch['dones']             # [B]
+        states = batch['states']                   # [B, state_dim]
+        actions = batch['actions']                 # [B, action_dim]
+        rewards = batch['rewards']                 # [B]
+        next_states = batch['next_states']         # [B, state_dim]
+        dones = batch['dones']                     # [B]
+        episode_returns = batch['episode_returns'] # [B] ← 每个 transition 所属 episode 的 U(τ)
 
         # ==================== 1. Critic Update (Distributional TD) ====================
-        # Line 11: Sample next action a' ~ π(·|s'; θ_k)
+        # Critic 训练与之前完全一致: 用 TD targets 训练分布式价值网络
         with torch.no_grad():
-            next_actions = self._sample_actions(next_states) # 动作定义为一个连续action_dim维向量，只不过强制从one-hot向量中取值
+            next_actions = self._sample_actions(next_states)
             # next_actions: [B, action_dim]
 
-            # Line 12: Compute distributional targets y_j = r + γ·ψ_j(s', a'; ω_k)
             next_quantiles = self.target_critic(next_states, next_actions)
             # next_quantiles: [B, M]
 
             # TD targets: y_j = r + γ·ψ_j(s', a') · (1 - done)
-            td_targets = rewards.unsqueeze(1) + self.gamma * next_quantiles * (1 - dones.unsqueeze(1)) # done=1的样本为终止状态，没有next_state，done=0的样本计算它的TD target
+            td_targets = rewards.unsqueeze(1) + self.gamma * next_quantiles * (1 - dones.unsqueeze(1))
             # td_targets: [B, M]
 
-        # Line 13: Quantile Huber Loss
         current_quantiles = self.online_critic(states, actions)
         # current_quantiles: [B, M]
 
-        critic_loss = self._compute_quantile_huber_loss(current_quantiles, td_targets) # 做online_critic的监督更新，让online_critic拟合td_target
+        critic_loss = self._compute_quantile_huber_loss(current_quantiles, td_targets)
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        # ==================== 2. Global Quantile Estimate Update (公式25) ====================
-        # Q_{k+1} ← Q_k + (1/N) Σ_j β_k (α - I{r + γ·ψ_j(s',a') ≤ Q_k})
-        # 使用所有 M 个 TD targets 进行更新，而非只用均值
-        self._update_global_quantiles(td_targets.detach()) # 使用当前batch的td_targets更新三个全局分位数估计
+        # ==================== 2. Global Quantile Estimate Update ====================
+        # 关键改动: 用 episode_returns 更新 Q（而非 td_targets）
+        # Q ← Q + β(α - I{U(τ) ≤ Q})
+        # 这与 QCPO 的 Q 更新在数学上完全一致:
+        #   Q 追踪的是 episode return 分布的 α-分位数，而非 TD target 混合分布的分位数
+        self._update_global_quantiles(episode_returns)
 
-        # ==================== 3. Actor Update (公式24) ====================
-        # D̃ = (1/N) Σ_j [(y_j - λ·I{y_j≤Q}/f̂_Z)] · ∇θ log π(a|s)
-        self._update_actor(states, actions, td_targets.detach())
+        # ==================== 3. Actor Update ====================
+        # 关键改动: Critic 提供 return 估计，episode_returns 提供 indicator
+        # w_t = Q_critic_mean(s_t, a_t) - λ · I{U(τ) ≤ Q_α} / f̂_Z
+        self._update_actor(states, actions, episode_returns)
 
         # ==================== Target网络软更新 ====================
-        # 每隔 target_update_interval 次 learn 调用软更新一次
         if self.learning_steps % self.target_update_interval == 0:
             self._soft_update_target()
 
@@ -593,25 +629,17 @@ class DQCAC(object):
         - target_quantiles: [B, M] 目标分位数 y_j = r + γψ_j(s',a')
 
         [输出]: 标量 loss
-
-        [算法]:
-        对每对 (i, j) 计算 td_error = y_j - ψ_i
-        然后用分位数 Huber loss 聚合
         """
         B, M = current_quantiles.shape
 
-        # ==================================================== 扩展维度 ====================================================
-        # current: [B, M] → [B, M, 1] (ψ_i)
-        # target:  [B, M] → [B, 1, M] (y_j)
-        # 广播后 td_error[b, i, j] = y_j[b] - ψ_i[b]
+        # 扩展维度用于广播: td_error[b, i, j] = y_j[b] - ψ_i[b]
         current_expanded = current_quantiles.unsqueeze(2)  # [B, M, 1]
         target_expanded = target_quantiles.unsqueeze(1)    # [B, 1, M]
 
         # TD error: u = y_j - ψ_i
         td_errors = target_expanded - current_expanded     # [B, M, M]
 
-        # ==================================================== Huber Loss ====================================================
-        # L_κ(u) = 0.5u² if |u| <= κ else κ(|u| - 0.5κ)
+        # Huber Loss: L_κ(u) = 0.5u² if |u| <= κ else κ(|u| - 0.5κ)
         abs_td_errors = td_errors.abs()
         huber_loss = torch.where(
             abs_td_errors <= self.huber_kappa,
@@ -620,111 +648,110 @@ class DQCAC(object):
         )
         # huber_loss: [B, M, M]
 
-        # ==================================================== 分位数权重 ====================================================
-        # quantile_taus: [M] → [1, M, 1] (τ_i 对应当前分位数)
-        # I{u < 0}: [B, M, M]
-        # 权重 |τ_i - I{u < 0}|
+        # 分位数权重: |τ_i - I{u < 0}|
         taus = self.quantile_taus.view(1, M, 1)            # [1, M, 1]
         quantile_weight = torch.abs(
             taus - (td_errors.detach() < 0).to(td_errors.dtype)
         )  # [B, M, M]
 
-        # ==================================================== 计算 loss ====================================================
         # element_wise: ρ^κ_τ(u) = |τ - I{u<0}| · L_κ(u) / κ
         element_wise_loss = quantile_weight * huber_loss / self.huber_kappa  # [B, M, M]
 
-        # 在 target 分位数维度 (dim=2, j) 求和，然后对 current 分位数维度 (dim=1, i) 求均值
-        # 最后对 batch 求均值
+        # 在 target 维度 (j) 求和，current 维度 (i) 求均值，batch 求均值
         loss = element_wise_loss.sum(dim=2).mean(dim=1).mean()
 
         return loss
 
     # ==================================================== 全局分位数更新 ====================================================
-    def _update_global_quantiles(self, td_targets):
+    def _update_global_quantiles(self, episode_returns):
         """
-        [函数简介]: 更新三个全局分位数估计 (公式25)
+        [函数简介]: 用 episode returns 更新三个全局分位数估计
 
-        Q_{k+1} ← Q_k + (1/N) Σ_j β_k (α - I{r + η·ψ_j(s',a') ≤ Q_k})
+        Q_{k+1} ← Q_k + β_k (α - I{U(τ) ≤ Q_k})
 
         [输入]:
-        - td_targets: [B, M] 所有 M 个 TD targets
+        - episode_returns: [B] 每个 transition 所属 episode 的折扣累积回报 U(τ)
 
-        [算法]:
-        将所有 TD targets 展平为 [B*M]，对全部 targets 计算 indicator
-        这样每个样本的 N 个分位数值都参与分位数估计的更新
+        [与 QCPO 的对应关系]:
+        QCPO 用 disc_reward_short (每个 episode 一个 U(τ)) 更新 Q
+        这里用 replay buffer 中采样到的 episode_returns 更新 Q
+        - 同一 episode 的多个 transitions 具有相同的 episode_return
+        - 固定长度 episode (n=10) 时，每个 episode 贡献相同数量的 transitions，无偏
+        - Q 追踪的是 episode return 分布的分位数，与 QCPO 数学含义一致
         """
-        # 展平所有 TD targets: [B, M] -> [B*M]
-        all_targets = td_targets.flatten()
-
         self.q_optimizer.zero_grad(set_to_none=True)
 
-        # Q(α-δ) 梯度: -(α-δ) + E[I{y ≤ Q(α-δ)}]
-        ind_lower = indicator(self.q_est_lower.detach(), all_targets)
+        # Q(α-δ) 梯度: -(α-δ) + E[I{U(τ) ≤ Q(α-δ)}]
+        ind_lower = indicator(self.q_est_lower.detach(), episode_returns)
         grad_lower = -(self.alpha_lower - ind_lower.mean())
         self.q_est_lower.grad = grad_lower.view(1)
 
-        # Q(α) 梯度: -α + E[I{y ≤ Q(α)}]
-        ind_center = indicator(self.q_est.detach(), all_targets)
+        # Q(α) 梯度: -α + E[I{U(τ) ≤ Q(α)}]
+        ind_center = indicator(self.q_est.detach(), episode_returns)
         grad_center = -(self.q_alpha - ind_center.mean())
         self.q_est.grad = grad_center.view(1)
 
-        # Q(α+δ) 梯度: -(α+δ) + E[I{y ≤ Q(α+δ)}]
-        ind_upper = indicator(self.q_est_upper.detach(), all_targets)
+        # Q(α+δ) 梯度: -(α+δ) + E[I{U(τ) ≤ Q(α+δ)}]
+        ind_upper = indicator(self.q_est_upper.detach(), episode_returns)
         grad_upper = -(self.alpha_upper - ind_upper.mean())
         self.q_est_upper.grad = grad_upper.view(1)
 
         self.q_optimizer.step()
 
     # ==================================================== Actor 更新 ====================================================
-    def _update_actor(self, states, actions, td_targets):
+    def _update_actor(self, states, actions, episode_returns):
         """
-        [函数简介]: Actor 更新 (公式24)
+        [函数简介]: Actor 更新 (Critic + episode-level constraint)
 
-        D̃(τ_k, θ_k, Q_k) = (1/N) Σ_j [(r + γ·ψ_j(s',a')) - λ·I{y_j ≤ Q(α)}/f̂_Z] · ∇θ log π(a|s)
+        梯度权重 w_t = Q_critic_mean(s_t, a_t) - λ · I{U(τ) ≤ Q_α} / f̂_Z
+
+        [数学推导]:
+        Lagrangian: L = E[U(τ)] + λ(Q_α(U) - C)
+        对 θ 求梯度后分为两部分:
+          ∇θ E[U(τ)]        = E[∇θ log π · Q^π(s,a)]              ← 策略梯度定理
+          λ·∇θ Q_α(U)       = -λ/f_Z · E[I{U(τ)≤Q} · ∇θ log π]  ← 分位数梯度
+        合并: ∇θ L = E[∇θ log π · (Q^π(s,a) - λ·I{U(τ)≤Q}/f_Z)]
+
+        [两部分的数据源]:
+        - Q^π(s,a): Distributional Critic 的均值输出 (per-transition, off-policy)
+          Q_critic_mean(s,a) = (1/M) Σ_j ψ_j(s,a)
+        - I{U(τ) ≤ Q_α}: 用 replay buffer 中存储的 episode_return (episode-level)
 
         [输入]:
         - states: [B, state_dim]
         - actions: [B, action_dim]
-        - td_targets: [B, M] TD targets (已 detach)
-
-        [算法]:
-        1. 计算 log π(a|s) for each sample in batch
-        2. 计算密度估计 f̂_Z = 2δ / (Q(α+δ) - Q(α-δ))
-        3. 对每个 TD target y_j 计算 indicator I{y_j ≤ Q(α)}
-        4. 计算约束项 λ·I{y_j ≤ Q(α)} / f̂_Z
-        5. 梯度权重 = y_j - 约束项，然后对 M 个分位数取均值
-        6. Actor loss = -E[log π · gradient_weight]
+        - episode_returns: [B] 每个 transition 所属 episode 的 U(τ)
         """
         # ==================================================== 计算 log π(a|s) ====================================================
         log_probs = self._compute_log_probs(states, actions)
         # log_probs: [B]
 
-        # ==================================================== 密度估计 f̂_Z ====================================================
+        # ==================================================== Return 部分: Critic 均值 ====================================================
+        # Q_critic_mean(s, a) = (1/M) Σ_j ψ_j(s, a)
+        # 这是 Distributional Critic 对 Q^π(s,a) = E[Z(s,a)] 的估计
+        with torch.no_grad():
+            critic_quantiles = self.online_critic(states, actions)  # [B, M]
+            critic_mean = critic_quantiles.mean(dim=1)              # [B]
+
+        # ==================================================== 约束部分: episode-level indicator ====================================================
+        # I{U(τ) ≤ Q_α}: 判断该 transition 所属 episode 的总回报是否低于分位数阈值
+        # 注意: 同一 episode 的所有 transition 得到相同的 indicator 值（与 QCPO 一致）
         density = self.estimate_density()
-        # density: 标量 tensor
+        indicators = indicator(self.q_est.detach(), episode_returns)  # [B]
 
-        # ==================================================== 计算 indicator ====================================================
-        # I{y_j ≤ Q(α)} for all TD targets
-        # td_targets: [B, M]
-        # 先展平计算，再 reshape 回来
-        indicators = (td_targets <= self.q_est.detach()).to(td_targets.dtype)  # [B, M]
-
-        # ==================================================== 计算约束项 ====================================================
-        # 约束项: λ · I{y_j ≤ Q(α)} / f̂_Z
-        # 密度 f̂_Z 在分母，用于将 indicator 的影响归一化到分布尺度
+        # 约束项: λ · I{U(τ) ≤ Q_α} / f̂_Z
         constraint_term = self.lambda_dual.detach() * indicators / density.detach()
-        # constraint_term: [B, M]
+        # 安全 clamp: 防止 λ/density 比值爆炸导致梯度主导
+        constraint_term = torch.clamp(constraint_term, max=self.max_constraint)
+        # constraint_term: [B]
 
-        # ==================================================== 计算梯度权重 ====================================================
-        # D̃ = (1/M) Σ_j [y_j - λ·I{y_j≤Q}/f̂_Z]
-        gradient_weights_per_j = td_targets - constraint_term  # [B, M]
-        gradient_weights = gradient_weights_per_j.mean(dim=1)   # [B]
+        # ==================================================== 合并梯度权重 ====================================================
+        # w_t = Q_critic_mean(s_t, a_t) - λ·I{U(τ)≤Q}/f̂_Z
+        gradient_weights = critic_mean - constraint_term  # [B]
 
         # ==================================================== Actor loss ====================================================
-        # 目标: 最大化 E[D̃ · log π(a|s)]
-        # 因为用梯度下降，加负号: loss = -D̃ · log π
+        # loss = -E[log π(a|s) · w_t]，负号把梯度上升转为梯度下降
         actor_loss = -(log_probs * gradient_weights.detach()).mean()
-        # .detach() 确保梯度不回传到 Critic 和 Q
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -733,7 +760,7 @@ class DQCAC(object):
     # ==================================================== Dual 更新 ====================================================
     def _update_dual(self):
         """
-        [函数简介]: 更新拉格朗日乘子 λ (Line 6)
+        [函数简介]: 更新拉格朗日乘子 λ
 
         λ ← ϕ(λ + ε_k(Q_k - q))
 
@@ -763,7 +790,6 @@ class DQCAC(object):
         std = torch.exp(self.actor.log_std).unsqueeze(0)           # [1, action_dim]
         std = std.expand_as(means)                                 # [B, action_dim]
 
-        # 对角协方差高斯分布可直接重参数化采样，避免逐样本构建分布对象
         noise = torch.randn_like(means)
         return means + noise * std
 
@@ -779,7 +805,7 @@ class DQCAC(object):
         std = std.expand_as(means)                                 # [B, action_dim]
         var = std.pow(2)                                           # [B, action_dim]
 
-        # 对角高斯分布 log_prob 按维求和:
+        # 对角高斯分布 log_prob:
         # log N(a|μ,σ²) = -0.5 * [((a-μ)^2 / σ²) + 2logσ + log(2π)]
         log_probs_per_dim = -0.5 * (
             ((actions - means) ** 2) / var + 2.0 * torch.log(std) + self._log_2pi
@@ -793,7 +819,6 @@ class DQCAC(object):
                 self.target_critic.parameters(),
                 self.online_critic.parameters()
             ):
-                # lerp_ 等价于 target = (1-tau)*target + tau*online，原地更新更轻量
                 target_param.data.lerp_(online_param.data, self.tau)
 
     def estimate_density(self):
@@ -814,7 +839,6 @@ class DQCAC(object):
         [输入]: state (np.ndarray)
         [输出]: action (np.ndarray)
         """
-        # 环境交互阶段不需要构建反向图，避免额外显存与计算开销
         with torch.no_grad():
             state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device)
             mean = self.actor(state_tensor)
