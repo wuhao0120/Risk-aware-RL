@@ -353,7 +353,7 @@ class DQCAC(object):
         # ==================================================== Wandb日志初始化 ====================================================
         wandb.init(
             project=args.env_name,
-            name=f"DQCAC_{args.seed}",
+            name=getattr(args, 'wandb_name', f"DQCAC_{args.seed}"),
             config={
                 **vars(args),
                 'algorithm': 'DQC-AC-v2',
