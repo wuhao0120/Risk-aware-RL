@@ -657,7 +657,6 @@ class DQCAC(object):
         # element_wise: ρ^κ_τ(u) = |τ - I{u<0}| · L_κ(u) / κ
         element_wise_loss = quantile_weight * huber_loss / self.huber_kappa  # [B, M, M]
 
-        # 在 target 维度 (j) 求和，current 维度 (i) 求均值，batch 求均值
         loss = element_wise_loss.sum(dim=2).mean(dim=1).mean()
 
         return loss
