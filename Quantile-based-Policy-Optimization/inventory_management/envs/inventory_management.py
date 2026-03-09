@@ -45,7 +45,7 @@ class InventoryManagementEnv(gym.Env):
         self.I[self.t] += self.I[self.t-1] + arrive - self.S[self.t,:-1]
         self.U[self.t] += self.q[self.t, :-1] - self.S[self.t, :-1]
 
-        done = self.t == self.T
+        done = self.t == self.TI
         self.R[self.t,:-1] += self.p[:-1] * self.S[self.t,:-1] - self.p[1:] * self.S[self.t,1:] \
                               - self.c * self.U[self.t] - self.h * self.I[self.t]
         self.R[self.t,-1] += np.sum(self.R[self.t,:-1])

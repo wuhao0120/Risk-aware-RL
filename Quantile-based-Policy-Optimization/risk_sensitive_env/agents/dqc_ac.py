@@ -1,29 +1,26 @@
-# ==================================================== DQC-AC Agent ====================================================
+# ==================================================== DQC-AC Agent (v3) ====================================================
 # DQC-AC (Distributional Quantile-Constrained Actor-Critic) for Risk-Sensitive Environment
 #
 # 核心算法: TD Learning + Distributional Critic + Primal-Dual 约束优化
-# 结合 QCPO 的 episode-level 分位数约束 与 Distributional Critic 的数据效率
 #
-# ===== 核心设计思想 =====
-# QCPO 使用 Monte-Carlo episode return U(τ) 做约束判断（正确但数据低效）
-# 本算法将梯度拆为两部分，用不同数据源：
+# ===== v3 核心设计: 固定长度 Rolling Return =====
+# 环境从 n=10 放宽到 n=2*rollout_n-1=19:
+#   - 每条 trajectory 走 19 步, 只存前 rollout_n=10 个 transition 到 Replay Buffer
+#   - 这样 TD bootstrap 链能从任意 step t 正确展开 rollout_n 步
+#   - Critic ψ(s_t, a_t) 隐式学到 "从 s_t 出发走 rollout_n 步的 cumulative return"
 #
-#   ∇θ L = E[∇θ log π · Q_critic(s,a)]           ← Critic 提供 (per-transition, off-policy)
-#         - λ/f_Z · E[I{U(τ)≤Q_α} · ∇θ log π]   ← episode return 提供 (episode-level, 数学正确)
+# 例: step 2 的 Critic 输出 ψ(s_2, a_2) ≈ Σ_{k=2}^{11} γ^{k-2} r_k
+#     即从 step 2 开始到 step 11 的 10步 cumulative return
 #
-# 合并后每个 transition 的梯度权重:
-#   w_t = Q_critic_mean(s_t, a_t) - λ · I{U(τ) ≤ Q_α} / f̂_Z
-#
-# 关键区别 vs 旧版:
-# - Q/λ/indicator 全部基于 episode return（与 QCPO 一致），而非 TD targets
-# - Critic 仅用于: (1) Actor梯度中的return估计 (2) 自身的 distributional TD 训练
-# - Replay Buffer 额外存储每个 transition 所属 episode 的 U(τ)
+# 梯度权重 (TD target 作为 "虚拟 return"):
+#   ȳ_t = (1/M) Σ_j (r_t + γ·ψ_j(s_{t+1}, a'; ω))    ← TD target 均值
+#   w_t = ȳ_t - λ · I{ȳ_t ≤ Q_α} / f̂_Z
 #
 # 关键公式:
-# - TD targets:     y_j = r + γ·ψ_j(s', a'; ω)             (Critic 训练用)
+# - TD targets:     y_j = r + γ·ψ_j(s', a'; ω)             (Critic 训练 + Actor 梯度)
 # - Critic Loss:    Σ_i Σ_j ρ_{τ_i}^κ(y_j - ψ_i(s,a))     (Quantile Huber Loss)
-# - Q Update:       Q ← Q + β(α - I{U(τ) ≤ Q})             (用 episode return, 非 TD target)
-# - Actor Gradient: w = Q_critic_mean - λ·I{U(τ)≤Q}/f̂_Z    (Critic + episode return 混合)
+# - Q Update:       Q ← Q + β(α - I{ȳ ≤ Q})                (用 TD target 均值)
+# - Actor Gradient: w = ȳ - λ·I{ȳ≤Q}/f̂_Z                   (TD target 统一)
 # - Density:        f̂_Z = 2δ / (Q(α+δ) - Q(α-δ))
 # ==================================================================================================================
 

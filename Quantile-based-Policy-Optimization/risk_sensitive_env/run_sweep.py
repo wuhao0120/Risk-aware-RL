@@ -190,6 +190,103 @@ EXPERIMENTS = {
 
 
 # ==================================================== 工具函数 ====================================================
+BEST3_EXPERIMENTS = {
+    "exp4_optimal_th5_nq200_tui1000",
+    "exp7_optimal_th4_nq200_tui1000",
+    "exp8_optimal_th6_nq200_tui1000",
+}
+
+
+def infer_param_group(exp_name: str, overrides: dict) -> str:
+    """
+    根据实验参数判定 wandb group 维度
+
+    目标: 让同一类 sweep 在 workspace 中可一键过滤查看。
+    """
+    if exp_name in BEST3_EXPERIMENTS:
+        return "best3"
+
+    keys = set(overrides.keys())
+    if keys == {"tau"}:
+        return "tau"
+    if keys == {"updates_per_episode"}:
+        return "updates_per_episode"
+    if keys == {"target_update_interval"}:
+        return "target_update_interval"
+    if keys == {"num_quantiles", "emb_dim"}:
+        return "model_capacity"
+    if keys == {"batch_size", "theta_a"}:
+        return "batch_lr"
+
+    return "mixed"
+
+
+def _to_tag_value(value) -> str:
+    """将参数值转换为 tag 友好的紧凑字符串。"""
+    if isinstance(value, list):
+        return "-".join(str(x) for x in value)
+    if isinstance(value, tuple):
+        return "-".join(str(x) for x in value)
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+def build_wandb_tags(exp_name: str, overrides: dict, param_group: str, sweep_id: str):
+    """
+    组装 wandb tags:
+    - 基础标签: 算法/批次/分组/实验名
+    - 参数标签: 每个覆盖参数都打 param 与 value 标签，便于过滤
+    """
+    tags = [
+        "algo:DQCAC",
+        "kind:sweep",
+        f"sweep_id:{sweep_id}",
+        f"group:{param_group}",
+        f"exp:{exp_name}",
+    ]
+
+    for key in sorted(overrides.keys()):
+        tags.append(f"param:{key}")
+        tags.append(f"value:{key}={_to_tag_value(overrides[key])}")
+
+    if exp_name in BEST3_EXPERIMENTS:
+        tags.append("tier:best3")
+
+    return tags
+
+
+def patch_wandb_init_for_run(args):
+    """
+    在当前子进程中临时包装 wandb.init，注入 name/group/tags/job_type。
+
+    这样可以尽量只改 run_sweep.py，不需要动 agent 代码。
+    """
+    original_init = wandb.init
+
+    def _wrapped_init(*init_args, **init_kwargs):
+        # name/group/job_type 使用 run_sweep 中计算的值，覆盖 agent 默认值
+        if getattr(args, "wandb_name", None):
+            init_kwargs["name"] = args.wandb_name
+        if getattr(args, "wandb_group", None):
+            init_kwargs["group"] = args.wandb_group
+        if getattr(args, "wandb_job_type", None):
+            init_kwargs["job_type"] = args.wandb_job_type
+
+        # 合并 tags，保留去重后的顺序
+        merged_tags = list(init_kwargs.get("tags") or [])
+        for tag in getattr(args, "wandb_tags", []):
+            if tag not in merged_tags:
+                merged_tags.append(tag)
+        if merged_tags:
+            init_kwargs["tags"] = merged_tags
+
+        return original_init(*init_args, **init_kwargs)
+
+    wandb.init = _wrapped_init
+    return original_init
+
+
 def make_args(overrides: dict, max_episode_override: int = None) -> BaselineArgs:
     """
     在 baseline 基础上覆盖指定参数
@@ -224,8 +321,14 @@ def args_to_serializable(args) -> dict:
 
 
 # ==================================================== 单个实验进程 ====================================================
-def run_single_experiment(exp_name, overrides, gpu_id=0, eval_episodes=10000,
-                          max_episode_override=None):
+def run_single_experiment(
+    exp_name,
+    overrides,
+    gpu_id=0,
+    eval_episodes=10000,
+    max_episode_override=None,
+    sweep_id="manual",
+):
     """
     单个实验: 训练 → 评估 → 保存结果
 
@@ -236,12 +339,22 @@ def run_single_experiment(exp_name, overrides, gpu_id=0, eval_episodes=10000,
     - eval_episodes:        评估时的 episode 数
     - max_episode_override: CLI 覆盖的训练轮数
     """
+    original_wandb_init = None
     try:
         # ==================== 设置设备与 wandb 名称 ====================
         device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
         args = make_args(overrides, max_episode_override)
         args.device = device
         args.wandb_name = f"DQCAC_{exp_name}"             # 让 wandb run 名称区分不同实验
+        args.wandb_job_type = "sweep"
+
+        # 按 sweep 参数维度分组，最优3组自动归入 best3 组
+        param_group = infer_param_group(exp_name, overrides)
+        args.wandb_group = f"dqcac_sweep_{sweep_id}_{param_group}"
+        args.wandb_tags = build_wandb_tags(exp_name, overrides, param_group, sweep_id)
+
+        # 仅在当前子进程临时覆盖 wandb.init 行为，避免改 agent 文件
+        original_wandb_init = patch_wandb_init_for_run(args)
 
         # ==================== 随机种子 ====================
         random.seed(args.seed)
@@ -280,6 +393,14 @@ def run_single_experiment(exp_name, overrides, gpu_id=0, eval_episodes=10000,
         payload = {
             "experiment_name": exp_name,
             "timestamp": timestamp,
+            "wandb": {
+                "name": args.wandb_name,
+                "group": args.wandb_group,
+                "job_type": args.wandb_job_type,
+                "tags": args.wandb_tags,
+                "sweep_id": sweep_id,
+                "param_group": param_group,
+            },
             # ---- 评估结果 ----
             "eval": {
                 "mean_return": round(float(mean_ret), 6),
@@ -309,6 +430,10 @@ def run_single_experiment(exp_name, overrides, gpu_id=0, eval_episodes=10000,
         print(f"\n[ERROR] [{exp_name}] 实验失败: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        # 恢复 wandb.init，确保包装器只影响当前 run
+        if original_wandb_init is not None:
+            wandb.init = original_wandb_init
 
 
 # ==================================================== 结果汇总 ====================================================
@@ -376,8 +501,11 @@ def main():
                         help="列出所有可用实验及其参数差异")
     parser.add_argument("--summary", action="store_true",
                         help="只打印已有结果汇总, 不启动训练")
+    parser.add_argument("--sweep-id", type=str, default=None,
+                        help="本次 sweep 标识符 (用于 wandb group/tag; 默认自动时间戳)")
 
     cli_args = parser.parse_args()
+    sweep_id = cli_args.sweep_id or time.strftime("%Y%m%d-%H%M%S")
 
     # ---- 列出实验 ----
     if cli_args.list:
@@ -418,6 +546,7 @@ def main():
     print(f"  GPU:        cuda:{cli_args.gpu}")
     print(f"  训练轮数:   {max_ep_str}")
     print(f"  评估轮数:   {cli_args.eval_episodes}")
+    print(f"  Sweep ID:   {sweep_id}")
     print(f"  结果目录:   {SCRIPT_DIR / 'sweep_results'}")
     print(f"{'=' * 60}")
     for name, ov in experiments.items():
@@ -442,7 +571,7 @@ def main():
             p = Process(
                 target=run_single_experiment,
                 args=(exp_name, overrides, cli_args.gpu, cli_args.eval_episodes,
-                      cli_args.max_episode)
+                      cli_args.max_episode, sweep_id)
             )
             p.start()
             processes.append((exp_name, p))

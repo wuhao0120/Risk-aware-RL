@@ -5,7 +5,11 @@
       "Bash(conda run:*)",
       "Bash(e:/Miniconda3/envs/distRL/python.exe:*)",
       "Bash(grep:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "WebSearch",
+      "WebFetch(domain:projecteuclid.org)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:doi.org)"
     ]
   }
 }

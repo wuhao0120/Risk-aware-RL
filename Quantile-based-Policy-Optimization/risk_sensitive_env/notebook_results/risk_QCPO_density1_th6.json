@@ -2,7 +2,7 @@
   "algo_name": "QCPO",
   "mean_return": 10.8627,
   "quantile_return": 5.5982,
-  "learned_risk": ,
+  "learned_risk": 0,
   "q_alpha": 0.25,
   "quantile_threshold": 6,
   "density_estimate": true,

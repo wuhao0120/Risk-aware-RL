@@ -462,7 +462,7 @@ class QCPO(object):
         self.lambda_optimizer.zero_grad()
         
         # Dual loss
-        dual_loss = self.lambda_dual * (self.q_est.detach() - self.quantile_threshold)
+        dual_loss = self.lambda_dual * (self.q_est.detach() - self.quantile_threshold)  
         
         dual_loss.backward()
         self.lambda_optimizer.step()
