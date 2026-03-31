@@ -15,26 +15,44 @@ def init_weights(module: nn.Module, gain: float = 1):
     return module
 
 
-class Actor(nn.Module): 
+class Actor(nn.Module):
     """
     Actor Network (策略网络)
-    
+
     用于输出动作分布的均值参数
     在QPO/QCPO中，动作服从高斯分布：π(a|s) = N(μ(s), σ²)
-    本网络输出均值 μ(s)，标准差 σ 作为可学习参数（但默认不训练）
+    本网络输出均值 μ(s)，标准差 σ 作为可学习参数（默认不训练）
+
+    支持两种架构:
+    - hidden_dims=None: 线性策略 μ(s) = W @ s  (原始行为, 3个参数)
+    - hidden_dims=[64,64]: MLP策略 μ(s) = W₂·tanh(W₁·s + b₁) + b₂
     """
-    def __init__(self, state_dim, action_dim, init_std=1.0):
+    def __init__(self, state_dim, action_dim, init_std=1.0, hidden_dims=None):
         """
         Args:
             state_dim: 状态维度
             action_dim: 动作维度
             init_std: 初始标准差（用于探索）
+            hidden_dims: 隐藏层维度列表, 如 [64, 64]。None 则用线性策略
         """
         super(Actor, self).__init__()
 
-        # 简单线性策略: μ(s) = W @ s
         self.model = nn.Sequential()
-        self.model.add_module('fc0', init_weights(nn.Linear(state_dim, action_dim, bias=False)))
+
+        if hidden_dims is None or len(hidden_dims) == 0:
+            # 线性策略: μ(s) = W @ s (向后兼容)
+            self.model.add_module('fc0', init_weights(nn.Linear(state_dim, action_dim, bias=False)))
+        else:
+            # MLP策略: state_dim → hidden[0] → ... → hidden[-1] → action_dim
+            layer_dims = [state_dim] + list(hidden_dims) + [action_dim]
+            for i in range(len(layer_dims) - 1):
+                is_last = (i == len(layer_dims) - 2)
+                self.model.add_module(
+                    f'fc{i}',
+                    init_weights(nn.Linear(layer_dims[i], layer_dims[i + 1], bias=True))
+                )
+                if not is_last:
+                    self.model.add_module(f'act{i}', nn.Tanh())
 
         # 对数标准差作为可学习参数（默认不训练）
         self.log_std = nn.Parameter(torch.full((action_dim,), np.log(init_std)))
@@ -43,10 +61,10 @@ class Actor(nn.Module):
     def forward(self, x):
         """
         前向传播
-        
+
         Args:
             x: 状态输入 [batch_size, state_dim] 或 [state_dim]
-            
+
         Returns:
             动作均值 [batch_size, action_dim] 或 [action_dim]
         """

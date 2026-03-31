@@ -1,11 +1,12 @@
-# ==================================================== DQC-AC Agent (v4) ====================================================
+# ==================================================== DQC-AC Agent (v5) ====================================================
 # DQC-AC (Distributional Quantile-Constrained Actor-Critic) for Risk-Sensitive Environment
 #
 # 严格实现论文 Algorithm 3 (Distributional Quantile-Constrained Actor-Critic)
 # 核心思想: 用 TD targets 完全替代 Monte Carlo episode returns，实现 per-transition 更新
 #
-# ===== v4: 严格 Algorithm 3 + T=10 截断模拟 infinite horizon =====
-# 环境每 episode 走 T=10 步 (截断近似 infinite horizon)
+# ===== v5: 严格 Algorithm 3 + 正确的 truncation 处理 (infinite horizon) =====
+# 环境每 episode 走 max_steps 步 (截断近似 infinite horizon)
+# 关键改进: 区分 terminated 与 truncated，TD target 只在真正终止时置零
 # 算法完全基于 TD targets，不依赖 episode returns:
 #   - Critic ψ(s,a;ω) 输出 M 个分位数，学习 Z(s,a) 的分布
 #   - Q update 用 TD targets: Q ← Q + (1/M)Σ_j β(α - I{y_j ≤ Q})
@@ -58,9 +59,13 @@ def indicator(threshold, values: torch.Tensor):
 # ==================================================== Replay Buffer ====================================================
 class ReplayBuffer:
     """
-    [类简介]: 经验回放缓冲区，存储标准 transition (s, a, r, s', done)
+    [类简介]: 经验回放缓冲区，存储 transition (s, a, r, s', terminated)
 
-    Algorithm 3 完全基于 TD targets 更新，不需要存储 episode-level 信息
+    关键: 只存 terminated 标志（真正的终止），不存 truncated。
+    Infinite horizon 环境中 terminated 始终为 False，截断由外部 max_steps 控制。
+    TD target 只用 terminated 做 bootstrap mask:
+      y = r + γ·V(s') · (1 - terminated)
+    截断时仍然 bootstrap（因为 MDP 并未真正结束）。
     """
 
     def __init__(self, capacity, device):
@@ -75,7 +80,7 @@ class ReplayBuffer:
         self.device = device
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, done):
+    def push(self, state, action, reward, next_state, terminated):
         """
         [函数简介]: 添加一个 transition 到缓冲区
 
@@ -84,9 +89,9 @@ class ReplayBuffer:
         - action: 采取的动作 (np.ndarray)
         - reward: 获得的奖励 (float)
         - next_state: 下一个状态 (np.ndarray)
-        - done: 是否终止 (bool)
+        - terminated: 是否真正终止 (bool/float), 截断不算终止
         """
-        self.buffer.append((state, action, reward, next_state, done))
+        self.buffer.append((state, action, reward, next_state, terminated))
 
     def sample(self, batch_size):
         """
@@ -97,18 +102,18 @@ class ReplayBuffer:
         - actions: [batch_size, action_dim]
         - rewards: [batch_size]
         - next_states: [batch_size, state_dim]
-        - dones: [batch_size]
+        - terminateds: [batch_size], 只有真正终止才为1，截断为0
         """
         batch = random.sample(self.buffer, batch_size)
 
-        states, actions, rewards, next_states, dones = zip(*batch)
+        states, actions, rewards, next_states, terminateds = zip(*batch)
 
         return {
             'states': torch.as_tensor(np.asarray(states), dtype=torch.float32, device=self.device),
             'actions': torch.as_tensor(np.asarray(actions), dtype=torch.float32, device=self.device),
             'rewards': torch.as_tensor(np.asarray(rewards), dtype=torch.float32, device=self.device),
             'next_states': torch.as_tensor(np.asarray(next_states), dtype=torch.float32, device=self.device),
-            'dones': torch.as_tensor(np.asarray(dones), dtype=torch.float32, device=self.device),
+            'terminateds': torch.as_tensor(np.asarray(terminateds), dtype=torch.float32, device=self.device),
         }
 
     def __len__(self):
@@ -264,7 +269,8 @@ class DQCAC(object):
         self._log_2pi = float(np.log(2.0 * np.pi))     # 高斯log_prob常量项，避免重复计算
 
         # ==================================================== Actor网络 ====================================================
-        self.actor = Actor(state_dim, action_dim, args.init_std).to(self.device)
+        actor_hidden = getattr(args, 'actor_hidden_dims', None)
+        self.actor = Actor(state_dim, action_dim, args.init_std, hidden_dims=actor_hidden).to(self.device)
 
         # Actor优化器
         self.actor_optimizer = Adam(self.actor.parameters(), lr=1.0, eps=1e-5)
@@ -344,12 +350,13 @@ class DQCAC(object):
             name=getattr(args, 'wandb_name', f"DQCAC_{args.seed}"),
             config={
                 **vars(args),
-                'algorithm': 'DQC-AC-v4-Algorithm3',
+                'algorithm': 'DQC-AC-v5-Algorithm3-truncation',
                 'num_quantiles': self.num_quantiles,
                 'buffer_capacity': self.buffer_capacity,
                 'batch_size': self.batch_size,
             },
             reinit=True,
+            id=wandb.util.generate_id(),
             group="DQCAC",
             dir=getattr(args, 'wandb_dir', None)
         )
@@ -358,10 +365,11 @@ class DQCAC(object):
         self._warmup()
 
         # ==================================================== 打印初始化信息 ====================================================
-        print(f"DQC-AC (v4 Algorithm3): α={self.q_alpha}, δ={self.delta}")
-        print(f"DQC-AC (v4 Algorithm3): Distributional Critic M={self.num_quantiles} quantiles")
-        print(f"DQC-AC (v4 Algorithm3): Constraint Q >= {self.quantile_threshold}")
-        print(f"DQC-AC (v4 Algorithm3): Q estimates: {self.q_est_lower.item():.3f}, "
+        print(f"DQC-AC (v5): α={self.q_alpha}, δ={self.delta}")
+        print(f"DQC-AC (v5): Distributional Critic M={self.num_quantiles} quantiles")
+        print(f"DQC-AC (v5): Constraint Q >= {self.quantile_threshold}")
+        print(f"DQC-AC (v5): Truncation-aware TD targets (infinite horizon)")
+        print(f"DQC-AC (v5): Q estimates: {self.q_est_lower.item():.3f}, "
               f"{self.q_est.item():.3f}, {self.q_est_upper.item():.3f}")
 
     # ==================================================== 预热 ====================================================
@@ -385,18 +393,18 @@ class DQCAC(object):
             while True:
                 state_flat = state.reshape(-1)
                 action = self.choose_action(state_flat, store_memory=False)
-                next_state, reward, done, _ = self._step_env(action)
+                next_state, reward, terminated, truncated, _ = self._step_env(action)
 
-                # Algorithm 3: 直接 push transition，不需要等 episode 结束
+                # 只存 terminated，截断时仍需 bootstrap
                 self.replay_buffer.push(
-                    state_flat, action, reward, next_state.reshape(-1), float(done)
+                    state_flat, action, reward, next_state.reshape(-1), float(terminated)
                 )
 
                 episode_return += disc_factor * reward
                 disc_factor *= self.gamma
                 state = next_state
 
-                if done:
+                if terminated or truncated:
                     break
 
             episode_returns.append(episode_return)
@@ -443,11 +451,11 @@ class DQCAC(object):
             while True:
                 state_flat = state.reshape(-1)
                 action = self.choose_action(state_flat, store_memory=False)
-                next_state, reward, done, _ = self._step_env(action)
+                next_state, reward, terminated, truncated, _ = self._step_env(action)
 
-                # Algorithm 3: 直接 push transition，不需要等 episode 结束
+                # 只存 terminated，截断时仍需 bootstrap
                 self.replay_buffer.push(
-                    state_flat, action, reward, next_state.reshape(-1), float(done)
+                    state_flat, action, reward, next_state.reshape(-1), float(terminated)
                 )
 
                 episode_reward += reward
@@ -458,7 +466,7 @@ class DQCAC(object):
 
                 state = next_state
 
-                if done:
+                if terminated or truncated:
                     break
 
             # disc_epi_reward 仅用于日志监控，不参与算法更新
@@ -488,8 +496,8 @@ class DQCAC(object):
             self.crossing_history.append(crossing_violation)
             crossing_rate = sum(self.crossing_history) / len(self.crossing_history)
 
-            wandb.log({
-                'disc_reward/raw_reward': episode_reward,
+            log_dict = {
+                'disc_reward/raw_reward': disc_epi_reward,
                 'lambda/value': self.lambda_dual.item(),
                 'action/avg_risk_episode': avg_risk_episode,
                 'density/estimate': density_est.item(),
@@ -498,7 +506,7 @@ class DQCAC(object):
                 'training/total_steps': total_steps,
                 'training/episode_steps': episode_steps,
                 'training/learning_steps': self.learning_steps,
-            }, step=i_episode)
+            }
 
             # ==================== 5. 定期详细日志 ====================
             if i_episode % self.log_interval == 0 and i_episode != 0:
@@ -510,20 +518,22 @@ class DQCAC(object):
 
                 constraint_margin = disc_q_reward - self.quantile_threshold
 
-                wandb.log({
+                log_dict.update({
                     'disc_reward/aver_reward': disc_a_reward,
                     'disc_reward/quantile_reward': disc_q_reward,
                     'quantile/q_est': self.q_est.item(),
                     'quantile/q_est_lower': self.q_est_lower.item(),
                     'quantile/q_est_upper': self.q_est_upper.item(),
                     'constraint/margin': constraint_margin,
-                }, step=i_episode)
+                })
 
                 print(f'Epi:{i_episode:05d} || disc_a_r:{disc_a_reward:.03f} '
                       f'disc_q_r:{disc_q_reward:.03f} λ:{self.lambda_dual.item():.04f}')
                 print(f'Epi:{i_episode:05d} || Q_low:{self.q_est_lower.item():.03f} '
                       f'Q_mid:{self.q_est.item():.03f} Q_high:{self.q_est_upper.item():.03f} '
                       f'density:{density_est.item():.04f}', '\n')
+
+            wandb.log(log_dict, step=i_episode)
 
     # ==================================================== 核心学习函数 ====================================================
     def _learn(self):
@@ -548,11 +558,11 @@ class DQCAC(object):
 
         # ==================== 采样 Batch ====================
         batch = self.replay_buffer.sample(self.batch_size)
-        states = batch['states']           # [B, state_dim]
-        actions = batch['actions']         # [B, action_dim]
-        rewards = batch['rewards']         # [B]
-        next_states = batch['next_states'] # [B, state_dim]
-        dones = batch['dones']             # [B]
+        states = batch['states']               # [B, state_dim]
+        actions = batch['actions']             # [B, action_dim]
+        rewards = batch['rewards']             # [B]
+        next_states = batch['next_states']     # [B, state_dim]
+        terminateds = batch['terminateds']     # [B], 只有真正终止才为1
 
         # ==================== 计算 TD targets (三步共享) ====================
         # Algorithm 3 Step 11-12: a' ~ π(·|s';θ), y_j = r + γ·ψ_j(s',a';ω_target)
@@ -560,8 +570,11 @@ class DQCAC(object):
             next_actions = self._sample_actions(next_states)   # [B, action_dim]
             next_quantiles = self.target_critic(next_states, next_actions)  # [B, M]
 
-            # y_j = r + γ·ψ_j(s', a'; ω_target) · (1 - done)
-            td_targets = rewards.unsqueeze(1) + self.gamma * next_quantiles * (1 - dones.unsqueeze(1))
+            # y_j = r + γ·ψ_j(s', a'; ω_target) · (1 - terminated)
+            # 关键: 用 terminated 而非 done 做 mask
+            # 截断 (truncated) 时 terminated=0，仍然 bootstrap → 正确的 infinite horizon 行为
+            # 真正终止时 terminated=1，不 bootstrap → y_j = r
+            td_targets = rewards.unsqueeze(1) + self.gamma * next_quantiles * (1 - terminateds.unsqueeze(1))
             # td_targets: [B, M], 论文中的 distributional Bellman target
 
         # ==================== 1. Critic Update (Algorithm 3 Step 13) ====================
@@ -825,16 +838,23 @@ class DQCAC(object):
         return state
 
     def _step_env(self, action):
-        """兼容 Gym/Gymnasium 的 step"""
+        """
+        兼容 Gym/Gymnasium 的 step, 始终返回 5 值:
+        (state, reward, terminated, truncated, info)
+
+        terminated: MDP 真正结束 (infinite horizon 环境中始终 False)
+        truncated: 达到 max_steps 的人为截断
+        """
         outcome = self.env.step(action)
         if len(outcome) == 5:
             state, reward, terminated, truncated, info = outcome
-            done = terminated or truncated
         elif len(outcome) == 4:
             state, reward, done, info = outcome
+            terminated = done
+            truncated = False
         else:
             raise ValueError("env.step() 返回值格式异常")
-        return state, reward, done, info
+        return state, reward, terminated, truncated, info
 
     def _compute_episode_avg_risk(self):
         """返回当前 episode 的平均风险等级"""

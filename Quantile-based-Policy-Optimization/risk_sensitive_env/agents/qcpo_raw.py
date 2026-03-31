@@ -71,7 +71,8 @@ class QCPO(object):
         # 策略网络
         state_dim = np.prod(self.env.observation_space.shape)
         action_dim = np.prod(self.env.action_space.shape)
-        self.actor = Actor(state_dim, action_dim, args.init_std)
+        actor_hidden = getattr(args, 'actor_hidden_dims', None)
+        self.actor = Actor(state_dim, action_dim, args.init_std, hidden_dims=actor_hidden)
 
         # 策略优化器和学习率调度器
         self.optimizer = Adam(self.actor.parameters(), 1., eps=1e-5)

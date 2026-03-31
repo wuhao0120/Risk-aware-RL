@@ -51,19 +51,27 @@ class QCPO(object):
     
     def __init__(self, args, env):
         self.device = args.device
-        
+
         # 训练参数
         self.log_interval = args.log_interval
         self.est_interval = args.est_interval
         self.q_alpha = args.q_alpha
         self.gamma = args.gamma
         self.max_episode = args.max_episode
-        
+
         # QCPO特有参数
         self.density_estimate = args.density_estimate  # 是否使用密度估计
         self.quantile_threshold = args.quantile_threshold   # 分位数约束阈值 C
         self.outer_interval = args.outer_interval           # 外层更新间隔
-        
+
+        # ==== 修复方案参数 (解决 λ/density 比值失控问题) ====
+        # 方案B: clamp constraint_term 使约束项不超过 |U(τ)|*ratio
+        #   constraint_clamp_ratio > 0 时启用, 例如 2.0 表示约束项最大为 2*|U|
+        self.constraint_clamp_ratio = getattr(args, 'constraint_clamp_ratio', 0.0)
+        # 方案C: 归一化 gradient_weights, 使 U(τ) 和 constraint_term 量级可比
+        #   'none'=不归一化(默认), 'scale'=按max(|U|,|C|)缩放, 'standardize'=均值0方差1
+        self.normalize_gradient = getattr(args, 'normalize_gradient', 'none')
+
         if not self.density_estimate:
             # 原始版本使用nu
             self.nu = args.nu
@@ -80,7 +88,8 @@ class QCPO(object):
         # 策略网络
         state_dim = np.prod(self.env.observation_space.shape)
         action_dim = np.prod(self.env.action_space.shape)
-        self.actor = Actor(state_dim, action_dim, args.init_std)
+        actor_hidden = getattr(args, 'actor_hidden_dims', None)
+        self.actor = Actor(state_dim, action_dim, args.init_std, hidden_dims=actor_hidden).to(self.device)
 
         # 策略优化器和学习率调度器
         self.optimizer = Adam(self.actor.parameters(), 1., eps=1e-5)
@@ -99,6 +108,7 @@ class QCPO(object):
             name=f"{args.algo_name}{algo_suffix}_{args.seed}", 
             config={**vars(args), 'density_estimate': self.density_estimate}, 
             reinit=True, 
+            id=wandb.util.generate_id(),
             group=f"{args.algo_name}{algo_suffix}",
             dir=getattr(args, 'wandb_dir', None)
         )
@@ -209,33 +219,35 @@ class QCPO(object):
                     break
             
             avg_risk_episode = self._compute_episode_avg_risk()
-            
+            regime_stats = self._compute_regime_stats()
+
             # 内层更新(θ, Q)
             self.update_inner()
             self.memory.clear()
-            
+
             inner_step_counter += 1
-            
+
             # 外层更新(λ)，每outer_interval次执行一次
             if inner_step_counter >= self.outer_interval:
                 self.update_dual()
                 inner_step_counter = 0
-            
+
             disc_epi_rewards.append(disc_epi_reward)
 
             log_dict = {
-                'disc_reward/raw_reward': episode_reward,
-                'disc_reward/discounted_reward': disc_epi_reward,
+                'disc_reward/raw_reward': disc_epi_reward,
                 'lambda/value': self.lambda_dual.item(),
                 'action/avg_risk_episode': avg_risk_episode
             }
-            
+            log_dict.update(regime_stats)
+
             if self.density_estimate:
-                # 计算密度估计
+                # 计算密度估计及 λ/f 比值 (诊断量级失控)
                 density_est = self.compute_density_estimate()
                 log_dict['density/estimate'] = density_est.item()
-            
-            wandb.log(log_dict, step=i_episode)
+                lambda_over_density = self.lambda_dual.item() / max(density_est.item(), 1e-8)
+                log_dict['debug/lambda_over_density'] = lambda_over_density
+                log_dict['debug/ratio_to_reward'] = lambda_over_density / max(abs(disc_epi_reward), 1.0)
             
             # 日志记录
             if i_episode % self.log_interval == 0 and i_episode != 0:
@@ -246,7 +258,7 @@ class QCPO(object):
                 # 约束满足余量: Q - C
                 constraint_margin = disc_q_reward - self.quantile_threshold
                 
-                log_dict = {
+                interval_log_dict = {
                     'disc_reward/aver_reward': disc_a_reward,
                     'disc_reward/quantile_reward': disc_q_reward,
                     'quantile/q_est': self.q_est.item(),
@@ -254,10 +266,10 @@ class QCPO(object):
                 }
                 
                 if self.density_estimate:
-                    log_dict['quantile/q_est_low'] = self.q_est_low.item()
-                    log_dict['quantile/q_est_high'] = self.q_est_high.item()
+                    interval_log_dict['quantile/q_est_low'] = self.q_est_low.item()
+                    interval_log_dict['quantile/q_est_high'] = self.q_est_high.item()
                 
-                wandb.log(log_dict, step=i_episode)
+                log_dict.update(interval_log_dict)
                 
                 print(f'Epi:{i_episode:05d} || disc_a_r:{disc_a_reward:.03f} '
                       f'disc_q_r:{disc_q_reward:.03f} λ:{self.lambda_dual.item():.04f}')
@@ -273,6 +285,8 @@ class QCPO(object):
                 print(f'Epi:{i_episode:05d} || lr:{self.scheduler.get_last_lr()[0]:.2e} '
                       f'q_lr:{self.q_scheduler.get_last_lr()[0]:.2e} '
                       f'λ_lr:{self.lambda_scheduler.get_last_lr()[0]:.2e}\n')
+
+            wandb.log(log_dict, step=i_episode)
             
             self.scheduler.step()
             self.q_scheduler.step()
@@ -282,27 +296,29 @@ class QCPO(object):
         """
         根据当前策略采样动作（训练时使用，会存储到memory）
         """
-        state = torch.from_numpy(state).float()
-        mean = self.actor(state)
-        var = torch.diag(torch.exp(2 * self.actor.log_std))
-        dist = MultivariateNormal(mean, var)
-        action = dist.sample()
-        
+        with torch.no_grad():
+            state = torch.from_numpy(state).float().to(self.device)
+            mean = self.actor(state)
+            var = torch.diag(torch.exp(2 * self.actor.log_std))
+            dist = MultivariateNormal(mean, var)
+            action = dist.sample()
+
         self.memory.states.append(state)
         self.memory.actions.append(action)
-        
-        return action.detach().data.cpu().numpy()
+
+        return action.cpu().numpy()
 
     def select_action(self, state):
         """
         选择动作（评估时使用，不存储memory）
         """
-        state = torch.from_numpy(state).float()
-        mean = self.actor(state)
-        var = torch.diag(torch.exp(2 * self.actor.log_std))
-        dist = MultivariateNormal(mean, var)
-        action = dist.sample()
-        return action.detach().data.cpu().numpy()
+        with torch.no_grad():
+            state = torch.from_numpy(state).float().to(self.device)
+            mean = self.actor(state)
+            var = torch.diag(torch.exp(2 * self.actor.log_std))
+            dist = MultivariateNormal(mean, var)
+            action = dist.sample()
+        return action.cpu().numpy()
 
     def _reset_env(self):
         """兼容Gym/Gymnasium reset接口"""
@@ -387,17 +403,15 @@ class QCPO(object):
         2. 密度估计版本 (density_estimate=True):
            D(τ, θ, Q) = (U(τ) - λ·I{U(τ) ≤ Q}/π̂(Q_τ)) Σ ∇_θ log π(a|s;θ)
         """
-        self.actor.to(self.device)
-
         # 计算折扣奖励
         disc_reward, disc_reward_short = self.compute_discounted_epi_reward()
-        
+
         # 计算示性函数: I{U(τ) ≤ Q}
         ind = indicator(self.q_est.detach(), disc_reward)
 
-        # 获取旧状态和动作
-        old_states = torch.stack(self.memory.states).to(self.device).detach()
-        old_actions = torch.stack(self.memory.actions).to(self.device).detach()
+        # 获取旧状态和动作 (已在device上)
+        old_states = torch.stack(self.memory.states).detach()
+        old_actions = torch.stack(self.memory.actions).detach()
 
         # 计算对数概率
         logprobs, _ = self.evaluate(old_states, old_actions)
@@ -407,11 +421,30 @@ class QCPO(object):
             # 密度估计版本: U(τ) - λ·I{U(τ) ≤ Q}/π̂(Q_τ)
             density = self.compute_density_estimate()
             constraint_term = self.lambda_dual * ind / density
-            gradient_weights = disc_reward - constraint_term
         else:
             # 原始版本: U(τ) - ν·λ·I{U(τ) ≤ Q}
             constraint_term = self.nu * self.lambda_dual * ind
-            gradient_weights = disc_reward - constraint_term
+
+        # ==== 方案B: Clamp constraint_term ====
+        # 防止 λ/density 失控导致约束项淹没奖励项
+        if self.constraint_clamp_ratio > 0:
+            reward_scale = disc_reward.abs().mean().detach()          # |U(τ)| 的平均量级
+            clamp_max = self.constraint_clamp_ratio * reward_scale    # 约束项上界
+            constraint_term = torch.clamp(constraint_term, max=clamp_max)
+
+        gradient_weights = disc_reward - constraint_term
+
+        # ==== 方案C: 归一化 gradient_weights ====
+        if self.normalize_gradient == 'scale':
+            # 按 max(|U|, |C|) 缩放, 使两项量级相当
+            scale = torch.max(disc_reward.abs().mean(), constraint_term.abs().mean()).detach()
+            scale = torch.clamp(scale, min=1.0)                      # 防除零
+            gradient_weights = gradient_weights / scale
+        elif self.normalize_gradient == 'standardize':
+            # 标准化为均值0方差1
+            gw_std = gradient_weights.std().detach()
+            gw_std = torch.clamp(gw_std, min=1.0)                    # 防除零
+            gradient_weights = gradient_weights / gw_std
 
         # 损失函数 (负号因为我们做梯度上升)
         loss = -torch.mean(logprobs * gradient_weights)
@@ -447,8 +480,6 @@ class QCPO(object):
         
         self.q_optimizer.step()
 
-        self.actor.to(torch.device('cpu'))
-
     def update_dual(self):
         """
         外层更新: 拉格朗日乘子 λ
@@ -482,3 +513,25 @@ class QCPO(object):
                 except TypeError:
                     pass
         return 0.0
+
+    def _compute_regime_stats(self):
+        """计算当前episode的per-regime统计"""
+        stats = {}
+        if not hasattr(self.env, 'get_regime_history'):
+            return stats
+        regime_hist = self.env.get_regime_history()
+        risk_series = self.env.render()
+        if regime_hist is None or risk_series is None or len(risk_series) == 0:
+            return stats
+        step_regimes = regime_hist[:-1] if len(regime_hist) > len(risk_series) else regime_hist
+        step_regimes = np.array(step_regimes[:len(risk_series)])
+        risk_arr = np.array(risk_series)
+        regime_names = {0: 'calm', 1: 'volatile', 2: 'crisis'}
+        total_steps = len(risk_arr)
+        for rid, rname in regime_names.items():
+            mask = (step_regimes == rid)
+            count = mask.sum()
+            stats[f'regime/{rname}_frac'] = float(count) / total_steps
+            if count > 0:
+                stats[f'action/risk_{rname}'] = float(risk_arr[mask].mean())
+        return stats

@@ -57,7 +57,8 @@ class QPO(object):
         # 策略网络
         state_dim = np.prod(self.env.observation_space.shape)
         action_dim = np.prod(self.env.action_space.shape)
-        self.actor = Actor(state_dim, action_dim, args.init_std)
+        actor_hidden = getattr(args, 'actor_hidden_dims', None)
+        self.actor = Actor(state_dim, action_dim, args.init_std, hidden_dims=actor_hidden).to(self.device)
 
         # 优化器和学习率调度器
         self.optimizer = Adam(self.actor.parameters(), 1., eps=1e-5)
@@ -75,6 +76,7 @@ class QPO(object):
             name=f"{args.algo_name}_{args.seed}", 
             config=vars(args), 
             reinit=True, 
+            id=wandb.util.generate_id(),
             group=args.algo_name,
             dir=getattr(args, 'wandb_dir', None)
         )
@@ -129,32 +131,36 @@ class QPO(object):
                     break
             
             avg_risk_episode = self._compute_episode_avg_risk()
+            regime_stats = self._compute_regime_stats()
             self.update()
             self.memory.clear()
 
             disc_epi_rewards.append(disc_epi_reward)
 
-            wandb.log({
+            log_dict = {
                 'disc_reward/raw_reward': disc_epi_reward,
                 'action/avg_risk_episode': avg_risk_episode
-            }, step=i_episode)
+            }
+            log_dict.update(regime_stats)
 
             if i_episode % self.log_interval == 0 and i_episode != 0:
                 lb = max(0, len(disc_epi_rewards) - self.est_interval)
                 disc_a_reward = np.mean(disc_epi_rewards[lb:])
                 disc_q_reward = np.percentile(disc_epi_rewards[lb:], self.q_alpha * 100)
                 
-                wandb.log({
+                log_dict.update({
                     'disc_reward/aver_reward': disc_a_reward,
                     'disc_reward/quantile_reward': disc_q_reward,
                     'quantile/q_est': self.q_est.item()
-                }, step=i_episode)
+                })
                 
                 print(f'Epi:{i_episode:05d} || disc_a_r:{disc_a_reward:.03f} disc_q_r:{disc_q_reward:.03f}')
                 print(f'Epi:{i_episode:05d} || avg_risk:{avg_risk_episode:.03f}')
                 print(f'Epi:{i_episode:05d} || lr:{self.scheduler.get_last_lr()[0]:.2e} '
                       f'q_lr:{self.q_scheduler.get_last_lr()[0]:.2e} '
                       f'q_est:{self.q_est.item():.03f}\n')
+
+            wandb.log(log_dict, step=i_episode)
                       
             self.scheduler.step()
             self.q_scheduler.step()
@@ -163,27 +169,29 @@ class QPO(object):
         """
         根据当前策略采样动作（训练时使用，会存储到memory）
         """
-        state = torch.from_numpy(state).float()
-        mean = self.actor(state)
-        var = torch.diag(torch.exp(2 * self.actor.log_std))
-        dist = MultivariateNormal(mean, var)
-        action = dist.sample()
-        
+        with torch.no_grad():
+            state = torch.from_numpy(state).float().to(self.device)
+            mean = self.actor(state)
+            var = torch.diag(torch.exp(2 * self.actor.log_std))
+            dist = MultivariateNormal(mean, var)
+            action = dist.sample()
+
         self.memory.states.append(state)
         self.memory.actions.append(action)
-        
-        return action.detach().data.cpu().numpy()
-                                                  
+
+        return action.cpu().numpy()
+
     def select_action(self, state):
         """
         选择动作（评估时使用，不存储memory）
         """
-        state = torch.from_numpy(state).float()
-        mean = self.actor(state)
-        var = torch.diag(torch.exp(2 * self.actor.log_std))
-        dist = MultivariateNormal(mean, var)
-        action = dist.sample()
-        return action.detach().data.cpu().numpy()
+        with torch.no_grad():
+            state = torch.from_numpy(state).float().to(self.device)
+            mean = self.actor(state)
+            var = torch.diag(torch.exp(2 * self.actor.log_std))
+            dist = MultivariateNormal(mean, var)
+            action = dist.sample()
+        return action.cpu().numpy()
 
     def _reset_env(self):
         """兼容Gym/Gymnasium reset接口"""
@@ -242,21 +250,19 @@ class QPO(object):
 
     def update(self):
         """更新策略网络和分位数估计"""
-        self.actor.to(self.device)
-
         # 计算折扣奖励
         disc_reward, disc_reward_short = self.compute_discounted_epi_reward()
-        
+
         # 计算示性函数
         ind = indicator(self.q_est.detach(), disc_reward)
 
-        # 获取旧状态和动作
-        old_states = torch.stack(self.memory.states).to(self.device).detach()
-        old_actions = torch.stack(self.memory.actions).to(self.device).detach()
+        # 获取旧状态和动作 (已在device上)
+        old_states = torch.stack(self.memory.states).detach()
+        old_actions = torch.stack(self.memory.actions).detach()
 
         # 计算对数概率
         logprobs, _ = self.evaluate(old_states, old_actions)
-        
+
         # QPO策略损失: 最大化分位数
         loss = torch.mean(logprobs * ind)
 
@@ -268,12 +274,10 @@ class QPO(object):
         # 更新分位数估计
         self.q_optimizer.zero_grad()
         self.q_est.grad = -torch.mean(
-            self.q_alpha - indicator(self.q_est, disc_reward_short), 
+            self.q_alpha - indicator(self.q_est, disc_reward_short),
             dim=0, keepdim=True
         )
         self.q_optimizer.step()
-
-        self.actor.to(torch.device('cpu'))
 
     def _compute_episode_avg_risk(self):
         """返回当前episode的平均风险等级"""
@@ -286,3 +290,35 @@ class QPO(object):
                 except TypeError:
                     pass
         return 0.0
+
+    def _compute_regime_stats(self):
+        """计算当前episode的per-regime统计, 用于诊断训练动态"""
+        stats = {}
+        if not hasattr(self.env, 'get_regime_history'):
+            return stats
+
+        regime_hist = self.env.get_regime_history()     # [T+1] 体制序列
+        risk_series = self.env.render()                 # [T]   动作序列
+        if regime_hist is None or risk_series is None:
+            return stats
+        if len(risk_series) == 0:
+            return stats
+
+        # regime_hist[0] 是初始体制, regime_hist[t+1] 是 step t 之后的体制
+        # risk_series[t] 是 step t 的动作
+        # step t 的奖励由 regime_hist[t] (旧体制) 决定
+        step_regimes = regime_hist[:-1] if len(regime_hist) > len(risk_series) else regime_hist
+        step_regimes = np.array(step_regimes[:len(risk_series)])
+        risk_arr = np.array(risk_series)
+
+        regime_names = {0: 'calm', 1: 'volatile', 2: 'crisis'}
+        total_steps = len(risk_arr)
+
+        for rid, rname in regime_names.items():
+            mask = (step_regimes == rid)
+            count = mask.sum()
+            stats[f'regime/{rname}_frac'] = float(count) / total_steps
+            if count > 0:
+                stats[f'action/risk_{rname}'] = float(risk_arr[mask].mean())
+
+        return stats
