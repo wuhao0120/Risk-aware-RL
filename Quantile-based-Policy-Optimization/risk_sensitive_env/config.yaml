@@ -31,13 +31,11 @@ q_b: 10000
 q_c: 0.6
 
 # ======================
-# QCPO 特有参数
+# QCPO 特有参数 (Probability-Based Constraint)
+# 约束: P_θ(Z ≤ q) ≤ α
 # ======================
 outer_interval: 100     # 外层更新间隔（每多少个episode更新一次λ）
-nu: 1.0                 # 约束惩罚系数（仅在density_estimate=False时使用）
-quantile_threshold: 6.0 # 分位数约束阈值 C (Q_α >= C)
-density_estimate: false # 是否使用密度估计版本（true使用密度估计，false使用nu）
-h_n: 0.01               # 密度估计版本的分位数间隔（仅在density_estimate=true时使用）
+quantile_threshold: 6.0 # 约束阈值 q
 
 # 拉格朗日乘子学习率
 lambda_a: 1.0
@@ -75,7 +73,7 @@ output_dir: 'results'   # 结果保存目录
 #   - 预期选择: r → 0 (最保守策略)
 #   - 预期结果: Mean ≈ 9.56, Q_0.25 ≈ 9.36
 #
-# QCPO (最大化均值 s.t. Q_0.25 >= 6.0):
+# QCPO (最大化均值 s.t. P(U≤6.0) ≤ 0.25):
 #   - 解 9.36 - 5.4r = 6.0 → r ≈ 0.62
 #   - 预期结果: Mean ≈ 12.5, Q_0.25 ≈ 6.0
 #

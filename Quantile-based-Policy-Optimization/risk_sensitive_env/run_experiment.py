@@ -71,16 +71,11 @@ def get_args():
     parser.add_argument('--q_b', type=float, default=10000)
     parser.add_argument('--q_c', type=float, default=0.6)
     
-    # QCPO特有参数
-    parser.add_argument('--outer_interval', type=int, default=100)
-    parser.add_argument('--nu', type=float, default=1.0,
-                      help='约束惩罚系数')
+    # QCPO特有参数 (Probability-Based Constraint)
+    parser.add_argument('--outer_interval', type=int, default=100,
+                      help='外层更新间隔（每多少个episode更新一次λ）')
     parser.add_argument('--quantile_threshold', type=float, default=6.0,
-                      help='分位数约束阈值C')
-    parser.add_argument('--density_estimate', type=bool, default=False,
-                      help='是否使用密度估计版本（True）或使用nu版本（False）')
-    parser.add_argument('--h_n', type=float, default=0.01,
-                      help='密度估计版本的分位数间隔（默认0.01，对应τ±0.01）')
+                      help='约束阈值 q, 约束: P(U(τ)≤q) ≤ α')
 
     # DQC-AC特有参数
     parser.add_argument('--density_bandwidth', type=float, default=0.01,
