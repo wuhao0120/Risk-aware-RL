@@ -1,0 +1,50 @@
+/* theme.css — 纸墨主题设计令牌 + 页面骨架 + 组件类（视觉基准: reference/approved-fullbleed-v3.html） */
+:root {
+  --paper:#f8f4ec; --card:#fffdf8; --tint:#f3efe6;
+  --ink:#1c1917; --verm:#b91c1c; --amber:#d97706;
+  --g1:#57534e; --g2:#78716c; --g3:#a8a29e; --line:#d6d3d1;
+  --serif:'Noto Serif SC','SimSun',serif;
+  --sans:'Noto Sans SC','Microsoft YaHei',sans-serif;
+  --mono:'JetBrains Mono',Consolas,monospace;
+  --scale:1;
+}
+html,body{margin:0;height:100%;background:#111;overflow:hidden}
+.slide{position:absolute;left:50%;top:50%;width:1280px;height:720px;
+  transform:translate(-50%,-50%) scale(var(--scale));transform-origin:center;
+  background:var(--paper);font-family:var(--serif);display:none;
+  flex-direction:column;padding:26px 56px 18px;box-sizing:border-box;overflow:hidden}
+.slide.active{display:flex}
+.slide *{box-sizing:border-box;margin:0}
+.sans{font-family:var(--sans)}
+.mono{font-family:var(--mono)}
+.serif{font-family:var(--serif)}
+/* 页眉/页脚骨架 */
+.hdr{display:flex;justify-content:space-between;align-items:baseline;
+  border-bottom:1.5px solid var(--line);padding-bottom:9px}
+.hdr .crumb{color:var(--verm);font-size:15px;letter-spacing:5px}
+.hdr .title{color:var(--ink);font-size:32px;font-weight:900}
+.hdr .deck{color:var(--g3);font-size:13px;letter-spacing:2px}
+.ftr{border-top:1.5px solid var(--line);margin-top:12px;padding-top:8px;
+  display:flex;justify-content:space-between;align-items:center;
+  color:var(--g3);font-size:13px}
+.body{flex:1;display:flex;gap:30px;margin-top:16px;min-height:0}
+/* 组件 */
+.term{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--verm);
+  padding:16px 20px;border-radius:3px;font-family:var(--mono);font-size:15px;line-height:1.95;color:#44403c}
+.note-l{border-left:3px solid var(--verm);padding-left:14px;color:var(--verm);
+  font-size:15px;line-height:1.7;font-style:italic}
+.chip{border:1.5px solid var(--ink);padding:6px 18px;border-radius:999px;
+  font-family:var(--sans);font-size:17px;display:inline-block}
+.chip.hot{border-color:var(--verm);color:var(--verm);font-weight:700}
+.stat{flex:1;border:1px solid var(--line);text-align:center;padding:9px 2px;
+  background:var(--card);font-family:var(--sans)}
+.kwbar{background:var(--tint);padding:10px 16px;font-family:var(--sans);
+  font-size:14.5px;color:var(--g1);letter-spacing:1px}
+.dots{display:flex;gap:5px;align-items:center}
+.dots i{width:7px;height:7px;border-radius:50%;background:var(--line);display:block}
+.dots i.on{background:var(--verm)}
+@media print {
+  @page{size:1280px 720px;margin:0}
+  html,body{overflow:visible;background:#fff}
+  .slide{display:flex;position:relative;left:0;top:0;transform:none;page-break-after:always}
+}
