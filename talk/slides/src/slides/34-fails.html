@@ -1,0 +1,44 @@
+<div class="hdr">
+  <div class="crumb" style="color:var(--amber);">§ 5 边界 · 翻车实录</div>
+  <div class="title">一本正经地胡说：两个真实现场</div>
+  <div class="deck">AI 智能体与科研工作流</div>
+</div>
+<div class="body" style="margin-top:14px;">
+  <!-- 左：编造引用 -->
+  <div style="flex:1;display:flex;flex-direction:column;gap:10px;">
+    <div class="sans" style="color:var(--amber);font-size:13px;letter-spacing:3px;">现场一 · 编造文献，连法官都敢骗</div>
+    <div style="background:var(--card);border:1px solid var(--line);padding:14px 18px;">
+      <div style="font-size:16.5px;font-weight:700;color:var(--ink);">Mata v. Avianca（美国联邦法院，2023）</div>
+      <div style="font-size:14px;color:var(--g1);line-height:1.85;margin-top:6px;">律师用 ChatGPT 写诉状，引用的 <b>6 个判例全是编造的</b>——追问时它还保证这些判例 "indeed exist"。结果：罚款 $5,000，并致函 6 位"被署名"的真实法官。</div>
+      <div style="font-size:13px;color:var(--g2);font-style:italic;margin-top:6px;">"Many harms flow from the submission of fake opinions." —— Castel 法官判词</div>
+    </div>
+    <div style="background:var(--card);border:1px solid var(--line);padding:14px 18px;flex:1;">
+      <div style="font-size:15px;font-weight:700;color:var(--ink);">它正在蔓延进学术文献</div>
+      <div class="sans" style="display:flex;gap:8px;margin-top:10px;text-align:center;">
+        <div style="flex:1;background:var(--tint);padding:8px 4px;"><div style="font-size:19px;font-weight:700;color:var(--g1);">1/2,828</div><div style="font-size:11.5px;color:var(--g2);">2023 年</div></div>
+        <div style="flex:1;background:#fdf0e7;padding:8px 4px;"><div style="font-size:19px;font-weight:700;color:var(--amber);">1/458</div><div style="font-size:11.5px;color:var(--g2);">2025 年</div></div>
+        <div style="flex:1;background:#fdecea;padding:8px 4px;"><div style="font-size:19px;font-weight:700;color:var(--verm);">1/277</div><div style="font-size:11.5px;color:var(--g2);">2026 年初</div></div>
+      </div>
+      <div style="font-size:12.5px;color:var(--g2);margin-top:8px;">含编造引文的论文比例 · 哥伦比亚大学团队审计 PubMed 约 250 万篇论文（Lancet 通讯，2026-05）</div>
+    </div>
+  </div>
+  <!-- 右：数学翻车 -->
+  <div style="flex:1;display:flex;flex-direction:column;gap:10px;">
+    <div class="sans" style="color:var(--amber);font-size:13px;letter-spacing:3px;">现场二 · 数学推导：步步"有据"，答案是错的</div>
+    <div style="background:var(--card);border:1px solid var(--line);padding:14px 18px;flex:1;">
+      <div style="font-size:14px;color:var(--g1);line-height:1.8;">题目（GSM-Symbolic 基准）：Oliver 周五摘 44 个猕猴桃，周六 58 个，周日是周五的两倍，<b style="color:var(--amber);">但其中 5 个偏小</b>。共多少个？</div>
+      <div class="term" style="margin-top:10px;border-left-color:var(--amber);font-size:13.5px;">
+        <div style="color:var(--g2);">模型（o1-mini 等）：周日 88 − 5 = 83 …</div>
+        <div style="color:var(--verm);">44 + 58 + 83 = 185　✗</div>
+        <div style="color:#15803d;">正确：44 + 58 + 88 = 190　（"偏小"≠"不算"）</div>
+      </div>
+      <div style="font-size:13.5px;color:var(--g1);line-height:1.8;margin-top:8px;">加一句<b>看似相关的废话</b>，SOTA 模型成绩最多掉 65%；USAMO 2025 整卷证明题评测中多数模型得分 <b>&lt; 5%</b>。</div>
+    </div>
+    <div class="note-l" style="border-left-color:var(--amber);color:#92400e;">陶哲轩（2025-06，访谈转录）：AI 的证明"看起来天衣无缝……错误往往极其隐蔽，找到之后又蠢得离谱"。</div>
+  </div>
+</div>
+<div class="ftr">
+  <div class="dots"><i class="on"></i><i></i><i></i><i></i></div>
+  <div>· 34 / 40 ·</div>
+  <div class="sans" style="font-size:11px;">Mata v. Avianca 678 F.Supp.3d 443 · Lancet 2026-05 · arXiv:2410.05229 · arXiv:2503.21934</div>
+</div>

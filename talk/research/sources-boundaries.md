@@ -1,0 +1,31 @@
+# 台账：AI使用边界——翻车实例与学术政策（核实日 2026-06-13）
+
+## [fake-citations-case] 美国律师用ChatGPT编造6个判例被联邦法院罚款5,000美元；编造引文已蔓延至学术文献并逐年加速
+- 断言细节: Mata v. Avianca, Inc., No. 1:22-cv-01461 (PKC) (S.D.N.Y.)，制裁判决2023-06-22（678 F. Supp. 3d 443）；Castel法官对律师Schwartz、LoDuca及律所Levidow, Levidow & Oberman连带罚款$5,000，并责令致函被冒名的6位真实法官；6个假判例：Varghese/Shaboon/Petersen/Martinez/Durden/Miller；ChatGPT曾向律师保证假判例"indeed exist"；判词金句"Many harms flow from the submission of fake opinions."。量化研究：Topaz等（哥伦比亚大学）2026年5月Lancet通讯，审计PubMed约250万篇论文/9,700万条引文，发现约2,800篇论文含约4,000条编造引文，含编造引文论文比例 2023年1/2,828 → 2025年1/458 → 2026年前7周1/277；辅证：Zhao等 arXiv:2605.07723（250万篇/1.11亿条引文，仅2025年≈146,932条幻觉引文）；Chelli等 JMIR 2024;26:e53164（471条参考文献样本，幻觉率GPT-3.5 39.6%、GPT-4 28.6%、Bard 91.4%）
+- 来源: https://en.wikipedia.org/wiki/Mata_v._Avianca,_Inc.（访问 2026-06-13）；第二来源: https://www.statnews.com/2026/05/07/lancet-study-finds-steep-rise-fraudulent-citations-academic-papers/ （另见 https://law.justia.com/cases/federal/district-courts/new-york/nysdce/1:2022cv01461/575368/54/ 、https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(26)00603-3/fulltext 、https://arxiv.org/abs/2605.07723 、https://www.jmir.org/2024/1/e53164 、https://www.legaldive.com/news/lawyer-fake-chatgpt-cases-sanctions-fines-lawyers-chatgpt-fake-cases/653741/）
+- 置信: 高
+- 用于: slide-34
+
+## [math-fail-example] LLM数学推导可"看起来步步有据实则出错"：GSM-NoOp猕猴桃题中模型把无关从句当运算依据，单句干扰可致SOTA模型性能跌65%
+- 断言细节: 可展示原题（arXiv:2410.05229, Apple团队GSM-Symbolic论文）："Oliver picks 44 kiwis on Friday... On Sunday, he picks double the number of kiwis he did on Friday, but five of them were a bit smaller than average. How many kiwis does Oliver have?"；o1-mini与Llama3-8B均推理"88 − 5 = 83 ... 44 + 58 + 83 = 185"，而"略小的5个"与计数无关，正确答案190；论文摘要："Adding a single clause that seems relevant to the question causes significant performance drops (up to 65%)"。佐证：USAMO 2025整卷证明评测（arXiv:2503.21934）除Gemini-2.5-Pro得25%外其余模型均<5%；陶哲轩（Lex Fridman播客#472，2025-06）："the AI-generated proofs, they look superficially flawless... the errors are often really subtle and then when you spot them, they're really stupid"（措辞经X帖转录与The Decoder一致，官方逐字稿未完整核到，引用时注明"转录自访谈"）
+- 来源: https://arxiv.org/abs/2410.05229（访问 2026-06-13）；第二来源: https://arxiv.org/abs/2503.21934 （陶哲轩引语 https://the-decoder.com/math-genius-terence-tao-says-that-ai-still-cant-smell-bad-math/ 、https://lexfridman.com/terence-tao-transcript/）
+- 置信: 高（陶哲轩引语逐字措辞为中）
+- 用于: slide-34
+
+## [erdos-incident-flip] 2025年10月OpenAI高管宣称GPT-5"解决10个未解Erdős问题"，约一两天内被数据库维护者证伪为文献检索，删帖澄清
+- 断言细节: 约2025-10-17，OpenAI VP Kevin Weil发帖（现已删除）："GPT-5 found solutions to 10 (!) previously unsolved Erdős problems and made progress on 11 others"；erdosproblems.com维护者Thomas Bloom回应称这是"a dramatic misrepresentation"，网站标"open"仅指"I personally am unaware of a paper which solves it"，实为"GPT-5 found references, which solved these problems, that I personally was unaware of"；DeepMind CEO Hassabis评论"this is embarrassing"，LeCun讥讽"Hoisted by their own GPTards"；Weil删帖，研究员Bubeck承认"only solutions in the literature were found"；媒体报道时间线：The Decoder 10-18、TechCrunch 10-19、Fortune 10-20、Futurism 10-21。注意：X原帖直链未核实（已删除），引用一律用媒体链接
+- 来源: https://techcrunch.com/2025/10/19/openais-embarrassing-math/（访问 2026-06-13）；第二来源: https://the-decoder.com/leading-openai-researcher-announced-a-gpt-5-math-breakthrough-that-never-happened/ （另见 https://futurism.com/artificial-intelligence/openai-researcher-deletes-tweet 、https://fortune.com/2025/10/20/did-openais-latest-ai-model-solve-famously-difficult-math-problems-well/）
+- 置信: 高（事件与原话经多家独立媒体一致转述；具体发帖钟点为中）
+- 用于: slide-35
+
+## [journal-policies] Nature/Elsevier/AMS均明文规定：AI不得列为作者、作者使用须声明、审稿人不得把稿件喂给AI
+- 断言细节: Nature Portfolio："LLMs... do not currently satisfy our authorship criteria"（作者身份意味着问责），"Use of an LLM should be properly documented in the Methods section"，并要求"peer reviewers do not upload manuscripts into generative AI tools"（配套社论Nature 613, 612 (2023)："No LLM tool will be accepted as a credited author"）；Elsevier："Authors should disclose the use of AI tools for manuscript preparation in a separate AI declaration statement included in their manuscript upon submission"、"Authors should not list AI tools as an author or co-author"、"Reviewers should not upload a submitted manuscript or any part of it into an AI tool"；AMS有专门政策页"Use of Artificial Intelligence"（改编COPE 2023-02声明）："AI tools cannot be listed as an author of a paper"、用AI须在Materials and Methods等处披露所用工具及用法、"Editors and referees are not to upload papers under review to an LLM in any format, for any reason"
+- 来源: https://www.nature.com/nature-portfolio/editorial-policies/ai（访问 2026-06-13）；第二来源: https://www.elsevier.com/about/policies-and-standards/generative-ai-policies-for-journals （AMS官方政策页 https://www.ams.org/publications/journals/policies/UseofArtificialIntelligence 、Nature社论 https://www.nature.com/articles/d41586-023-00191-1）
+- 置信: 高
+- 用于: slide-36
+
+## [data-security] 三家厂商条款：消费者网页对话OpenAI/DeepSeek默认可用于训练（可关闭），Anthropic须用户自选；OpenAI/Anthropic明文承诺API数据默认不训练，DeepSeek无此明确承诺
+- 断言细节: OpenAI官方政策页："we may use your content to train our models"（个人版ChatGPT），"By default, we do not train on any inputs or outputs from our products for business users, including ChatGPT Team, ChatGPT Enterprise, and the API"；opt-out=隐私门户"do not train on my content"或设置中关闭"Improve the model for everyone"，临时对话不训练。Anthropic：2025-08-28条款更新，消费者须自选是否允许训练（老用户限2025-10-08前选择，可随时在Privacy Settings更改；允许则保留5年，否则30天）；商用/API："By default, we will not use your inputs or outputs from our commercial products (e.g. Claude for Work, Anthropic API, Claude Gov, etc.) to train our models"。DeepSeek隐私政策（Last Update 2026-02-10）："to train and improve our technology, such as our machine learning models and algorithms"，数据"store your Personal Data in People's Republic of China"；用户条款4.3提供opt-out：关闭"Improve the model for everyone"；API（开放平台）条款未见"不用于训练"承诺——标注"无明确承诺"，勿写成"不训练"
+- 来源: https://openai.com/policies/how-your-data-is-used-to-improve-model-performance/（访问 2026-06-13）；第二来源: https://www.anthropic.com/news/updates-to-our-consumer-terms （另见 https://privacy.claude.com/en/articles/7996868-is-my-data-used-for-model-training 、https://cdn.deepseek.com/policies/en-US/deepseek-privacy-policy.html 、https://cdn.deepseek.com/policies/en-US/deepseek-terms-of-use.html 、https://cdn.deepseek.com/policies/en-US/deepseek-open-platform-terms-of-service.html）
+- 置信: 高
+- 用于: slide-36
