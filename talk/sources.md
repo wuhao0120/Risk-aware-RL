@@ -1,6 +1,7 @@
 # 来源台账 · 《AI 智能体与科研工作流》
 
 > 幻灯片上每条事实断言的出处。核实日期 2026-06-13。条目格式: 键名/断言/来源/置信/用于哪页。
+> 注：model-landscape / harness-lineup / multimodal-pdf-support 三个键为家族键，台账内按 `键名/厂商` 分条。
 
 
 <!-- ===== research/sources-math.md ===== -->
