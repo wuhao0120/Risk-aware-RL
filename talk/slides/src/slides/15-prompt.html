@@ -1,0 +1,39 @@
+<div class="hdr">
+  <div class="crumb">§ 2 概念地图 · 积木一</div>
+  <div class="title">会问：同一个问题，两种命运</div>
+  <div class="deck">AI 智能体与科研工作流</div>
+</div>
+<div class="body" style="margin-top:14px;">
+  <!-- 左：差提问 -->
+  <div style="flex:1;display:flex;flex-direction:column;gap:10px;">
+    <div class="sans" style="color:var(--g2);font-size:13px;letter-spacing:3px;">这样问 —— 得到一篇泛泛的小作文</div>
+    <div class="sans" style="background:var(--card);border:1px solid var(--line);border-radius:10px 10px 10px 2px;padding:13px 17px;font-size:15px;color:#292524;">"Zagier 那个一句话证明怎么理解？"</div>
+    <div style="background:var(--tint);padding:13px 17px;font-size:13.5px;color:var(--g2);line-height:1.85;flex:1;">
+      它只能猜你要什么 → 复述定理背景 → 罗列教科书套话 → 关键的对合构造一笔带过……<br/><br/>
+      <span style="color:var(--verm);">问题不在模型，在于它对"你卡在哪"一无所知。</span>
+    </div>
+  </div>
+  <!-- 右：好提问 -->
+  <div style="flex:1.25;display:flex;flex-direction:column;gap:10px;">
+    <div class="sans" style="color:var(--verm);font-size:13px;letter-spacing:3px;">这样问 —— 得到针对你的讲解（Prompt Engineering）</div>
+    <div class="sans" style="background:#fffaf5;border:1.5px solid var(--verm);border-radius:10px 10px 10px 2px;padding:13px 17px;font-size:14.5px;color:#292524;line-height:1.8;">
+      "<b style="color:var(--verm);">[给材料]</b> 这是论文原文 PDF。<b style="color:var(--verm);">[给上下文]</b> 我懂对合的定义，卡在：为什么三个分支拼起来是良定义的。<b style="color:var(--verm);">[说清要什么]</b> 逐分支解释，并用 p=13 演示。<b style="color:var(--verm);">[约束格式]</b> 先一句话结论，再分三点，公式用 LaTeX。"
+    </div>
+    <div style="display:flex;gap:8px;">
+      <div class="stat"><div style="font-size:16px;font-weight:700;color:var(--ink);">材料</div><div style="font-size:12px;color:var(--g2);">原文 / 数据 / 代码</div></div>
+      <div class="stat"><div style="font-size:16px;font-weight:700;color:var(--ink);">上下文</div><div style="font-size:12px;color:var(--g2);">你已知什么 · 卡在哪</div></div>
+      <div class="stat"><div style="font-size:16px;font-weight:700;color:var(--ink);">目标</div><div style="font-size:12px;color:var(--g2);">要解释/反例/推导</div></div>
+      <div class="stat"><div style="font-size:16px;font-weight:700;color:var(--ink);">格式</div><div style="font-size:12px;color:var(--g2);">结构 · 记号 · 长度</div></div>
+    </div>
+    <div class="note-l">旁注 · 给 AI 喂对材料的手艺有个名字：<b>Context Engineering</b>——后面 Agent/Harness 会替你自动做大半。</div>
+  </div>
+</div>
+<div style="background:var(--ink);margin:14px -56px 0;padding:13px 56px;text-align:center;">
+  <span style="color:var(--paper);font-size:19px;font-weight:600;">目标 + 材料 + 约束 ＝ 好答案　</span>
+  <span class="sans" style="color:var(--g3);font-size:13px;">（模糊的问题只能换来通用的答案）</span>
+</div>
+<div class="ftr">
+  <div class="dots"><i></i><i class="on"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+  <div>· 15 / 40 ·</div>
+  <div>积木二：它有眼睛了 ➤</div>
+</div>

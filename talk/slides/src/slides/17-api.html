@@ -1,0 +1,59 @@
+<div class="hdr">
+  <div class="crumb">§ 2 概念地图 · 积木三</div>
+  <div class="title">API：从"零售"到"批发"</div>
+  <div class="deck">AI 智能体与科研工作流</div>
+</div>
+<div class="body" style="margin-top:14px;">
+  <!-- 左：示意 + 代码 -->
+  <div style="flex:1.2;display:flex;flex-direction:column;gap:12px;">
+    <div style="display:flex;align-items:stretch;gap:0;">
+      <div style="flex:1;border:1.5px solid var(--ink);background:var(--card);padding:12px;text-align:center;">
+        <div style="font-size:17px;font-weight:700;color:var(--ink);">你的脚本</div>
+        <div class="sans" style="font-size:12px;color:var(--g2);margin-top:3px;">Python / R / MATLAB</div>
+      </div>
+      <div style="display:flex;align-items:center;padding:0 10px;color:var(--verm);font-size:22px;">⇄</div>
+      <div style="flex:1;border:1.5px solid var(--verm);background:#fffaf5;padding:12px;text-align:center;">
+        <div style="font-size:17px;font-weight:700;color:var(--verm);">API</div>
+        <div class="sans" style="font-size:12px;color:var(--g2);margin-top:3px;">程序化接口</div>
+      </div>
+      <div style="display:flex;align-items:center;padding:0 10px;color:var(--verm);font-size:22px;">⇄</div>
+      <div style="flex:1;border:1.5px solid var(--ink);background:var(--card);padding:12px;text-align:center;">
+        <div style="font-size:17px;font-weight:700;color:var(--ink);">模型</div>
+        <div class="sans" style="font-size:12px;color:var(--g2);margin-top:3px;">按量计费 · 可换家</div>
+      </div>
+    </div>
+    <div style="background:#1b1917;border-radius:4px;padding:15px 19px;flex:1;">
+      <div class="mono" style="font-size:13.5px;line-height:2.0;color:#d6d3d1;">
+        <div style="color:#8a8782;"># 例：把 300 篇 arXiv 摘要自动分类打分</div>
+        <div><span style="color:#f0abab;">for</span> paper <span style="color:#f0abab;">in</span> arxiv_papers:&nbsp;&nbsp;<span style="color:#8a8782;"># 300 篇</span></div>
+        <div>&nbsp;&nbsp;ans = client.messages.create(</div>
+        <div>&nbsp;&nbsp;&nbsp;&nbsp;model=<span style="color:#a8d08d;">"claude"</span>,</div>
+        <div>&nbsp;&nbsp;&nbsp;&nbsp;prompt=<span style="color:#a8d08d;">f"按主题与相关度给摘要打分: {paper}"</span>)</div>
+        <div>&nbsp;&nbsp;scores.append(parse(ans))&nbsp;&nbsp;<span style="color:#8a8782;"># 半小时跑完</span></div>
+      </div>
+    </div>
+  </div>
+  <!-- 右：要点 -->
+  <div style="flex:1;display:flex;flex-direction:column;justify-content:space-between;gap:10px;">
+    <div style="display:flex;flex-direction:column;gap:13px;">
+      <div style="border-left:3px solid var(--verm);padding-left:16px;">
+        <div style="font-size:18px;font-weight:700;color:var(--ink);">批量 · 可重复 · 可进流水线</div>
+        <div style="font-size:14.5px;color:var(--g1);line-height:1.8;margin-top:3px;">网页一次聊一条；API 一次跑三百条，结果直接进你的数据框。</div>
+      </div>
+      <div style="border-left:3px solid var(--verm);padding-left:16px;">
+        <div style="font-size:18px;font-weight:700;color:var(--ink);">连接你的数据与代码</div>
+        <div style="font-size:14.5px;color:var(--g1);line-height:1.8;margin-top:3px;">仿真结果让它解读、报错让它分析、文本让它结构化——都是一行调用。</div>
+      </div>
+      <div style="border-left:3px solid var(--verm);padding-left:16px;">
+        <div style="font-size:18px;font-weight:700;color:var(--ink);">隐私条款反而更干净</div>
+        <div style="font-size:14.5px;color:var(--g1);line-height:1.8;margin-top:3px;">主流厂商 API 数据<b>默认不用于训练</b>（网页版未必）——§5 详谈。</div>
+      </div>
+    </div>
+    <div class="note-l">旁注 · 网页是零售，API 是批发。后面的 Agent 与 Harness，全都长在 API 之上。</div>
+  </div>
+</div>
+<div class="ftr">
+  <div class="dots"><i></i><i></i><i></i><i class="on"></i><i></i><i></i><i></i><i></i><i></i></div>
+  <div>· 17 / 40 ·</div>
+  <div>主角登场：Agent ➤</div>
+</div>

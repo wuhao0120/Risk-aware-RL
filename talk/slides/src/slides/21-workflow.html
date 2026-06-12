@@ -1,0 +1,62 @@
+<div class="hdr">
+  <div class="crumb">§ 2 概念地图</div>
+  <div class="title">自动化工作流：让它"值班"</div>
+  <div class="deck">AI 智能体与科研工作流</div>
+</div>
+<div class="sans" style="margin-top:14px;background:var(--card);border:1px solid var(--line);border-radius:10px 10px 10px 2px;padding:12px 18px;display:flex;gap:12px;align-items:baseline;">
+  <span style="color:var(--verm);font-size:13px;letter-spacing:2px;white-space:nowrap;">一次设定</span>
+  <span style="color:#292524;font-size:15.5px;">"每天早上八点，把 arXiv 上 math.NT 的新论文按和我课题的相关度整理给我；实验在跑时每两小时看一眼日志，崩了就告诉我原因。"</span>
+</div>
+<div style="flex:1;display:flex;flex-direction:column;justify-content:center;min-height:0;margin-top:10px;">
+  <!-- 一天时间轴 -->
+  <div style="position:relative;padding:30px 0 0;">
+    <div style="position:absolute;top:74px;left:2%;right:2%;height:2px;background:var(--ink);"></div>
+    <div style="display:flex;justify-content:space-between;padding:0 2%;">
+      <div style="width:23%;">
+        <div class="mono" style="color:var(--verm);font-size:15px;font-weight:700;">08:00</div>
+        <div style="width:10px;height:10px;border-radius:50%;background:var(--verm);margin:8px 0 14px;"></div>
+        <div style="background:var(--card);border:1px solid var(--line);padding:12px 14px;">
+          <div style="font-size:16px;font-weight:700;color:var(--ink);">arXiv 速报</div>
+          <div style="font-size:13px;color:var(--g1);line-height:1.7;margin-top:4px;">新论文按相关度排好，附"为什么与你有关"</div>
+        </div>
+      </div>
+      <div style="width:23%;">
+        <div class="mono" style="color:var(--ink);font-size:15px;font-weight:700;">10:00 / 12:00 / …</div>
+        <div style="width:10px;height:10px;border-radius:50%;background:var(--ink);margin:8px 0 14px;"></div>
+        <div style="background:var(--card);border:1px solid var(--line);padding:12px 14px;">
+          <div style="font-size:16px;font-weight:700;color:var(--ink);">实验看板</div>
+          <div style="font-size:13px;color:var(--g1);line-height:1.7;margin-top:4px;">每两小时巡检训练日志，异常即时报告原因</div>
+        </div>
+      </div>
+      <div style="width:23%;">
+        <div class="mono" style="color:var(--ink);font-size:15px;font-weight:700;">18:00</div>
+        <div style="width:10px;height:10px;border-radius:50%;background:var(--ink);margin:8px 0 14px;"></div>
+        <div style="background:var(--card);border:1px solid var(--line);padding:12px 14px;">
+          <div style="font-size:16px;font-weight:700;color:var(--ink);">当日小结</div>
+          <div style="font-size:13px;color:var(--g1);line-height:1.7;margin-top:4px;">今天读了什么、算了什么，自动写进研究日志</div>
+        </div>
+      </div>
+      <div style="width:23%;">
+        <div class="mono" style="color:var(--ink);font-size:15px;font-weight:700;">周五 17:00</div>
+        <div style="width:10px;height:10px;border-radius:50%;background:var(--ink);margin:8px 0 14px;"></div>
+        <div style="background:var(--card);border:1px solid var(--line);padding:12px 14px;">
+          <div style="font-size:16px;font-weight:700;color:var(--ink);">周报草稿</div>
+          <div style="font-size:13px;color:var(--g1);line-height:1.7;margin-top:4px;">从日志汇总一周进展，组会材料有了底稿</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div style="display:flex;gap:14px;margin-top:24px;">
+    <div class="term" style="flex:1;font-size:13.5px;">
+      <div style="color:var(--g2);"># 它本质上只是：定时器 + Agent</div>
+      <div style="color:var(--ink);">schedule:&nbsp;&nbsp;every day 08:00</div>
+      <div style="color:var(--ink);">agent:&nbsp;&nbsp;&nbsp;&nbsp;"检索 arXiv math.NT 新文 → 相关度排序 → 邮件"</div>
+    </div>
+    <div class="note-l" style="flex:1;display:flex;align-items:center;">旁注 · 关键转变：从"你去用 AI"，到"AI 在替你<b>持续地</b>工作"。研究方向第一次有了"全天候的值班员"。</div>
+  </div>
+</div>
+<div class="ftr">
+  <div class="dots"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i class="on"></i><i></i></div>
+  <div>· 21 / 40 ·</div>
+  <div>一张图收拢全章 ➤</div>
+</div>
