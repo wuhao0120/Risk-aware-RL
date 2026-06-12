@@ -96,6 +96,7 @@
 
 - **幻灯片引擎**：手写 ~100 行 JS（方向键/空格翻页、`F` 全屏、URL hash 定位、1280×720 等比缩放），不依赖外部库；全部资源（字体子集、图片 base64、样式）内联为单文件 `talk/slides/ai-research-talk.html`。
 - **数学公式**：构建期用 KaTeX 预渲染为 HTML+内联 CSS（运行时零 JS 依赖）；公式量少（Zagier 集合与对合定义等）。
+  - *实施备注（2026-06-13）*：实际改为手排 HTML 公式——公式总量少且需与纸墨版式融合，KaTeX 预渲染方案备而未用。
 - **图表**：SVG 手绘（阶梯图、时间轴、pipeline 图）；截图类素材以原图存 `talk/assets/`，**构建时 base64 内联**进单文件。
 - **PDF 备份**：无头 Edge `--print-to-pdf` + 打印样式（每页一版）。
 - **截图存档**：沿用 `talk/making-of/_capture.py` 管线，里程碑即截即archive。
