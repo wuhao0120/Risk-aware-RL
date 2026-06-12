@@ -1,3 +1,5 @@
 **/wandb/
 
 *.log
+.superpowers/
+talk/making-of/_wrapped/
