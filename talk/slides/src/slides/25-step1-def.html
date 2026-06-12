@@ -1,0 +1,51 @@
+<div class="hdr">
+  <div class="crumb">§ 3 研究之旅 · 第 ① 步</div>
+  <div class="title">拆定义：让它把"一句话"展开成一页纸</div>
+  <div class="deck">AI 智能体与科研工作流</div>
+</div>
+<div class="sans" style="margin-top:14px;background:var(--card);border:1px solid var(--line);border-radius:10px 10px 10px 2px;padding:12px 18px;display:flex;gap:12px;align-items:baseline;">
+  <span style="color:var(--verm);font-size:13px;letter-spacing:2px;white-space:nowrap;">你问</span>
+  <span style="color:#292524;font-size:15.5px;">"这是 Zagier 1990 那篇一句话证明（zagier.pdf）。把那个对合拆开讲清楚：S 是什么集合？三个分支各在什么条件下用？为什么这是良定义的？"</span>
+</div>
+<div class="body" style="margin-top:14px;">
+  <!-- 左：S 的定义 -->
+  <div style="flex:1;display:flex;flex-direction:column;gap:12px;">
+    <div style="color:var(--g2);font-size:13px;letter-spacing:3px;" class="sans">它先把舞台搭清楚</div>
+    <div style="background:var(--card);border:1px solid var(--line);padding:18px 22px;">
+      <div class="mono" style="font-size:18px;color:var(--ink);text-align:center;">S = { (x, y, z) ∈ ℤ₊³ : x² + 4yz = p }</div>
+      <div style="border-top:1px dashed var(--line);margin:12px 0;"></div>
+      <div style="font-size:14.5px;color:var(--g1);line-height:2.0;">
+        <div><span style="color:var(--verm);">—</span> 这是<b>有限集</b>：x² &lt; p，且 yz = (p−x²)/4 只有有限种分解</div>
+        <div><span style="color:var(--verm);">—</span> p ≡ 1 (mod 4) ⇒ x 必为<b>奇数</b></div>
+        <div><span style="color:var(--verm);">—</span> 例：p=13 时 S 只有 3 个元素（下一页全部列出）</div>
+      </div>
+    </div>
+    <div class="note-l">旁注 · 它没有跳步：每个"为什么"都给了一行理由，看不懂还可以追问。</div>
+  </div>
+  <!-- 右：三分支 -->
+  <div style="flex:1.15;display:flex;flex-direction:column;gap:12px;">
+    <div style="color:var(--g2);font-size:13px;letter-spacing:3px;" class="sans">再把那个映射切成三支</div>
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      <div style="display:flex;border:1px solid var(--line);background:var(--card);">
+        <div class="mono" style="width:32%;padding:11px 14px;color:var(--verm);font-size:14.5px;border-right:1px solid var(--line);">x &lt; y−z</div>
+        <div class="mono" style="flex:1;padding:11px 14px;color:var(--ink);font-size:14.5px;">(x, y, z) ↦ (x+2z, z, y−x−z)</div>
+      </div>
+      <div style="display:flex;border:1px solid var(--line);background:var(--card);">
+        <div class="mono" style="width:32%;padding:11px 14px;color:var(--verm);font-size:14.5px;border-right:1px solid var(--line);">y−z &lt; x &lt; 2y</div>
+        <div class="mono" style="flex:1;padding:11px 14px;color:var(--ink);font-size:14.5px;">(x, y, z) ↦ (2y−x, y, x−y+z)</div>
+      </div>
+      <div style="display:flex;border:1px solid var(--line);background:var(--card);">
+        <div class="mono" style="width:32%;padding:11px 14px;color:var(--verm);font-size:14.5px;border-right:1px solid var(--line);">x &gt; 2y</div>
+        <div class="mono" style="flex:1;padding:11px 14px;color:var(--ink);font-size:14.5px;">(x, y, z) ↦ (x−2y, x−y+z, y)</div>
+      </div>
+    </div>
+    <div style="background:var(--tint);padding:12px 16px;font-size:14px;color:var(--g1);line-height:1.9;">
+      <b style="color:var(--ink);">良定义的关键（它主动补上的）：</b>边界情形 x = y−z 或 x = 2y 不可能发生——否则 p = (x+z)²−z²+... 可分解，与 p 是素数矛盾；且每支的像都落回 S 中。
+    </div>
+  </div>
+</div>
+<div class="ftr">
+  <div class="dots"><i></i><i class="on"></i><i></i><i></i><i></i><i></i><i></i></div>
+  <div>· 25 / 40 ·</div>
+  <div>第 ② 步：算个例子 ➤</div>
+</div>

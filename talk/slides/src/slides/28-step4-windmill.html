@@ -1,0 +1,51 @@
+<div class="hdr">
+  <div class="crumb">§ 3 研究之旅 · 第 ④ 步</div>
+  <div class="title">要直观：把代数画成"风车"</div>
+  <div class="deck">AI 智能体与科研工作流</div>
+</div>
+<div class="sans" style="margin-top:14px;background:var(--card);border:1px solid var(--line);border-radius:10px 10px 10px 2px;padding:12px 18px;display:flex;gap:12px;align-items:baseline;">
+  <span style="color:var(--verm);font-size:13px;letter-spacing:2px;white-space:nowrap;">你问</span>
+  <span style="color:#292524;font-size:15.5px;">"有没有几何解释？画出来。"</span>
+</div>
+<div class="body" style="margin-top:10px;">
+  <!-- 左：大风车 p=29 -->
+  <div style="flex:1.25;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+    <svg viewBox="0 0 400 400" style="height:100%;max-height:480px;">
+      <rect x="158" y="158" width="84" height="84" fill="#f4d7d0" stroke="#b91c1c" stroke-width="2"/>
+      <rect x="242" y="158" width="140" height="28" fill="#fffdf8" stroke="#1c1917" stroke-width="1.5"/>
+      <rect x="158" y="18"  width="28" height="140" fill="#fffdf8" stroke="#1c1917" stroke-width="1.5"/>
+      <rect x="18"  y="214" width="140" height="28" fill="#fffdf8" stroke="#1c1917" stroke-width="1.5"/>
+      <rect x="214" y="242" width="28" height="140" fill="#fffdf8" stroke="#1c1917" stroke-width="1.5"/>
+      <text x="200" y="206" text-anchor="middle" font-size="20" font-family="JetBrains Mono,Consolas" fill="#b91c1c">x²</text>
+      <text x="312" y="177" text-anchor="middle" font-size="14" font-family="JetBrains Mono,Consolas" fill="#57534e">y·z</text>
+      <text x="172" y="92" text-anchor="middle" font-size="14" font-family="JetBrains Mono,Consolas" fill="#57534e" transform="rotate(-90 172 92)">y·z</text>
+      <text x="88" y="233" text-anchor="middle" font-size="14" font-family="JetBrains Mono,Consolas" fill="#57534e">y·z</text>
+      <text x="228" y="312" text-anchor="middle" font-size="14" font-family="JetBrains Mono,Consolas" fill="#57534e" transform="rotate(-90 228 312)">y·z</text>
+      <text x="200" y="396" text-anchor="middle" font-size="15" font-family="Noto Sans SC,sans-serif" fill="#57534e">p = x² + 4yz　（图：p = 29, x=3, y=1, z=5）</text>
+    </svg>
+  </div>
+  <!-- 右：十字 + 直观三行 -->
+  <div style="flex:1;display:flex;flex-direction:column;justify-content:space-between;gap:12px;">
+    <div style="display:flex;gap:16px;align-items:center;background:var(--card);border:1px solid var(--line);padding:10px 16px;">
+      <svg viewBox="0 0 200 200" style="width:108px;height:108px;flex-shrink:0;">
+        <rect x="86" y="86" width="28" height="28" fill="#f4d7d0" stroke="#b91c1c" stroke-width="2"/>
+        <rect x="114" y="86" width="68" height="28" fill="#fffdf8" stroke="#1c1917" stroke-width="1.2"/>
+        <rect x="18"  y="86" width="68" height="28" fill="#fffdf8" stroke="#1c1917" stroke-width="1.2"/>
+        <rect x="86" y="18"  width="28" height="68" fill="#fffdf8" stroke="#1c1917" stroke-width="1.2"/>
+        <rect x="86" y="114" width="28" height="68" fill="#fffdf8" stroke="#1c1917" stroke-width="1.2"/>
+      </svg>
+      <div style="font-size:14.5px;color:var(--g1);line-height:1.8;"><b style="color:var(--verm);">不动点 = 完全对称的十字</b><br/>p=13, (1,1,3)：x=y 时风车四翼对齐，怎么"重切"都回到自己。</div>
+    </div>
+    <div style="font-size:15.5px;color:#292524;line-height:2.0;">
+      <div><span style="color:var(--verm);">壹</span>　把 p 画成<b>面积</b>：中心正方形 x² + 四翼矩形 yz × 4</div>
+      <div><span style="color:var(--verm);">贰</span>　同一个 p 有多种"风车切法"，对合 = 在切法之间<b>翻转</b></div>
+      <div><span style="color:var(--verm);">叁</span>　翻不动的只有那台对称十字 ⇒ 切法总数是<b>奇数</b> ⇒ 证明成立</div>
+    </div>
+    <div class="kwbar">出处它也给了：这是著名的"风车证明"可视化（见来源台账 windmill-viz）</div>
+  </div>
+</div>
+<div class="ftr">
+  <div class="dots"><i></i><i></i><i></i><i></i><i class="on"></i><i></i><i></i></div>
+  <div>· 28 / 40 ·</div>
+  <div>第 ⑤ 步：沉淀成笔记 ➤</div>
+</div>

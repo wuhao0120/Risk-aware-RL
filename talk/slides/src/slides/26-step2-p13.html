@@ -1,0 +1,59 @@
+<div class="hdr">
+  <div class="crumb">§ 3 研究之旅 · 第 ② 步</div>
+  <div class="title">算例子：p = 13，整个集合摆在桌面上</div>
+  <div class="deck">AI 智能体与科研工作流</div>
+</div>
+<div class="sans" style="margin-top:14px;background:var(--card);border:1px solid var(--line);border-radius:10px 10px 10px 2px;padding:12px 18px;display:flex;gap:12px;align-items:baseline;">
+  <span style="color:var(--verm);font-size:13px;letter-spacing:2px;white-space:nowrap;">你问</span>
+  <span style="color:#292524;font-size:15.5px;">"用 p=13 把 S 的所有元素列出来，对合怎么配对、不动点是谁，算给我看。"</span>
+</div>
+<div class="body" style="margin-top:14px;">
+  <!-- 左：配对图 -->
+  <div style="flex:1.2;display:flex;flex-direction:column;">
+    <div style="color:var(--g2);font-size:13px;letter-spacing:3px;" class="sans">S(13) 共 3 个元素 · 对合 T 的配对</div>
+    <div style="flex:1;position:relative;margin-top:8px;">
+      <svg viewBox="0 0 560 290" style="width:100%;height:100%;">
+        <defs><marker id="ar26" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#b91c1c"/></marker></defs>
+        <!-- 互换对 -->
+        <rect x="30" y="60" width="150" height="64" fill="#fffdf8" stroke="#1c1917" stroke-width="1.5"/>
+        <text x="105" y="98" text-anchor="middle" font-size="22" font-family="JetBrains Mono,Consolas" fill="#1c1917">(1, 3, 1)</text>
+        <rect x="380" y="60" width="150" height="64" fill="#fffdf8" stroke="#1c1917" stroke-width="1.5"/>
+        <text x="455" y="98" text-anchor="middle" font-size="22" font-family="JetBrains Mono,Consolas" fill="#1c1917">(3, 1, 1)</text>
+        <path d="M 185 80 C 250 50, 310 50, 375 80" stroke="#b91c1c" stroke-width="2" fill="none" marker-end="url(#ar26)"/>
+        <path d="M 375 106 C 310 136, 250 136, 185 106" stroke="#b91c1c" stroke-width="2" fill="none" marker-end="url(#ar26)"/>
+        <text x="280" y="44" text-anchor="middle" font-size="14" fill="#b91c1c" font-family="Noto Sans SC,sans-serif">T 互换这一对</text>
+        <!-- 不动点 -->
+        <rect x="205" y="190" width="150" height="64" fill="#fffaf5" stroke="#b91c1c" stroke-width="2.5"/>
+        <text x="280" y="228" text-anchor="middle" font-size="22" font-family="JetBrains Mono,Consolas" fill="#b91c1c">(1, 1, 3)</text>
+        <path d="M 360 205 C 420 175, 420 245, 360 235" stroke="#b91c1c" stroke-width="2" fill="none" marker-end="url(#ar26)"/>
+        <text x="448" y="226" font-size="14" fill="#b91c1c" font-family="Noto Sans SC,sans-serif">唯一不动点</text>
+        <text x="280" y="278" text-anchor="middle" font-size="13" fill="#78716c" font-family="Noto Sans SC,sans-serif">(1, 1, 3)：x = y 落在中间分支，映回自身 ✓</text>
+      </svg>
+    </div>
+  </div>
+  <!-- 右：推出链 -->
+  <div style="flex:1;display:flex;flex-direction:column;gap:10px;">
+    <div style="color:var(--g2);font-size:13px;letter-spacing:3px;" class="sans">于是证明自己走完了最后三步</div>
+    <div style="display:flex;gap:12px;align-items:baseline;background:var(--card);border:1px solid var(--line);padding:11px 16px;">
+      <span style="color:var(--verm);font-weight:900;">1</span>
+      <span style="font-size:15px;color:#292524;">T 的不动点<b>恰一个</b> ⇒ |S| = 3 是<b>奇数</b></span>
+    </div>
+    <div style="display:flex;gap:12px;align-items:baseline;background:var(--card);border:1px solid var(--line);padding:11px 16px;">
+      <span style="color:var(--verm);font-weight:900;">2</span>
+      <span style="font-size:15px;color:#292524;">奇数个元素 ⇒ 交换对合 σ: (x,y,z) ↦ (x,z,y) <b>必有不动点</b></span>
+    </div>
+    <div style="display:flex;gap:12px;align-items:baseline;background:var(--card);border:1px solid var(--line);padding:11px 16px;">
+      <span style="color:var(--verm);font-weight:900;">3</span>
+      <span style="font-size:15px;color:#292524;">σ 固定 (3,1,1)：y = z = 1 ⇒ p = x² + 4y² = x² + (2y)²</span>
+    </div>
+    <div style="background:var(--ink);color:var(--paper);text-align:center;padding:14px;margin-top:4px;">
+      <span class="mono" style="font-size:26px;">13 = 3² + 2²</span>
+    </div>
+    <div class="note-l">旁注 · 整页手算它只用了十几秒；但每一步你都能逐行检查——这正是和"只给结论"的差别。</div>
+  </div>
+</div>
+<div class="ftr">
+  <div class="dots"><i></i><i></i><i class="on"></i><i></i><i></i><i></i><i></i></div>
+  <div>· 26 / 40 ·</div>
+  <div>第 ③ 步：我不信，跑代码 ➤</div>
+</div>

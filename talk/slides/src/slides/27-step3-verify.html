@@ -1,0 +1,50 @@
+<div class="hdr">
+  <div class="crumb">§ 3 研究之旅 · 第 ③ 步</div>
+  <div class="title">代码验证："我不完全信，跑给我看"</div>
+  <div class="deck">AI 智能体与科研工作流</div>
+</div>
+<div class="sans" style="margin-top:14px;background:var(--card);border:1px solid var(--line);border-radius:10px 10px 10px 2px;padding:12px 18px;display:flex;gap:12px;align-items:baseline;">
+  <span style="color:var(--verm);font-size:13px;letter-spacing:2px;white-space:nowrap;">你问</span>
+  <span style="color:#292524;font-size:15.5px;">"写一个 verify.py：对 p≤10⁴ 全量验证这是 S 上的对合且不动点唯一；对 p≤10⁶ 验证不动点公式和两平方和表示。跑给我看。"</span>
+</div>
+<div class="body" style="margin-top:14px;">
+  <!-- 左：真实运行输出 -->
+  <div style="flex:1.15;display:flex;flex-direction:column;gap:10px;">
+    <div style="color:var(--g2);font-size:13px;letter-spacing:3px;" class="sans">它写完就跑 · 以下是真实输出</div>
+    <div class="term" style="flex:1;font-size:14px;">
+      <div style="color:var(--ink);">❯ python verify.py</div>
+      <div style="color:var(--g1);">[全量] p ≤ 10,000：<b style="color:var(--ink);">609</b> 个素数</div>
+      <div style="color:var(--g2);">　　　 对合性 + 不动点唯一 + 两平方 <span style="color:#15803d;">✓</span> (0.1s)</div>
+      <div style="color:var(--g1);">[快速] p ≤ 1,000,000：<b style="color:var(--ink);">39,175</b> 个素数</div>
+      <div style="color:var(--g2);">　　　 不动点公式 + 两平方表示 <span style="color:#15803d;">✓</span> (0.8s)</div>
+      <div style="color:var(--ink);margin-top:6px;">❯ python verify.py 13</div>
+      <div style="color:var(--g2);">p = 13, |S| = 3</div>
+      <div style="color:var(--g2);">　(1,1,3) → (1,1,3)　<span style="color:var(--verm);">← 不动点</span></div>
+      <div style="color:var(--g2);">　(1,3,1) → (3,1,1)　(3,1,1) → (1,3,1)</div>
+      <div style="color:#15803d;">两平方: 13 = 2² + 3²</div>
+    </div>
+  </div>
+  <!-- 右：核心代码 -->
+  <div style="flex:1;display:flex;flex-direction:column;gap:10px;">
+    <div style="color:var(--g2);font-size:13px;letter-spacing:3px;" class="sans">它写的核心 10 行（完整版在 talk/demo/verify.py）</div>
+    <div style="background:#1b1917;border-radius:4px;padding:16px 20px;flex:1;">
+      <div class="mono" style="font-size:13.5px;line-height:1.95;color:#d6d3d1;">
+        <div><span style="color:#f0abab;">def</span> <span style="color:#fcd9a0;">zagier_map</span>(t):</div>
+        <div>&nbsp;&nbsp;x, y, z = t</div>
+        <div>&nbsp;&nbsp;<span style="color:#f0abab;">if</span> x &lt; y - z:&nbsp;<span style="color:#f0abab;">return</span> (x+2*z, z, y-x-z)</div>
+        <div>&nbsp;&nbsp;<span style="color:#f0abab;">if</span> x &lt; 2*y:&nbsp;&nbsp;&nbsp;<span style="color:#f0abab;">return</span> (2*y-x, y, x-y+z)</div>
+        <div>&nbsp;&nbsp;<span style="color:#f0abab;">return</span> (x-2*y, x-y+z, y)</div>
+        <div style="color:#8a8782;"># 对每个素数: 像在 S 内 · T∘T=id · 不动点唯一</div>
+        <div><span style="color:#f0abab;">assert</span> all(T(T(t)) == t <span style="color:#f0abab;">for</span> t <span style="color:#f0abab;">in</span> S(p))</div>
+        <div><span style="color:#f0abab;">assert</span> fixed_points(p) == [(1, 1, (p-1)//4)]</div>
+        <div><span style="color:#f0abab;">assert</span> a*a + b*b == p</div>
+      </div>
+    </div>
+    <div class="note-l">旁注 · 数学没有被"权威"验证，而是被<b>可复跑的代码</b>验证——你随时可以自己再跑一遍。</div>
+  </div>
+</div>
+<div class="ftr">
+  <div class="dots"><i></i><i></i><i></i><i class="on"></i><i></i><i></i><i></i></div>
+  <div>· 27 / 40 ·</div>
+  <div>第 ④ 步：要直观 ➤</div>
+</div>
