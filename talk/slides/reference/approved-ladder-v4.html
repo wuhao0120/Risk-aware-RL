@@ -1,0 +1,100 @@
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;900&family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;600&display=swap');
+.ms { position:relative; left:50%; transform:translateX(-50%); width:min(94vw,1280px); aspect-ratio:16/9; border-radius:6px; overflow:hidden; box-shadow:0 10px 36px rgba(0,0,0,.2); font-family:'Noto Serif SC','SimSun',serif; background:#f8f4ec; display:flex; flex-direction:column; }
+.ms * { box-sizing:border-box; margin:0; }
+.mono { font-family:'JetBrains Mono',Consolas,monospace; }
+.sans { font-family:'Noto Sans SC','Microsoft YaHei',sans-serif; }
+.den-card { cursor:pointer; border:2px solid transparent; border-radius:12px; padding:14px 16px; transition:all .15s; background:rgba(127,127,127,.05); margin-bottom:12px; }
+.den-card:hover { border-color:#b91c1c66; }
+.den-card.selected { border-color:#b91c1c; background:rgba(185,28,28,.06); }
+.lv { background:#fffdf8; border:1.5px solid #1c1917; display:flex; flex-direction:column; padding:18px 20px 14px; position:relative; }
+.lv .num { position:absolute; top:8px; right:14px; font-size:44px; font-weight:900; color:rgba(28,25,23,.07); line-height:1; }
+</style>
+
+<h2>📐 表格页重做 · 四级阶梯图（v4）</h2>
+<p class="subtitle">把"表格里塞文字"换成"阶梯版式"：高度递增 = 自主性递增，每级只留一句本质 + 一个数学场景。文字量降了 60%。</p>
+
+<div class="ms" style="padding:26px 56px 18px;">
+  <!-- 页眉 -->
+  <div style="display:flex;justify-content:space-between;align-items:baseline;border-bottom:1.5px solid #d6d3d1;padding-bottom:9px;">
+    <div style="color:#b91c1c;font-size:15px;letter-spacing:5px;">§ 2 概念地图 · 小结</div>
+    <div style="color:#1c1917;font-size:32px;font-weight:900;">四个层级：AI 离你的研究越来越近</div>
+    <div style="color:#a8a29e;font-size:13px;letter-spacing:2px;">AI 智能体与科研工作流</div>
+  </div>
+
+  <!-- 阶梯主区 -->
+  <div style="flex:1;position:relative;display:flex;align-items:flex-end;gap:18px;margin-top:18px;min-height:0;padding-top:34px;">
+    <svg style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;" viewBox="0 0 100 100" preserveAspectRatio="none">
+      <defs><marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#b91c1c"/></marker></defs>
+      <path d="M 5,34 L 92,3" stroke="#b91c1c" stroke-width="0.45" stroke-dasharray="2,1.6" fill="none" marker-end="url(#arr)" opacity="0.65"/>
+    </svg>
+    <div class="sans" style="position:absolute;top:6px;left:42%;color:#b91c1c;font-size:13.5px;letter-spacing:3px;transform:rotate(-3.5deg);">自主性 · 能替你完成的事 ↗</div>
+
+    <div class="lv" style="flex:1;height:58%;">
+      <div class="num">Ⅰ</div>
+      <div class="sans" style="font-size:13px;letter-spacing:3px;color:#78716c;">对话</div>
+      <div style="font-size:25px;font-weight:900;color:#1c1917;margin-top:2px;">Chat</div>
+      <div style="font-size:15.5px;color:#292524;line-height:1.6;margin-top:10px;">你问一句，<br/>它答一句。</div>
+      <div style="flex:1;"></div>
+      <div style="font-size:13px;color:#57534e;"><span style="color:#b91c1c;">—</span> 查定义 · 润色段落</div>
+      <div class="mono" style="font-size:10.5px;color:#a8a29e;margin-top:6px;">DeepSeek / ChatGPT 网页</div>
+    </div>
+
+    <div class="lv" style="flex:1;height:72%;">
+      <div class="num">Ⅱ</div>
+      <div class="sans" style="font-size:13px;letter-spacing:3px;color:#78716c;">智能体</div>
+      <div style="font-size:25px;font-weight:900;color:#1c1917;margin-top:2px;">Agent</div>
+      <div style="font-size:15.5px;color:#292524;line-height:1.6;margin-top:10px;">给它目标，<br/>它自己动手。</div>
+      <div style="flex:1;"></div>
+      <div style="font-size:13px;color:#57534e;"><span style="color:#b91c1c;">—</span> 读论文 + 代码验证例子</div>
+      <div class="mono" style="font-size:10.5px;color:#a8a29e;margin-top:6px;">想 → 做 → 看 → 再做 ↻</div>
+    </div>
+
+    <div class="lv" style="flex:1;height:86%;border:2px solid #b91c1c;background:#fffaf5;">
+      <div class="num" style="color:rgba(185,28,28,.10);">Ⅲ</div>
+      <div style="position:absolute;top:-13px;left:14px;" class="sans"><span style="background:#b91c1c;color:#fffaf5;font-size:11.5px;letter-spacing:2px;padding:3px 10px;">今天的 demo 在这层</span></div>
+      <div class="sans" style="font-size:13px;letter-spacing:3px;color:#b91c1c;">驾驶舱</div>
+      <div style="font-size:25px;font-weight:900;color:#b91c1c;margin-top:2px;">Harness</div>
+      <div style="font-size:15.5px;color:#292524;line-height:1.6;margin-top:10px;">把整个项目<br/>交给它托管。</div>
+      <div style="flex:1;"></div>
+      <div style="font-size:13px;color:#57534e;"><span style="color:#b91c1c;">—</span> LaTeX 工程 · 研究目录</div>
+      <div class="mono" style="font-size:10.5px;color:#a8a29e;margin-top:6px;">Claude Code / Codex / Opencode</div>
+    </div>
+
+    <div class="lv" style="flex:1;height:100%;">
+      <div class="num">Ⅳ</div>
+      <div class="sans" style="font-size:13px;letter-spacing:3px;color:#78716c;">工作流</div>
+      <div style="font-size:25px;font-weight:900;color:#1c1917;margin-top:2px;">Workflow</div>
+      <div style="font-size:15.5px;color:#292524;line-height:1.6;margin-top:10px;">设好规则，<br/>定时自动跑。</div>
+      <div style="flex:1;"></div>
+      <div style="font-size:13px;color:#57534e;"><span style="color:#b91c1c;">—</span> 每早 8 点 arXiv 速报</div>
+      <div class="mono" style="font-size:10.5px;color:#a8a29e;margin-top:6px;">agent + 定时触发</div>
+    </div>
+  </div>
+
+  <!-- 怎么选 -->
+  <div class="sans" style="display:flex;align-items:stretch;border:1px solid #1c1917;margin-top:16px;">
+    <div style="background:#1c1917;color:#f8f4ec;padding:10px 18px;font-size:14px;letter-spacing:3px;display:flex;align-items:center;white-space:nowrap;">怎么选</div>
+    <div style="flex:1;display:flex;align-items:center;justify-content:center;padding:8px 10px;gap:8px;font-size:14.5px;color:#292524;"><b>问一句</b><span style="color:#b91c1c;">→ Chat</span></div>
+    <div style="width:1px;background:#d6d3d1;"></div>
+    <div style="flex:1;display:flex;align-items:center;justify-content:center;padding:8px 10px;gap:8px;font-size:14.5px;color:#292524;"><b>做一件事</b><span style="color:#b91c1c;">→ Agent</span></div>
+    <div style="width:1px;background:#d6d3d1;"></div>
+    <div style="flex:1;display:flex;align-items:center;justify-content:center;padding:8px 10px;gap:8px;font-size:14.5px;color:#292524;"><b>管一个项目</b><span style="color:#b91c1c;">→ Harness</span></div>
+    <div style="width:1px;background:#d6d3d1;"></div>
+    <div style="flex:1;display:flex;align-items:center;justify-content:center;padding:8px 10px;gap:8px;font-size:14.5px;color:#292524;"><b>周期性的事</b><span style="color:#b91c1c;">→ Workflow</span></div>
+  </div>
+
+  <!-- 页脚 -->
+  <div style="border-top:1.5px solid #d6d3d1;margin-top:12px;padding-top:8px;display:flex;justify-content:space-between;align-items:center;">
+    <div style="color:#b91c1c;font-size:14px;font-style:italic;">旁注 · 层级越往上走，AI 越像「合作者」而不是「问答机」。</div>
+    <div style="color:#a8a29e;font-size:13px;">· 18 / 40 ·</div>
+    <div style="color:#78716c;font-size:13px;">下一章：一篇论文的研究之旅 ➤</div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:26px;">
+  <h3>表格页改成这样可以吗？</h3>
+  <div class="den-card" data-choice="ladder-ok" onclick="toggleSelect(this)"><b>✓ 可以</b> —— 四级阶梯图替换原表格页</div>
+  <div class="den-card" data-choice="ladder-tweak" onclick="toggleSelect(this)"><b>方向对，细节要调</b> —— 在终端告诉我调什么</div>
+  <div class="den-card" data-choice="ladder-no" onclick="toggleSelect(this)"><b>不行，换个思路</b> —— 在终端说说你的想法</div>
+</div>

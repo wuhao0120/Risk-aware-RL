@@ -1,0 +1,158 @@
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;900&family=Noto+Sans+SC:wght@300;400;500;700;900&family=JetBrains+Mono:wght@400;600&display=swap');
+.ms { width:100%; aspect-ratio:16/9; border-radius:10px; overflow:hidden; position:relative; box-shadow:0 8px 30px rgba(0,0,0,.18); font-family:'Noto Sans SC','Microsoft YaHei',sans-serif; }
+.ms * { box-sizing:border-box; margin:0; }
+.ms-pair { display:flex; flex-direction:column; gap:14px; margin:10px 0 4px; }
+.mono { font-family:'JetBrains Mono',Consolas,monospace; }
+.serif { font-family:'Noto Serif SC','SimSun',serif; }
+.style-card { cursor:pointer; border:2px solid transparent; border-radius:14px; padding:16px; transition:all .15s; background:rgba(127,127,127,.05); margin-bottom:26px; }
+.style-card:hover { border-color:#818cf8; }
+.style-card.selected { border-color:#4f46e5; background:rgba(79,70,229,.08); }
+</style>
+
+<h2>🎨 正式幻灯片 · 三个视觉方向（真实完成度样张）</h2>
+<p class="subtitle">刚才的大纲页只是工作草稿，不代表成品。下面每个方向展示「封面 + 内容页」两页样张，点击卡片选择，也可以在终端说"A 的底色 + B 的字体"这种混搭要求。</p>
+
+<!-- ============ 方向 A ============ -->
+<div class="style-card" data-choice="A-midnight" onclick="toggleSelect(this)">
+  <h3 style="margin:0 0 2px;">方向 A · 深空蓝 「AI 发布会基调」</h3>
+  <p class="subtitle" style="margin-bottom:10px;">深色底 + 电光青点缀 + 终端元素。最有"前沿科技"气场，和报告主题最搭；高对比设计，投影仪上依然清晰。</p>
+  <div class="ms-pair">
+
+    <!-- A 封面 -->
+    <div class="ms" style="background:linear-gradient(135deg,#070b14 0%,#0c1426 55%,#0f1b33 100%);">
+      <div style="position:absolute;inset:0;background-image:radial-gradient(rgba(99,179,237,.13) 1px,transparent 1px);background-size:28px 28px;"></div>
+      <div style="position:absolute;top:7%;left:6%;" class="mono">
+        <span style="color:#22d3ee;font-size:13px;letter-spacing:2px;">数学学院学术报告 · 2026.06.15</span>
+      </div>
+      <div style="position:absolute;top:24%;left:6%;right:6%;">
+        <div style="color:#fff;font-size:54px;font-weight:900;line-height:1.18;letter-spacing:1px;">AI 智能体<br/>与科研工作流</div>
+        <div style="width:120px;height:3px;background:linear-gradient(90deg,#22d3ee,#818cf8);margin:22px 0;border-radius:2px;"></div>
+        <div style="color:#94a3b8;font-size:19px;font-weight:300;">从网页对话到智能体 —— AI 如何进入数学研究</div>
+      </div>
+      <div style="position:absolute;bottom:8%;left:6%;color:#64748b;font-size:14px;">吴昊 · 华东师范大学统计学院 / 北京中关村学院</div>
+      <div style="position:absolute;bottom:8%;right:6%;" class="mono"><span style="color:#22d3ee;font-size:16px;">❯ _</span></div>
+    </div>
+
+    <!-- A 内容页 -->
+    <div class="ms" style="background:linear-gradient(135deg,#070b14 0%,#0c1426 100%);padding:34px 44px;">
+      <div class="mono" style="color:#22d3ee;font-size:12px;letter-spacing:3px;margin-bottom:8px;">02 · 概念地图</div>
+      <div style="color:#fff;font-size:34px;font-weight:900;margin-bottom:24px;">Agent：会"动手"的 AI</div>
+      <div style="display:flex;gap:26px;">
+        <div style="flex:1.1;">
+          <div style="display:flex;align-items:center;gap:7px;margin-bottom:18px;">
+            <span style="background:rgba(34,211,238,.12);border:1px solid #22d3ee55;color:#67e8f9;padding:7px 15px;border-radius:999px;font-size:15px;">想</span><span style="color:#475569;">→</span>
+            <span style="background:rgba(129,140,248,.12);border:1px solid #818cf855;color:#a5b4fc;padding:7px 15px;border-radius:999px;font-size:15px;">做</span><span style="color:#475569;">→</span>
+            <span style="background:rgba(34,211,238,.12);border:1px solid #22d3ee55;color:#67e8f9;padding:7px 15px;border-radius:999px;font-size:15px;">看结果</span><span style="color:#475569;">→</span>
+            <span style="background:rgba(129,140,248,.12);border:1px solid #818cf855;color:#a5b4fc;padding:7px 15px;border-radius:999px;font-size:15px;">再做</span>
+          </div>
+          <div style="color:#cbd5e1;font-size:15.5px;line-height:1.9;font-weight:300;">Chat 只能<b style="color:#fff;">回答</b>；Agent 能<b style="color:#22d3ee;">行动</b>——<br/>读文件 · 写代码 · 跑实验 · 看报错 · 自己修正，<br/>循环直到把事情<b style="color:#fff;">做完</b>。</div>
+        </div>
+        <div style="flex:1;background:#030712;border:1px solid #1e293b;border-radius:10px;padding:14px 16px;">
+          <div style="display:flex;gap:5px;margin-bottom:10px;"><span style="width:9px;height:9px;border-radius:50%;background:#f87171;"></span><span style="width:9px;height:9px;border-radius:50%;background:#fbbf24;"></span><span style="width:9px;height:9px;border-radius:50%;background:#34d399;"></span></div>
+          <div class="mono" style="font-size:12.5px;line-height:1.85;">
+            <div style="color:#e2e8f0;"><span style="color:#22d3ee;">❯</span> 验证 Zagier 对合：p = 13</div>
+            <div style="color:#94a3b8;">(1,1,3) → (3,1,1) → (1,3,1) ✓</div>
+            <div style="color:#94a3b8;">不动点唯一: (1,1,3)　✓</div>
+            <div style="color:#34d399;">✓ 已验证 p ≤ 10⁶ 全部 78,498 个素数</div>
+          </div>
+        </div>
+      </div>
+      <div class="mono" style="position:absolute;bottom:18px;right:28px;color:#334155;font-size:13px;">14 / 40</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 方向 B ============ -->
+<div class="style-card" data-choice="B-paper" onclick="toggleSelect(this)">
+  <h3 style="margin:0 0 2px;">方向 B · 纸墨 「数学手稿基调」</h3>
+  <p class="subtitle" style="margin-bottom:10px;">暖白纸底 + 衬线字 + 朱砂红点缀，像一本精排的数学书。最贴数学学院气质，亮底在任何投影仪上都最稳。</p>
+  <div class="ms-pair">
+
+    <!-- B 封面 -->
+    <div class="ms serif" style="background:#f8f4ec;">
+      <div style="position:absolute;top:30px;left:48px;right:48px;border-top:3px double #1c1917;"></div>
+      <div style="position:absolute;top:18%;right:5%;color:rgba(28,25,23,.05);font-size:120px;font-weight:900;transform:rotate(-6deg);" class="serif">p = x²+4yz</div>
+      <div style="position:absolute;top:26%;left:48px;right:48px;">
+        <div style="color:#b91c1c;font-size:15px;letter-spacing:6px;margin-bottom:18px;">数学学院学术报告</div>
+        <div style="color:#1c1917;font-size:52px;font-weight:900;line-height:1.25;">AI 智能体与科研工作流</div>
+        <div style="color:#57534e;font-size:19px;margin-top:20px;font-weight:400;">从网页对话到智能体 —— AI 如何进入数学研究</div>
+      </div>
+      <div style="position:absolute;bottom:11%;left:48px;display:flex;align-items:center;gap:14px;">
+        <div style="width:44px;height:44px;background:#b91c1c;color:#f8f4ec;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:900;border-radius:4px;">吴</div>
+        <div style="color:#44403c;font-size:15px;line-height:1.5;">吴昊 · 华东师范大学统计学院<br/><span style="color:#78716c;font-size:13px;">二〇二六年六月十五日</span></div>
+      </div>
+      <div style="position:absolute;bottom:30px;left:48px;right:48px;border-bottom:1px solid #1c1917;"></div>
+    </div>
+
+    <!-- B 内容页 -->
+    <div class="ms serif" style="background:#f8f4ec;padding:36px 52px 36px 64px;">
+      <div style="position:absolute;top:0;bottom:0;left:38px;width:1px;background:#b91c1c44;"></div>
+      <div style="color:#b91c1c;font-size:14px;letter-spacing:4px;margin-bottom:10px;">§ 2 · 概念地图</div>
+      <div style="color:#1c1917;font-size:34px;font-weight:900;margin-bottom:22px;">Agent：会"动手"的 AI</div>
+      <div style="color:#292524;font-size:17px;line-height:2.0;">
+        Chat 只能<b>回答</b>，Agent 能<b style="color:#b91c1c;">行动</b>：
+        <span style="border:1px solid #1c1917;padding:3px 12px;border-radius:999px;font-size:14.5px;margin:0 2px;">想</span> →
+        <span style="border:1px solid #1c1917;padding:3px 12px;border-radius:999px;font-size:14.5px;margin:0 2px;">做</span> →
+        <span style="border:1px solid #1c1917;padding:3px 12px;border-radius:999px;font-size:14.5px;margin:0 2px;">看结果</span> →
+        <span style="border:1px solid #b91c1c;color:#b91c1c;padding:3px 12px;border-radius:999px;font-size:14.5px;margin:0 2px;">再做</span>
+      </div>
+      <div style="margin-top:20px;background:#fffdf8;border:1px solid #d6d3d1;border-left:4px solid #b91c1c;padding:16px 20px;border-radius:4px;">
+        <div class="mono" style="font-size:13px;line-height:1.9;color:#44403c;">
+          <div>❯ 验证 Zagier 对合：p = 13</div>
+          <div style="color:#78716c;">(1,1,3) → (3,1,1) → (1,3,1) ✓　不动点唯一 ✓</div>
+          <div style="color:#15803d;">✓ 已验证 p ≤ 10⁶ 全部 78,498 个素数</div>
+        </div>
+      </div>
+      <div style="position:absolute;bottom:18px;left:0;right:0;text-align:center;color:#a8a29e;font-size:13px;">· 14 ·</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 方向 C ============ -->
+<div class="style-card" data-choice="C-editorial" onclick="toggleSelect(this)">
+  <h3 style="margin:0 0 2px;">方向 C · 双色编辑部 「杂志专题基调」</h3>
+  <p class="subtitle" style="margin-bottom:10px;">白底 + 靛蓝/琥珀撞色 + 超大字号与色块，像一期科技杂志专题。最年轻有冲击力，亮底投影同样稳。</p>
+  <div class="ms-pair">
+
+    <!-- C 封面 -->
+    <div class="ms" style="background:#ffffff;display:flex;">
+      <div style="flex:1.6;padding:44px 40px;position:relative;">
+        <div style="display:inline-block;background:#1c1917;color:#fff;font-size:12px;font-weight:700;letter-spacing:3px;padding:6px 12px;">MATH × AI · 学术报告</div>
+        <div style="color:#111;font-size:50px;font-weight:900;line-height:1.2;margin-top:26px;">AI 智能体<br/>与科研<span style="box-shadow:inset 0 -16px 0 #fbbf24;">工作流</span></div>
+        <div style="color:#57534e;font-size:17px;margin-top:18px;">从网页对话到智能体<br/>AI 如何进入数学研究</div>
+        <div style="position:absolute;bottom:36px;left:40px;color:#44403c;font-size:14px;font-weight:500;">吴昊 · 华东师范大学统计学院</div>
+      </div>
+      <div style="flex:1;background:#4f46e5;position:relative;overflow:hidden;">
+        <div style="position:absolute;top:-20px;right:-30px;color:rgba(255,255,255,.14);font-size:200px;font-weight:900;line-height:1;">AI</div>
+        <div style="position:absolute;bottom:36px;left:32px;color:#fff;">
+          <div style="font-size:46px;font-weight:900;">06.15</div>
+          <div style="font-size:14px;color:#c7d2fe;letter-spacing:2px;">数学学院 · 2026</div>
+        </div>
+        <div style="position:absolute;top:36px;left:32px;width:54px;height:8px;background:#fbbf24;"></div>
+      </div>
+    </div>
+
+    <!-- C 内容页 -->
+    <div class="ms" style="background:#fff;padding:38px 48px;">
+      <div style="position:absolute;top:-30px;right:10px;color:rgba(79,70,229,.07);font-size:190px;font-weight:900;">02</div>
+      <div style="display:inline-block;background:#4f46e5;color:#fff;font-size:12px;font-weight:700;letter-spacing:3px;padding:5px 12px;">概念地图</div>
+      <div style="color:#111;font-size:36px;font-weight:900;margin:16px 0 24px;">Agent：会"动手"的 AI</div>
+      <div style="display:flex;gap:10px;margin-bottom:22px;">
+        <div style="background:#eef2ff;color:#4f46e5;font-weight:700;padding:10px 20px;font-size:16px;">想</div>
+        <div style="background:#4f46e5;color:#fff;font-weight:700;padding:10px 20px;font-size:16px;">做</div>
+        <div style="background:#eef2ff;color:#4f46e5;font-weight:700;padding:10px 20px;font-size:16px;">看结果</div>
+        <div style="background:#fbbf24;color:#1c1917;font-weight:700;padding:10px 20px;font-size:16px;">再做 ↻</div>
+      </div>
+      <div style="color:#374151;font-size:16.5px;line-height:1.85;">Chat 只能<b>回答</b>，Agent 能<b style="color:#4f46e5;">行动</b>——读文件、写代码、跑实验、看报错、自己修正，循环直到把事情<b>做完</b>。</div>
+      <div style="position:absolute;bottom:0;left:0;right:0;background:#111;padding:10px 48px;" class="mono">
+        <span style="color:#fbbf24;font-size:13px;">❯ 验证 Zagier 对合 p≤10⁶ ··· ✓ 78,498 个素数全部通过</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>选一个方向（点击卡片），或在终端告诉我混搭/调整要求</h3>
+  <p class="subtitle">三个方向的信息排版骨架相同，定方向后我会把全部 ~40 页按该方向精做。正式版会嵌入字体文件，离线放映不变样。</p>
+</div>

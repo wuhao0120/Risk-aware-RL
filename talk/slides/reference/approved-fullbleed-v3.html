@@ -1,0 +1,189 @@
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;900&family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;600&display=swap');
+.ms { position:relative; left:50%; transform:translateX(-50%); width:min(94vw,1280px); aspect-ratio:16/9; border-radius:6px; overflow:hidden; box-shadow:0 10px 36px rgba(0,0,0,.2); font-family:'Noto Serif SC','SimSun',serif; background:#f8f4ec; display:flex; flex-direction:column; }
+.ms * { box-sizing:border-box; margin:0; }
+.mono { font-family:'JetBrains Mono',Consolas,monospace; }
+.sans { font-family:'Noto Sans SC','Microsoft YaHei',sans-serif; }
+.slide-label { margin:22px 0 10px; text-align:center; }
+.den-card { cursor:pointer; border:2px solid transparent; border-radius:12px; padding:14px 16px; transition:all .15s; background:rgba(127,127,127,.05); margin-bottom:12px; }
+.den-card:hover { border-color:#b91c1c66; }
+.den-card.selected { border-color:#b91c1c; background:rgba(185,28,28,.06); }
+</style>
+
+<h2>📐 方向 B · 满幅版（v3）</h2>
+<p class="subtitle">两个改动：① 每页内容纵向撑满、左右贯通，不再"上重下空"；② 预览放大到接近真实放映尺寸（字号即成品字号）。</p>
+
+<!-- ===== 封面 v3 ===== -->
+<div class="slide-label"><span class="label">样张 1 · 封面（扉页 + 摘要 + 目录，全幅）</span></div>
+<div class="ms">
+  <div style="padding:28px 56px 0;"><div style="border-top:4px double #1c1917;"></div></div>
+  <div style="flex:1;display:flex;padding:0 56px;gap:44px;min-height:0;">
+    <!-- 左：题区 -->
+    <div style="flex:1.35;display:flex;flex-direction:column;justify-content:center;position:relative;">
+      <div style="position:absolute;bottom:6%;right:-2%;color:rgba(28,25,23,.055);font-size:120px;font-weight:900;transform:rotate(-7deg);pointer-events:none;">p = x²+4yz</div>
+      <div style="color:#b91c1c;font-size:17px;letter-spacing:7px;">数学学院学术报告</div>
+      <div style="color:#1c1917;font-size:64px;font-weight:900;line-height:1.22;margin:20px 0 16px;">AI 智能体<br/>与科研工作流</div>
+      <div style="color:#57534e;font-size:23px;">从网页对话到智能体 —— AI 如何进入数学研究</div>
+      <div style="display:flex;align-items:center;gap:16px;margin-top:38px;">
+        <div style="width:52px;height:52px;background:#b91c1c;color:#f8f4ec;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:900;border-radius:4px;">吴</div>
+        <div style="color:#44403c;font-size:18px;line-height:1.5;">吴昊 · 华东师范大学统计学院 / 北京中关村学院<br/><span style="color:#78716c;font-size:15px;">具身智能与强化学习方向 · 二〇二六年六月十五日</span></div>
+      </div>
+    </div>
+    <!-- 右：摘要+关键词 -->
+    <div style="flex:1;display:flex;flex-direction:column;justify-content:center;gap:18px;">
+      <div style="background:#fffdf8;border:1px solid #d6d3d1;border-top:4px solid #1c1917;padding:22px 26px;">
+        <div style="color:#78716c;font-size:14px;letter-spacing:4px;margin-bottom:12px;">摘　要</div>
+        <div style="color:#292524;font-size:17px;line-height:1.95;text-align:justify;">大语言模型、智能体与自动化工作流正在改变科研的工作方式。本报告结合数学与统计的科研场景：AI 如何帮助研究者<b>理解论文、辅助计算与编程、改进写作、管理研究任务</b>——以及哪些事它仍然做不了。</div>
+      </div>
+      <div class="sans" style="display:flex;flex-wrap:wrap;gap:8px;">
+        <span style="border:1px solid #1c1917;padding:5px 14px;font-size:14px;">大模型</span>
+        <span style="border:1px solid #1c1917;padding:5px 14px;font-size:14px;">多模态</span>
+        <span style="border:1px solid #b91c1c;color:#b91c1c;padding:5px 14px;font-size:14px;font-weight:700;">Agent</span>
+        <span style="border:1px solid #b91c1c;color:#b91c1c;padding:5px 14px;font-size:14px;font-weight:700;">Harness</span>
+        <span style="border:1px solid #1c1917;padding:5px 14px;font-size:14px;">MCP</span>
+        <span style="border:1px solid #1c1917;padding:5px 14px;font-size:14px;">自动化工作流</span>
+        <span style="border:1px solid #1c1917;padding:5px 14px;font-size:14px;">能力边界</span>
+      </div>
+    </div>
+  </div>
+  <!-- 底：目录条 -->
+  <div style="padding:0 56px 26px;" class="sans">
+    <div style="display:flex;gap:10px;">
+      <div style="flex:1.2;border:1px solid #d6d3d1;border-top:4px solid #1c1917;padding:10px 14px;background:#fffdf8;"><div style="color:#78716c;font-size:12px;letter-spacing:2px;">① 发展现状 · 12′</div><div style="color:#1c1917;font-size:15px;font-weight:600;margin-top:2px;">AI 走到哪一步了</div></div>
+      <div style="flex:1.2;border:1px solid #d6d3d1;border-top:4px solid #1c1917;padding:10px 14px;background:#fffdf8;"><div style="color:#78716c;font-size:12px;letter-spacing:2px;">② 概念地图 · 15′</div><div style="color:#1c1917;font-size:15px;font-weight:600;margin-top:2px;">Chat→Agent→Harness</div></div>
+      <div style="flex:1.2;border:1px solid #d6d3d1;border-top:4px solid #b91c1c;padding:10px 14px;background:#fffdf8;"><div style="color:#b91c1c;font-size:12px;letter-spacing:2px;">③ 案例 · 8′</div><div style="color:#1c1917;font-size:15px;font-weight:600;margin-top:2px;">一篇论文的研究之旅</div></div>
+      <div style="flex:1.2;border:1px solid #d6d3d1;border-top:4px solid #b91c1c;padding:10px 14px;background:#fffdf8;"><div style="color:#b91c1c;font-size:12px;letter-spacing:2px;">④ Live Demo · 12′</div><div style="color:#1c1917;font-size:15px;font-weight:600;margin-top:2px;">现场让 AI 动手</div></div>
+      <div style="flex:1.2;border:1px solid #d6d3d1;border-top:4px solid #d97706;padding:10px 14px;background:#fffdf8;"><div style="color:#d97706;font-size:12px;letter-spacing:2px;">⑤ 边界 · 6′</div><div style="color:#1c1917;font-size:15px;font-weight:600;margin-top:2px;">什么必须自己判断</div></div>
+    </div>
+    <div style="border-bottom:1.5px solid #1c1917;margin-top:14px;"></div>
+  </div>
+</div>
+
+<!-- ===== 概念页 v3 ===== -->
+<div class="slide-label"><span class="label">样张 2 · 概念页（满幅双栏 + 底部对比条 —— 全套密度基准）</span></div>
+<div class="ms" style="padding:26px 56px 18px;">
+  <div style="display:flex;justify-content:space-between;align-items:baseline;border-bottom:1.5px solid #d6d3d1;padding-bottom:9px;">
+    <div style="color:#b91c1c;font-size:15px;letter-spacing:5px;">§ 2 概念地图 · 4/8</div>
+    <div style="display:flex;align-items:baseline;gap:18px;"><div style="color:#1c1917;font-size:34px;font-weight:900;">Agent：会"动手"的 AI</div><div class="mono" style="color:#78716c;font-size:14px;">= 模型 + 工具 + 循环</div></div>
+    <div style="color:#a8a29e;font-size:13px;letter-spacing:2px;">AI 智能体与科研工作流</div>
+  </div>
+  <div style="flex:1;display:flex;gap:30px;margin-top:16px;min-height:0;">
+    <!-- 左栏 -->
+    <div style="flex:1.12;display:flex;flex-direction:column;justify-content:space-between;">
+      <div style="color:#292524;font-size:19px;line-height:1.75;">Chat 给你<b>答案的文字</b>，Agent 交付<b style="color:#b91c1c;">做完的事</b>。拿到任务后它自主循环：</div>
+      <div style="display:flex;align-items:center;gap:8px;" class="sans">
+        <span style="border:1.5px solid #1c1917;padding:6px 18px;border-radius:999px;font-size:17px;">想</span><span style="color:#b91c1c;font-size:18px;">→</span>
+        <span style="border:1.5px solid #1c1917;padding:6px 18px;border-radius:999px;font-size:17px;">做</span><span style="color:#b91c1c;font-size:18px;">→</span>
+        <span style="border:1.5px solid #1c1917;padding:6px 18px;border-radius:999px;font-size:17px;">看结果</span><span style="color:#b91c1c;font-size:18px;">→</span>
+        <span style="border:1.5px solid #b91c1c;color:#b91c1c;padding:6px 18px;border-radius:999px;font-size:17px;font-weight:700;">再做 ↻</span>
+      </div>
+      <div style="color:#292524;font-size:18px;line-height:2.05;">
+        <div><span style="color:#b91c1c;">—</span>　读整篇论文 PDF，连同公式、图表与参考文献</div>
+        <div><span style="color:#b91c1c;">—</span>　<b>写代码并运行</b>，数值/符号验证一个命题</div>
+        <div><span style="color:#b91c1c;">—</span>　批量跑实验，把结果整理成表格与图</div>
+        <div><span style="color:#b91c1c;">—</span>　遇到报错<b>自己读、自己修、重新跑</b>，直到做完</div>
+      </div>
+      <div class="sans" style="background:#f3efe6;padding:10px 16px;font-size:14.5px;color:#57534e;letter-spacing:1px;">关键词：自主循环 · 工具调用 · 自我纠错 · 交付结果</div>
+    </div>
+    <!-- 右栏 -->
+    <div style="flex:1;display:flex;flex-direction:column;justify-content:space-between;gap:12px;">
+      <div style="background:#fffdf8;border:1px solid #d6d3d1;border-left:5px solid #b91c1c;padding:16px 20px;border-radius:3px;flex:1;">
+        <div class="mono" style="font-size:15px;line-height:1.95;color:#44403c;">
+          <div style="color:#1c1917;">❯ 读 Zagier(1990)，验证那个对合</div>
+          <div style="color:#78716c;">✓ 解析定义：三段分支 (x,y,z) ↦ …</div>
+          <div style="color:#78716c;">✓ p=13：轨道 (1,1,3)→(3,1,1)→… 闭合</div>
+          <div style="color:#78716c;">✓ 写好 verify.py 并运行</div>
+          <div style="color:#15803d;">✓ p ≤ 10⁶：78,498 个素数全部通过</div>
+          <div style="color:#1c1917;">❯ 生成带图 LaTeX 笔记 notes.tex ✓</div>
+        </div>
+      </div>
+      <div style="border-left:3px solid #b91c1c;padding-left:14px;color:#b91c1c;font-size:15px;line-height:1.7;font-style:italic;">旁注 · 一次指令，数分钟后拿回：可复查的代码、验证结果、一份排好版的笔记。</div>
+      <div style="display:flex;gap:8px;" class="sans">
+        <div style="flex:1;border:1px solid #d6d3d1;text-align:center;padding:9px 2px;background:#fffdf8;"><div style="font-size:21px;font-weight:700;color:#1c1917;">1 次</div><div style="font-size:13px;color:#78716c;">自然语言指令</div></div>
+        <div style="flex:1;border:1px solid #d6d3d1;text-align:center;padding:9px 2px;background:#fffdf8;"><div style="font-size:21px;font-weight:700;color:#1c1917;">~5 min</div><div style="font-size:13px;color:#78716c;">自主完成</div></div>
+        <div style="flex:1;border:1px solid #d6d3d1;text-align:center;padding:9px 2px;background:#fffdf8;"><div style="font-size:21px;font-weight:700;color:#b91c1c;">3 件</div><div style="font-size:13px;color:#78716c;">代码 · 结果 · 笔记</div></div>
+      </div>
+    </div>
+  </div>
+  <!-- 底部对比条 -->
+  <div class="sans" style="display:flex;gap:0;margin-top:14px;border:1px solid #d6d3d1;">
+    <div style="flex:1;padding:9px 16px;background:#fffdf8;display:flex;align-items:center;gap:12px;"><span style="color:#78716c;font-size:13px;letter-spacing:2px;white-space:nowrap;">同一请求 · CHAT</span><span style="color:#44403c;font-size:14.5px;">返回五段解释文字，例子对不对仍要自己算</span></div>
+    <div style="width:1px;background:#d6d3d1;"></div>
+    <div style="flex:1;padding:9px 16px;background:#f3efe6;display:flex;align-items:center;gap:12px;"><span style="color:#b91c1c;font-size:13px;letter-spacing:2px;white-space:nowrap;">同一请求 · AGENT</span><span style="color:#1c1917;font-size:14.5px;font-weight:600;">交回 verify.py + 78,498 ✓ + notes.tex</span></div>
+  </div>
+  <div style="border-top:1.5px solid #d6d3d1;margin-top:12px;padding-top:8px;display:flex;justify-content:space-between;align-items:center;">
+    <div style="display:flex;gap:5px;align-items:center;"><span style="width:7px;height:7px;border-radius:50%;background:#d6d3d1;"></span><span style="width:7px;height:7px;border-radius:50%;background:#d6d3d1;"></span><span style="width:7px;height:7px;border-radius:50%;background:#d6d3d1;"></span><span style="width:7px;height:7px;border-radius:50%;background:#b91c1c;"></span><span style="width:7px;height:7px;border-radius:50%;background:#d6d3d1;"></span><span style="width:7px;height:7px;border-radius:50%;background:#d6d3d1;"></span><span style="width:7px;height:7px;border-radius:50%;background:#d6d3d1;"></span><span style="width:7px;height:7px;border-radius:50%;background:#d6d3d1;"></span></div>
+    <div style="color:#a8a29e;font-size:13px;">· 14 / 40 ·</div>
+    <div style="color:#78716c;font-size:13px;">demo 预告：它将现场验证 Zagier ➤</div>
+  </div>
+</div>
+
+<!-- ===== 对比表页 v3 ===== -->
+<div class="slide-label"><span class="label">样张 3 · 对比表页（表格撑满 + 底部"怎么选"决策条）</span></div>
+<div class="ms" style="padding:26px 56px 18px;">
+  <div style="display:flex;justify-content:space-between;align-items:baseline;border-bottom:1.5px solid #d6d3d1;padding-bottom:9px;">
+    <div style="color:#b91c1c;font-size:15px;letter-spacing:5px;">§ 2 概念地图 · 小结</div>
+    <div style="color:#1c1917;font-size:32px;font-weight:900;">一张表看懂四个层级</div>
+    <div style="color:#a8a29e;font-size:13px;letter-spacing:2px;">AI 智能体与科研工作流</div>
+  </div>
+  <table class="sans" style="width:100%;border-collapse:collapse;font-size:15.5px;line-height:1.6;margin-top:14px;flex:1;">
+    <tr style="background:#1c1917;color:#f8f4ec;">
+      <th style="padding:10px 14px;text-align:left;font-weight:600;width:12%;">层级</th>
+      <th style="padding:10px 14px;text-align:left;font-weight:600;width:23%;">它是什么</th>
+      <th style="padding:10px 14px;text-align:left;font-weight:600;width:19%;">你给它什么</th>
+      <th style="padding:10px 14px;text-align:left;font-weight:600;width:22%;">它还给你什么</th>
+      <th style="padding:10px 14px;text-align:left;font-weight:600;">数学人的典型用法</th>
+    </tr>
+    <tr style="background:#fffdf8;">
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;color:#b91c1c;font-weight:700;font-size:17px;">Chat</td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;">网页对话框里的问答</td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;">一段文字（或图 / PDF）</td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;">一段回答文字</td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;">查定义 · 问思路 · 改段落</td>
+    </tr>
+    <tr style="background:#f3efe6;">
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;color:#b91c1c;font-weight:700;font-size:17px;">Agent</td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;">会用工具、会循环的 AI</td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;">一个任务目标</td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;"><b>做完的事</b>：代码、验证、文件</td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;">读论文 + 写代码验证例子</td>
+    </tr>
+    <tr style="background:#fffdf8;">
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;color:#b91c1c;font-weight:700;font-size:17px;">Harness</td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;">智能体的"驾驶舱"软件：<span style="color:#78716c;">Claude Code / Codex / Opencode…</span></td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;">你的文件夹 / 论文 / 代码库</td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;">长期记忆 · 技能沉淀 · 安全围栏</td>
+      <td style="padding:11px 14px;border-bottom:1px solid #e7e5e4;">托管整个 LaTeX / 研究目录</td>
+    </tr>
+    <tr style="background:#f3efe6;">
+      <td style="padding:11px 14px;color:#b91c1c;font-weight:700;font-size:17px;">Workflow</td>
+      <td style="padding:11px 14px;">定时 / 自动触发的 agent 流水线</td>
+      <td style="padding:11px 14px;">一次性的规则设定</td>
+      <td style="padding:11px 14px;">周期产出：监测、汇总、日报</td>
+      <td style="padding:11px 14px;">每早 8 点 arXiv 新论文速报</td>
+    </tr>
+  </table>
+  <!-- 怎么选决策条 -->
+  <div class="sans" style="display:flex;align-items:stretch;gap:0;border:1px solid #1c1917;margin-top:14px;">
+    <div style="background:#1c1917;color:#f8f4ec;padding:10px 18px;font-size:14px;letter-spacing:3px;display:flex;align-items:center;white-space:nowrap;">怎么选</div>
+    <div style="flex:1;display:flex;align-items:center;padding:8px 14px;gap:8px;font-size:14.5px;color:#292524;"><b>问一句</b><span style="color:#b91c1c;">→ Chat</span></div>
+    <div style="width:1px;background:#d6d3d1;"></div>
+    <div style="flex:1.1;display:flex;align-items:center;padding:8px 14px;gap:8px;font-size:14.5px;color:#292524;"><b>做一件事</b><span style="color:#b91c1c;">→ Agent</span></div>
+    <div style="width:1px;background:#d6d3d1;"></div>
+    <div style="flex:1.2;display:flex;align-items:center;padding:8px 14px;gap:8px;font-size:14.5px;color:#292524;"><b>管一个项目</b><span style="color:#b91c1c;">→ Harness</span></div>
+    <div style="width:1px;background:#d6d3d1;"></div>
+    <div style="flex:1.3;display:flex;align-items:center;padding:8px 14px;gap:8px;font-size:14.5px;color:#292524;"><b>周期性的事</b><span style="color:#b91c1c;">→ Workflow</span></div>
+  </div>
+  <div style="border-top:1.5px solid #d6d3d1;margin-top:12px;padding-top:8px;display:flex;justify-content:space-between;align-items:center;">
+    <div style="color:#b91c1c;font-size:14px;font-style:italic;">旁注 · 层级越往下，AI 越像「合作者」而不是「问答机」。</div>
+    <div style="color:#a8a29e;font-size:13px;">· 18 / 40 ·</div>
+    <div class="sans" style="color:#78716c;font-size:13px;background:#f3efe6;padding:4px 12px;">今天的 demo 用的是 Harness 层：Claude Code</div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:26px;">
+  <h3>这次的满幅密度可以吗？</h3>
+  <div class="den-card" data-choice="density-v3-ok" onclick="toggleSelect(this)"><b>✓ 可以，就按这个基准做全套</b>（章节过渡页允许稍松，表格页就这个密度）</div>
+  <div class="den-card" data-choice="density-v3-more" onclick="toggleSelect(this)"><b>还要更密</b>—— 再加信息量</div>
+  <div class="den-card" data-choice="density-v3-tweak" onclick="toggleSelect(this)"><b>密度对了，但有细节要调</b>—— 在终端告诉我（颜色 / 字体 / 某个元素）</div>
+</div>

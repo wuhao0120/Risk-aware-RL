@@ -3,3 +3,6 @@
 *.log
 .superpowers/
 talk/making-of/_wrapped/
+talk/slides/fonts/raw/
+talk/slides/dist/
+talk/demo/recordings/
