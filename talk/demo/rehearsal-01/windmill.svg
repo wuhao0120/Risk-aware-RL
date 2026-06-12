@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 430" width="400" height="430">
+  <!-- Zagier 风车构形: p = x^2 + 4yz, 图为 p=29 (x=3, y=1, z=5) -->
+  <rect x="158" y="158" width="84" height="84" fill="#f4d7d0" stroke="#b91c1c" stroke-width="2.5"/>
+  <rect x="242" y="158" width="140" height="28" fill="#fffdf8" stroke="#1c1917" stroke-width="2"/>
+  <rect x="158" y="18"  width="28" height="140" fill="#fffdf8" stroke="#1c1917" stroke-width="2"/>
+  <rect x="18"  y="214" width="140" height="28" fill="#fffdf8" stroke="#1c1917" stroke-width="2"/>
+  <rect x="214" y="242" width="28" height="140" fill="#fffdf8" stroke="#1c1917" stroke-width="2"/>
+  <text x="200" y="207" text-anchor="middle" font-size="22" font-family="serif" font-style="italic" fill="#b91c1c">x&#178;</text>
+  <text x="312" y="178" text-anchor="middle" font-size="15" font-family="serif" font-style="italic" fill="#57534e">y&#183;z</text>
+  <text x="172" y="92" text-anchor="middle" font-size="15" font-family="serif" font-style="italic" fill="#57534e" transform="rotate(-90 172 92)">y&#183;z</text>
+  <text x="88" y="234" text-anchor="middle" font-size="15" font-family="serif" font-style="italic" fill="#57534e">y&#183;z</text>
+  <text x="228" y="312" text-anchor="middle" font-size="15" font-family="serif" font-style="italic" fill="#57534e" transform="rotate(-90 228 312)">y&#183;z</text>
+  <text x="200" y="416" text-anchor="middle" font-size="16" font-family="serif" fill="#1c1917">p = x&#178; + 4yz&#12288;(p = 29, x = 3, y = 1, z = 5)</text>
+</svg>

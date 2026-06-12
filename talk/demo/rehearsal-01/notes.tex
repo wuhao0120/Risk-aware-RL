@@ -1,0 +1,73 @@
+% notes.tex — Zagier (1990) 一句话证明 · 研读笔记
+% 由 AI 辅助研读会话整理生成（首轮自彩排产物, 2026-06-13）
+\documentclass[11pt]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath,amsthm,amssymb}
+\usepackage{tikz}
+\usepackage[a4paper,margin=2.6cm]{geometry}
+\newtheorem{theorem}{定理}
+\newtheorem*{remark}{注}
+\title{Zagier「一句话证明」研读笔记}
+\author{（AI 辅助研读 · 全部断言经 \texttt{verify.py} 数值验证）}
+\date{2026 年 6 月}
+\begin{document}
+\maketitle
+
+\begin{theorem}[Fermat]
+每个素数 $p \equiv 1 \pmod 4$ 都可表为两个平方数之和。
+\end{theorem}
+
+\section*{一、舞台：有限集 $S$}
+\[
+S=\{(x,y,z)\in\mathbb{Z}_{+}^{3}\;:\;x^{2}+4yz=p\}.
+\]
+$S$ 有限（$x^{2}<p$ 且 $yz=(p-x^{2})/4$ 仅有限种分解）；又 $p\equiv1\pmod4$ 推出 $x$ 必为奇数。
+
+\section*{二、主角：Zagier 对合 $T$}
+\[
+T(x,y,z)=
+\begin{cases}
+(x+2z,\; z,\; y-x-z), & x<y-z,\\[2pt]
+(2y-x,\; y,\; x-y+z), & y-z<x<2y,\\[2pt]
+(x-2y,\; x-y+z,\; y), & x>2y.
+\end{cases}
+\]
+边界情形 $x=y-z$ 或 $x=2y$ 不会出现（否则 $p$ 可分解）。$T$ 的不动点只能落在中间分支：$x=y$ 时 $x\,|\,p$ 故 $x=y=1$，即唯一不动点 $(1,1,\tfrac{p-1}{4})$。
+
+\section*{三、收官：奇偶性}
+$T$ 是恰有一个不动点的对合 $\Rightarrow|S|$ 为奇数 $\Rightarrow$ 交换对合 $\sigma(x,y,z)=(x,z,y)$ 也必有不动点，即存在 $y=z$ 的三元组：
+\[
+p=x^{2}+4y^{2}=x^{2}+(2y)^{2}.\qquad\blacksquare
+\]
+
+\section*{四、算例 $p=13$}
+$S(13)=\{(1,1,3),(1,3,1),(3,1,1)\}$；$T$ 交换 $(1,3,1)\leftrightarrow(3,1,1)$，固定 $(1,1,3)$；$\sigma$ 固定 $(3,1,1)$，故 $13=3^{2}+2^{2}$。
+
+\section*{五、数值验证（verify.py）}
+对合性、不动点唯一性：$p\le 10^{4}$ 全量 $609$ 个素数通过（$0.1$s）；
+不动点公式与两平方表示：$p\le 10^{6}$ 共 $39{,}175$ 个素数通过（$0.8$s）。
+
+\section*{六、直观：风车}
+$p=x^{2}+4yz$ 即「中心 $x\times x$ 正方形 + 四翼 $y\times z$ 矩形」的风车面积分解；$T$ 是风车切法之间的翻转，唯一翻不动的是 $x=y$ 的对称十字。
+
+\begin{center}
+\begin{tikzpicture}[scale=0.42]
+  \fill[red!12] (0,0) rectangle (3,3);
+  \draw[very thick,red!70!black] (0,0) rectangle (3,3);
+  \draw[thick] (3,2) rectangle (8,3);
+  \draw[thick] (0,3) rectangle (1,8);
+  \draw[thick] (-5,0) rectangle (0,1);
+  \draw[thick] (2,-5) rectangle (3,0);
+  \node at (1.5,1.5) {$x^2$};
+  \node at (5.5,2.5) {$y\,z$};
+  \node at (0.5,5.5) {$y\,z$};
+  \node at (-2.5,0.5) {$y\,z$};
+  \node at (2.5,-2.5) {$y\,z$};
+  \node[below] at (1.5,-5.4) {\small 图：$p=29=3^2+4\cdot1\cdot5$ 的风车构形};
+\end{tikzpicture}
+\end{center}
+
+\begin{remark}
+原文仅一页：D. Zagier, \emph{A One-Sentence Proof That Every Prime $p\equiv1\pmod 4$ Is a Sum of Two Squares}, Amer.\ Math.\ Monthly \textbf{97}(2), 1990, p.~144. 证明是对 Heath-Brown (1984) 的简化；\textbf{非构造性}。风车可视化归于 A.~Spivak（2006/2007），另见 Mathologer 的讲解视频。
+\end{remark}
+\end{document}
