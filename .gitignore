@@ -1,6 +1,13 @@
 **/wandb/
 
 *.log
+*.py[cod]
+__pycache__/
+**/__pycache__/
+**/_runs/
+**/results/
+*_wandb_monitor.png
+wandb_monitor*.png
 .superpowers/
 talk/making-of/_wrapped/
 talk/slides/fonts/raw/

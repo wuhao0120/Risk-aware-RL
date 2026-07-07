@@ -48,6 +48,26 @@ lambda_c: 0.6
 density_bandwidth: 0.01  # 密度估计带宽δ（计算Q(α±δ)用于密度f̂_Z = 2δ/(Q(α+δ)-Q(α-δ))）
 
 # ======================
+# 约束型 Actor-Critic 共享参数 (DQCAC / DQCACBeta / DQCACBetaGPU)
+# ======================
+beta: 0.95               # Abel风险折扣因子β (仅DQCACBeta/GPU的actor约束项per-transition近似)
+critic_lr: 0.001         # 分布式critic学习率
+critic_hidden: [64, 64]  # critic隐藏层维度
+batch_size: 64           # DQCAC critic replay minibatch大小
+buffer_capacity: 100000  # DQCAC critic replay buffer容量
+min_buffer_size: 256     # DQCAC启用critic replay混合采样前的最小样本数
+entropy_coef: 0.0        # Actor entropy bonus系数
+target_tau: 0.005        # Target critic Polyak软更新系数
+lambda_max: 50.0         # 拉格朗日乘子λ上界
+advantage_norm: separate # separate / none / qcpo (qcpo仅DQCACBetaGPU: 跨迭代EMA稳定归一化, 反λ卷绕)
+norm_ema_decay: 0.1      # advantage_norm=qcpo时EMA归一化器衰减系数 (≈1/decay迭代窗宽)
+warmup_iters: null       # DQCACBetaGPU qcpo warmup迭代数(只练critic+EMA); null→qcpo默认5/其余0
+num_action_samples: 1    # 估计V_m(s)和V_c(s,b)时采样动作数
+actor_grad_clip: 10.0    # Actor梯度裁剪阈值
+critic_grad_clip: 10.0   # Critic梯度裁剪阈值
+action_clip: null        # 默认不裁剪动作, 保持RiskSensitiveEnv原始动作语义
+
+# ======================
 # 评估参数
 # ======================
 eval_episodes: 1000     # 评估时的采样次数
@@ -78,3 +98,20 @@ output_dir: 'results'   # 结果保存目录
 #   - 预期结果: Mean ≈ 12.5, Q_0.25 ≈ 6.0
 #
 # 结论: QCPO均值提高约30%!
+
+# ======================
+# DQC-AC-β (per-transition) 特有参数
+# ======================
+num_quantiles: 32          # 分布式critic分位数个数 N
+huber_kappa: 1.0           # quantile Huber 的 κ
+target_update_interval: 1  # target critic 软更新间隔 (learning step)
+updates_per_episode: 10    # 每 episode 内层 TD 更新次数
+
+# ======================
+# DQC-AC-β GPU 向量化 (DQCACBetaGPU) 特有参数
+# 全 GPU、B 路并行版; 总 env-step = num_iterations × num_envs × n
+# ======================
+num_envs: 256              # 并行 env 数 B (一次迭代采集的轨迹条数)
+num_iterations: 400        # 迭代次数 (400×256×10 ≈ 1.0M env-step ≈ baseline 的 10万 episode)
+n_step: 1                  # critic TD 步数=1 (原生 per-transition); >1 会让 actor 失控, 保持 1
+critic_step_feature: true  # critic 输入追加 step 特征 t/n: 修 step-blind 过散 (cdf_initial 0.34→0.20 校准)

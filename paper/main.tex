@@ -1,0 +1,534 @@
+\input{preamble}
+\input{format}
+\input{commands}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\definecolor{ECNURed}{RGB}{164,31,53}
+\usepackage[fontset=ubuntu]{ctex}
+
+
+
+
+\begin{document}
+\title{Quantile Constraint Policy Optimization}
+\author{Zhang Yingying, Wu Hao}
+\maketitle
+
+\section{Background}
+Consider an MDP $(\mathcal{S},\mathcal{A},P,R,\eta)$, where $s\in \mathcal{S}$ denotes the state space and $a \in \mathcal{A}$ denotes the action space. $P(s'|s,a)$ denotes the environmental transition probabilities that depend on environment dynamics. Let $\rho(s)$ denote the initial state distribution and $R(s,a)$ and $\eta \in (0,1)$ are reward function and discount factor. A trajectory is represented by $\tau=(s_0,a_0,s_1,a_1,...,)$ We define the discounted cumulative return as:
+\begin{align}
+    Z := \sum_{t=1}^{\infty} \eta^t R(s_t,a_t).
+\end{align}
+
+The corresponding reward-to-go for timestep $t$ is:
+\begin{align}
+    G_t := \sum_{\ell=t}^{\infty}\eta^{\ell-t}R_\ell.
+\end{align}
+
+Our goal is to maximize the discounted cumulative return $Z$ subject to a quantile constraint $\mathcal{Q}(\alpha) \geq q$, where $\mathcal{Q}(\alpha)$ denotes the $\alpha$-quantile of $Z$ and $q$ is a pre-specified quantile threshold. We denote the problem as:
+\begin{align}
+    \max_{\theta \in \Theta}E_{\theta}[Z] ~~\text{s.t.}~\mathcal{Q}(\alpha;\theta)\geq q,
+\end{align}
+However, if we parameterize the policy $\pi$ by $\theta$, and take gradient descent to find the optimal $\theta^*$ of the problem, we have to handle the gradient of $\mathcal{Q}(\alpha)$:
+\begin{align}
+    \nabla_\theta \mathcal{Q}(\alpha;\theta)
+    = -\frac{\nabla_\theta F_Z(r;\theta)}{f_Z(r;\theta)}\bigg|_{r = \mathcal{Q}(\alpha;\theta)}, \notag
+\end{align}
+where $F_Z(r;\theta)$ denotes the distribution function of $Z$ and $f_Z(r;\theta)$ denotes the density function of $Z$. \textcolor{ECNURed}{The quantile gradient depends on the evaluation of an unknown density function at ground truth $\mathcal{Q}(\alpha;\theta)$}. In recent proposed QPO framework, \textbf{Jiang et al.} observed that the density function remains strictly positive, so they omit the denominator without influencing the gradient direction and estimate the ground truth $\mathcal{Q}(\alpha;\theta)$. 
+
+However, their method only applies to the case where only quantiles are optimized. When considering maximizing mean while using quantiles as a constraint, the total gradient is coupled with the gradients of the mean and quantile terms. In this case, ignoring the denominator of the quantile gradient can lead to unpredictable biases. \textcolor{ECNURed}{This is also the core observation behind our proposal to use equivalent probabilistic constraints instead of quantile constraints. By equivalently transforming quantile constraints into probabilistic expressions, we can avoid the denominator's dependence on the density function and eliminate the need to evaluate the gradient expression on the ground truth.}
+
+\section{Our Setting}
+We fomulate our problem as:
+\begin{align} 
+    \max_{\theta \in \Theta}E_{\tau}[Z] ~~\text{s.t.}~F_Z(q;\theta)=\mathbb P_\theta(Z\le q)\le \alpha.
+\end{align}
+We model the policy $\pi$ by a neural network parameterized by $\theta$, and the goal is to find the optimal theta that maximize mean return $Z$ while satisfying probability constraint $P(Z\leq q)\leq \alpha$.
+
+For the inequality constraint problem (3), we use Lagrange for solution and consider its dual problem, which is: 
+\begin{align} \label{dual-lag}
+    \min_{\lambda\geq0}\mathcal{L}(\lambda)
+    := \min_{\lambda\geq0}\max_{\theta\in\Theta}\mathcal{J}(\theta,\lambda)
+    :=\min_{\lambda\geq0}\max_{\theta\in\Theta}\left\{\mathbb{E}_{\theta}[Z]-\lambda\{P_\theta(Z\le q) - \alpha\}\right\}.
+\end{align}
+This dual problem is convex in $\lambda$, which does not depend on $\theta$, thus classical convex optimization methods can be used to efficiently find the optimal $\lambda^*$. Then, the corresponding $\tilde{\theta}$ defined as
+\begin{align} \label{eq:lag-dual}
+    \tilde{\theta}=\mathop{\arg\max}\limits_{\theta\in\Theta} \left\{\mathbb{E}_{\theta}[Z]-\lambda^*\{P_\theta(Z\le q) - \alpha\}\right\} := \mathop{\arg\max}\limits_{\theta\in\Theta}~\mathcal{J}(\theta).
+\end{align}
+
+We then introduce two methods to find the optimal $\tilde{\theta}$. The first method, called \textbf{Q}uantile \textbf{C}onstrained \textbf{P}olicy \textbf{O}ptimization, directly differentiates the Lagrangian function, and then estimates the expectation term using the Monte Carlo method, resulting in a trajectory-based optimization method.
+
+The second method is an improvement on the first. Since the first method's update signal comes from every trajectory, making its data efficiency low. Therefore, we consider slightly \textbf{modifying} the objective function by introducing a \textbf{distributional critic} and applying the \textbf{policy gradient theorem} to transform it into a per-transition update form.
+
+\section{QCPO (MC Based)}
+Based on (4), given some $\lambda$, take differentiation in $\mathcal{J}(\theta)$ and make some simplification, we have:
+\begin{align} \label{mix_gradient}
+    \nabla_\theta\mathcal{J}(\theta)
+    &=\mathbb E_{\theta}\left[\Bigl(Z-\lambda\,\mathbf 1\{Z\le q\}\Bigr)\sum_{t=0}^\infty\nabla_\theta\log\pi(A_t\mid S_t;\theta)\right]\\
+    &=\mathbb E_{\theta}\left[\sum_{t=0}^\infty\Bigl(\eta^t G_t-\lambda\,\mathbf 1\{Z\le q\}\Bigr) \nabla_\theta\log\pi(A_t\mid S_t;\theta)\right].
+\end{align}
+
+Similarly, taking differentiation of $\lambda$ results in the gradient update formulation of $\theta$ and $\lambda$:
+\begin{align}
+    \theta_{k+1} &\gets \theta_k+\gamma_kD(\tau_k,\theta_k,\mathcal{Q}_k) \notag \\
+    \lambda & \gets \left[\lambda + \epsilon_k(\mathbf 1\{Z_k\le q\}-\alpha)\right]_{+},
+\end{align}
+where
+\begin{align}
+    D(\tau_k,\theta_k,\mathcal{Q}_k))    &:=\Bigl(Z_k-\lambda_k\,\mathbf 1\{Z_k\le q\}\Bigr)\sum_{t=0}^\infty\nabla_\theta \log \pi(A_t^k\mid S_t^k;\theta_k) \notag \\
+    &= \sum_{t=0}^\infty \Bigl(\eta^t G_t^k-\lambda_k\,\mathbf 1\{Z_k\le q\}\Bigr) \nabla_\theta \log \pi(A_t^k\mid S_t^k;\theta_k)
+\end{align}
+is the gradient estimator of $\nabla_\theta\mathcal{J}(\theta)$.
+
+\begin{algorithm}[ht]
+\caption{Probability-Constrained Policy Optimization}
+\label{alg:pcpo}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Initial policy $\pi(\cdot|\cdot;\theta_1)$, violation level $\alpha$, threshold $q$, discount factor $\eta$, update interval $\mathcal{I}$, total iterations $N$, step-sizes $\{\gamma_k,\epsilon_k\}$, truncation timestep $T$.
+\STATE \textbf{Initialize:} $\theta \gets \theta_1$, $\lambda \gets 0$.
+\FOR{$k = 1,2,\dots,N$}
+    \STATE \textbf{Sample Trajectory:}
+    \STATE Sample a trajectory $\tau_k=\{s_0,a_0,r_0,\dots,s_{T-1}\}$ following $\pi(\cdot|\cdot;\theta_k)$.
+    
+    \STATE \textbf{Compute Return and Constraint Violation:}
+    \begin{equation}
+        Z_k
+        =
+        \sum_{t=0}^{T-1}\eta^t r_t .
+        \notag
+    \end{equation}
+    \STATE Compute the probability-constraint violation indicator:
+    \begin{equation}
+        I_k
+        =
+        \mathbf{1}\{Z_k\le q\}.
+        \notag
+    \end{equation}
+    
+    \STATE \textbf{Policy Gradient Estimation:}
+    \STATE Estimate the gradient of the Lagrangian objective:
+    \begin{equation}
+        D_k
+        \gets
+        \left(
+        Z_k
+        -
+        \lambda_k \mathbf{1}\{Z_k\le q\}
+        \right)
+        \sum_{t=0}^{T-1}
+        \nabla_\theta \log \pi(a_t|s_t;\theta_k).
+        \notag
+    \end{equation}
+    
+    \STATE \textbf{Update Policy Parameter:}
+    \begin{equation}
+        \theta_{k+1}
+        \gets
+        \varphi_\Theta
+        \left(
+        \theta_k+\gamma_k D_k
+        \right).
+        \notag
+    \end{equation}
+    
+    \STATE \textbf{Update Dual Variable (Conditional):}
+    \IF{$k \pmod{\mathcal{I}} == 0$}
+        \STATE Update $\lambda$ based on the empirical constraint violation:
+        \begin{equation}
+            \lambda_{k+1}
+            \gets
+            \left[
+            \lambda_k+\epsilon_k
+            \left(
+            \mathbf{1}\{Z_k\le q\}-\alpha
+            \right)
+            \right]_{+}.
+            \notag
+        \end{equation}
+    \ELSE
+        \STATE Keep the dual variable unchanged:
+        \begin{equation}
+            \lambda_{k+1}\gets\lambda_k.
+            \notag
+        \end{equation}
+    \ENDIF
+\ENDFOR
+\STATE \textbf{Return} final policy parameter $\theta^*$.
+\end{algorithmic}
+\end{algorithm}
+
+
+\section{Distributional Quantile-Constrained Actor-Critic}
+In this section, we introduce the distributional critic and slightly modify the gradient (8) to apply the policy gradient theorem. We first explain why the conclusions of the policy gradient theorem cannot be directly applied to the quantile constraint case. Intuitively, a quantile constraint is a trajectory-level constraint, which cannot be represented by a reachable distribution of states. Mathematically, the problem lies in the non-additivity of the indicator function, which prevents the discount factor from crossing the indicator function, thus making it impossible to normalize to a valid distribution in infinite horizon setting.
+
+\subsection{Why PGT fail in quantile?}
+For each time step $t\ge 0$, define the future discounted return-to-go by
+\begin{align}
+    G_t := \sum_{\ell=t}^{\infty}\eta^{\ell-t}R_\ell.
+\end{align}
+Then the gradient of the mean objective can be written as
+\begin{align}
+    \nabla_{\theta}J(\theta)
+    =
+    \mathbb{E}_{\theta}\Biggl[
+        \sum_{t=0}^{\infty}
+        \eta^t G_t
+        \nabla_{\theta}\log\pi(A_t\mid S_t;\theta)
+    \Biggr].
+\end{align}
+Applying the tower property to each term gives
+\begin{align}
+    \nabla_{\theta}J(\theta)
+    &=
+    \sum_{t=0}^{\infty}
+    \mathbb{E}_{\theta}\Bigl[
+        \eta^t G_t
+        \nabla_{\theta}\log\pi(A_t\mid S_t;\theta)
+    \Bigr] \label{eq:mean_local_1}\\
+    &=
+    \sum_{t=0}^{\infty}
+    \mathbb{E}_{\theta}\Bigl[
+        \mathbb{E}_{\theta}\bigl[
+            \eta^t G_t
+            \nabla_{\theta}\log\pi(A_t\mid S_t;\theta)
+            \,\big|\,
+            S_t,A_t
+        \bigr]
+    \Bigr] \label{eq:mean_local_2}\\
+    &=
+    \sum_{t=0}^{\infty}
+    \mathbb{E}_{\theta}\Bigl[
+        \eta^t
+        \mathbb{E}_{\theta}\bigl[
+            G_t
+            \,\big|\,
+            S_t,A_t
+        \bigr]
+        \nabla_{\theta}\log\pi(A_t\mid S_t;\theta)
+    \Bigr], \label{eq:mean_local_3}
+\end{align}
+where in the last step we use that $\nabla_{\theta}\log\pi(A_t\mid S_t;\theta)$ is measurable with respect to $\sigma(S_t,A_t)$. This motivates the \emph{local mean target}
+\begin{align}
+    Q_m^{\pi}(s,a)
+    :=
+    \mathbb{E}_{\theta}\!\left[
+        G_t
+        \,\middle|\,
+        S_t=s,A_t=a
+    \right].
+\end{align}
+Collecting the discount weights into the (normalized) discounted state--action occupancy
+\begin{align}
+    d_{\eta}^{\pi}(s,a)
+    :=
+    (1-\eta)\sum_{t=0}^{\infty}\eta^t\,\mathbb{P}_{\theta}\!\left(S_t=s,A_t=a\right),
+\end{align}
+the mean gradient \eqref{eq:mean_local_3} collapses into a single expectation over a \emph{stationary} distribution,
+\begin{align}\label{eq:mean_pg}
+    \nabla_{\theta}J(\theta)
+    =
+    \frac{1}{1-\eta}\,
+    \mathbb{E}_{(s,a)\sim d_{\eta}^{\pi}}\!\left[
+        Q_m^{\pi}(s,a)\,
+        \nabla_{\theta}\log\pi(a\mid s;\theta)
+    \right].
+\end{align}
+Equation \eqref{eq:mean_pg} is precisely the policy gradient theorem. The per-step discount $\eta^t$ is exactly what allows the infinite sum $\sum_t\eta^t(\cdot)$ to be renormalized into the probability measure $d_{\eta}^{\pi}$, after which a single critic $Q_m^{\pi}$ together with per-transition sampling suffices.
+
+\textbf{The constraint term.} We now attempt the same localization for the chance constraint
+\begin{align}
+    G(\theta)
+    :=
+    \mathbb{P}_{\theta}(Z\le q)
+    =
+    \mathbb{E}_{\theta}\!\left[\mathbf{1}\{Z\le q\}\right].
+\end{align}
+The likelihood-ratio identity gives
+\begin{align}
+    \nabla_{\theta}G(\theta)
+    =
+    \mathbb{E}_{\theta}\!\left[
+        \mathbf{1}\{Z\le q\}
+        \sum_{t=0}^{\infty}\nabla_{\theta}\log\pi(A_t\mid S_t;\theta)
+    \right],
+\end{align}
+and applying the tower property term by term yields
+\begin{align}\label{eq:risk_tower}
+    \nabla_{\theta}G(\theta)
+    =
+    \sum_{t=0}^{\infty}
+    \mathbb{E}_{\theta}\!\left[
+        \nabla_{\theta}\log\pi(A_t\mid S_t;\theta)\,
+        \mathbb{E}_{\theta}\!\left[\mathbf{1}\{Z\le q\}\,\middle|\,\mathcal{H}_t,A_t\right]
+    \right],
+\end{align}
+where $\mathcal{H}_t$ denotes the history up to time $t$. Two features of \eqref{eq:risk_tower}, both absent in the mean case, obstruct a direct actor--critic treatment.
+
+\emph{Obstacle 1 (non-locality).} Unlike $\mathbb{E}_{\theta}[G_t\mid S_t,A_t]$, the conditional risk signal $\mathbb{E}_{\theta}[\mathbf{1}\{Z\le q\}\mid\mathcal{H}_t,A_t]$ is \emph{not} a function of $(S_t,A_t)$ alone. Indeed,
+\begin{align}
+    \mathbb{P}^{\pi}\!\left(Z\le q\,\middle|\,S_t,A_t\right)
+    =
+    \mathbb{E}^{\pi}\!\left[\mathbf{1}\{Z\le q\}\,\middle|\,S_t,A_t\right]
+    \neq
+    \mathbf{1}\!\left\{\mathbb{E}^{\pi}\!\left[Z\,\middle|\,S_t,A_t\right]\le q\right\},
+\end{align}
+because the threshold event couples the future return-to-go $G_t$ with the \emph{already accumulated} prefix return; a mean critic cannot supply it.
+
+\emph{Obstacle 2 (no discount).} Even setting locality aside, the summands in \eqref{eq:risk_tower} carry weight $1$, not $\eta^t$. The geometric factor that renormalized the mean gradient into $d_{\eta}^{\pi}$ is gone: the non-additive indicator $\mathbf{1}\{Z\le q\}$ does not distribute over time steps, so the discount cannot \emph{cross} it. Consequently $\sum_{t\ge0}\mathbb{E}_{\theta}[\,\cdot\,]$ is an \emph{undiscounted} series with no normalized occupancy representation, and its single-trajectory estimator $\mathbf{1}\{Z\le q\}\sum_t\nabla_{\theta}\log\pi$ has variance that grows without bound as the horizon lengthens.
+
+We resolve Obstacle~1 in Section~\ref{sec:budget} by augmenting the state with a running budget, and Obstacle~2 in Section~\ref{sec:beta} by introducing an Abel discount $\beta$ --- the device implemented in our algorithm.
+
+%------------------------------------------------------------------------------
+\subsection{Localizing the Threshold Event via a Running Budget}\label{sec:budget}
+To restore locality we follow the standard state-augmentation device. Define the \emph{prefix return}
+\begin{align}
+    C_t
+    :=
+    \sum_{k=0}^{t-1}\eta^k R_k,
+    \qquad
+    C_0=0,
+\end{align}
+so that the total return splits as $Z=C_t+\eta^t G_t$. Hence, for any threshold $q$,
+\begin{align}
+    Z\le q
+    \quad\Longleftrightarrow\quad
+    G_t\le\frac{q-C_t}{\eta^t}
+    =:b_t,
+\end{align}
+which defines the \emph{running budget} $b_t$. The budget summarizes exactly the past information relevant to the threshold event: two histories sharing the same $(S_t,A_t)$ but different prefix returns impose different requirements on the future, and $b_t$ records that difference. It is maintained online by the one-step recursion
+\begin{align}\label{eq:budget_rec}
+    b_0=q,
+    \qquad
+    b_{t+1}=\frac{b_t-R_t}{\eta},
+\end{align}
+so augmenting the state with $b_t$ adds no rollout cost. Under this augmentation the conditional risk signal becomes a genuine local target,
+\begin{align}\label{eq:psi_target}
+    \mathbb{E}_{\theta}\!\left[\mathbf{1}\{Z\le q\}\,\middle|\,\mathcal{H}_t,A_t\right]
+    =
+    \Psi^{\pi}(S_t,A_t,b_t),
+    \qquad
+    \Psi^{\pi}(s,a,b):=\mathbb{P}^{\pi}\!\left(G_t\le b\,\middle|\,S_t=s,A_t=a\right),
+\end{align}
+the conditional CDF of the return-to-go evaluated at the current budget. The next theorem makes the augmentation precise; its proof is deferred to the Appendix.
+
+\begin{theorem}{Budget Augmentation}{budget}
+Fix a policy $\pi$ and a threshold $q\in\mathbb{R}$, let $b_t=(q-C_t)/\eta^t$, and define the augmented state $X_t:=(S_t,b_t)$. Then:
+\begin{enumerate}
+    \item[(i)] in general there exists no measurable $f:\mathcal{S}\times\mathcal{A}\to[0,1]$ with $\mathbb{P}^{\pi}(Z\le q\mid\mathcal{H}_t,A_t)=f(S_t,A_t)$ almost surely;
+    \item[(ii)] $\{X_t\}_{t\ge0}$ is a controlled Markov process.
+\end{enumerate}
+Consequently $\mathbb{E}^{\pi}[\mathbf{1}\{Z\le q\}\mid\mathcal{H}_t,A_t]=\Psi^{\pi}(S_t,A_t,b_t)$ depends on the current augmented state and action only.
+\end{theorem}
+
+Substituting the local target \eqref{eq:psi_target} into \eqref{eq:risk_tower} removes Obstacle~1:
+\begin{align}\label{eq:risk_local}
+    \nabla_{\theta}G(\theta)
+    =
+    \sum_{t=0}^{\infty}
+    \mathbb{E}_{\theta}\!\left[
+        \nabla_{\theta}\log\pi(A_t\mid S_t;\theta)\,
+        \Psi^{\pi}(S_t,A_t,b_t)
+    \right].
+\end{align}
+Obstacle~2, however, remains in plain sight: the sum \eqref{eq:risk_local} still carries unit weights. Comparing with the mean gradient \eqref{eq:mean_local_3}, the mean term is weighted by $\eta^t$ whereas the constraint term is weighted by $1$. This is the crux: \eqref{eq:risk_local} is an undiscounted infinite sum, \emph{not} the expectation of $\Psi^{\pi}$ under any normalized occupancy measure, and it does not reduce to a stationary per-transition estimator.
+
+%------------------------------------------------------------------------------
+\subsection{An Abel Discount for the Constraint Gradient}\label{sec:beta}
+The remedy we adopt --- and the one realized in our implementation --- is to supply the missing geometric weighting explicitly. Fix a \emph{risk discount} $\beta\in(0,1)$ and define the $\beta$-discounted constraint surrogate
+\begin{align}
+    G_{\beta}(\theta)
+    :=
+    \sum_{t=0}^{\infty}\beta^t\,\mathbb{E}_{\theta}\!\left[\Psi^{\pi}(S_t,A_t,b_t)\right],
+\end{align}
+whose gradient is the Abel-weighted series
+\begin{align}\label{eq:beta_grad}
+    \nabla_{\theta}G_{\beta}(\theta)
+    =
+    \sum_{t=0}^{\infty}\beta^t\,
+    \mathbb{E}_{\theta}\!\left[
+        \nabla_{\theta}\log\pi(A_t\mid S_t;\theta)\,
+        \Psi^{\pi}(S_t,A_t,b_t)
+    \right].
+\end{align}
+Three properties make \eqref{eq:beta_grad} the right object to optimize.
+
+\emph{(Summability and normalizability.)} Since $\sum_t\beta^t=1/(1-\beta)<\infty$, the weights $\beta^t$ renormalize into a $\beta$-discounted occupancy $d_{\beta}^{\pi}(s,a,b):=(1-\beta)\sum_{t}\beta^t\,\mathbb{P}_{\theta}(S_t=s,A_t=a,b_t=b)$, exactly as $\eta^t$ did for the mean, so that
+\begin{align}\label{eq:beta_stationary}
+    \nabla_{\theta}G_{\beta}(\theta)
+    =
+    \frac{1}{1-\beta}\,
+    \mathbb{E}_{(s,a,b)\sim d_{\beta}^{\pi}}\!\left[
+        \nabla_{\theta}\log\pi(a\mid s;\theta)\,
+        \Psi^{\pi}(s,a,b)
+    \right],
+\end{align}
+recovering a stationary, per-transition form with the bounded-variance estimator $\beta^t\,\nabla_{\theta}\log\pi\,\Psi$.
+
+\emph{(Controlled bias.)} The undiscounted series \eqref{eq:risk_local} is the Abel limit of \eqref{eq:beta_grad}: whenever the former converges, $\nabla_{\theta}G(\theta)=\lim_{\beta\uparrow1}\nabla_{\theta}G_{\beta}(\theta)$. Hence the $\beta^t$-weighting is \emph{unbiased for the surrogate} $G_{\beta}$ and biased for the true constraint $G$, with the bias vanishing as $\beta\to1$.
+
+\emph{(Bias--variance trade-off.)} The discount $\beta$ is the knob between these regimes. A small $\beta$ emphasizes early time steps, yielding a myopic but low-variance, well-normalized estimator (and a more conservative operating point); $\beta\to1$ approaches the exact constraint gradient at the price of the variance and non-summability of \eqref{eq:risk_local}. We never set $\beta=1$. Note that $\beta$ enters \emph{only} the constraint term: the objective, the budget recursion \eqref{eq:budget_rec}, the critic, and the dual variable all use the environment discount $\eta$.
+
+Combining the exact mean gradient \eqref{eq:mean_local_3} with the $\beta$-discounted constraint gradient \eqref{eq:beta_grad}, the Lagrangian $\mathcal{J}(\theta,\lambda)=J(\theta)-\lambda\{G(\theta)-\alpha\}$ is ascended along the per-step direction
+\begin{align}\label{eq:beta_lag_grad}
+    \nabla_{\theta}\mathcal{J}_{\beta}(\theta,\lambda)
+    =
+    \sum_{t=0}^{\infty}
+    \mathbb{E}_{\theta}\!\left[
+        \nabla_{\theta}\log\pi(A_t\mid S_t;\theta)
+        \Bigl(
+            \eta^t\,Q_m^{\pi}(S_t,A_t)
+            -
+            \lambda\,\beta^t\,\Psi^{\pi}(S_t,A_t,b_t)
+        \Bigr)
+    \right].
+\end{align}
+Equation \eqref{eq:beta_lag_grad} is the local, per-transition surrogate that our actor ascends: the mean term keeps its exact discount $\eta^t$, while the constraint term carries the Abel discount $\beta^t$.
+
+%------------------------------------------------------------------------------
+\subsection{Distributional Critic and Local Targets}\label{sec:critic}
+Both local targets in \eqref{eq:beta_lag_grad} --- the conditional mean $Q_m^{\pi}$ and the conditional CDF $\Psi^{\pi}$ --- are functionals of the same object: the law of the return-to-go $G_t$ given $(S_t,A_t)$. We therefore estimate that entire conditional distribution with a single distributional critic, following the quantile-regression approach of QR-DQN.
+
+\textbf{Quantile distribution.} The critic, parameterized by $\omega$, outputs $N$ quantile locations $\psi_1(s,a),\dots,\psi_N(s,a)$ and represents the return law by the uniform mixture
+\begin{align}
+    Z_{\psi}(s,a)
+    :=
+    \frac{1}{N}\sum_{i=1}^{N}\delta_{\psi_i(s,a)},
+\end{align}
+where $\psi_i$ targets the quantile at level $\hat{\tau}_i=(i-\tfrac{1}{2})/N$. The locations are fit by the quantile Huber loss
+\begin{align}\label{eq:qhuber}
+    \rho_{\tau}^{\kappa}(u)=\left|\tau-\mathbf{1}\{u<0\}\right|\frac{\mathcal{L}_{\kappa}(u)}{\kappa},
+    \qquad
+    \mathcal{L}_{\kappa}(u)=
+    \begin{cases}
+        \tfrac{1}{2}u^2, & |u|\le\kappa,\\[2pt]
+        \kappa\bigl(|u|-\tfrac{1}{2}\kappa\bigr), & |u|>\kappa,
+    \end{cases}
+\end{align}
+regressed onto samples of the distributional Bellman target $\mathcal{T}^{\pi}\mathcal{Z}(s,a)\overset{D}{=}R(s,a)+\eta\,\mathcal{Z}(S',A')$, with $S'\sim P(\cdot\mid s,a)$ and $A'\sim\pi(\cdot\mid S')$.
+
+\textbf{Two targets from one critic.} Given the learned quantiles, both signals are read off the same output. The mean target is the quantile average
+\begin{align}\label{eq:qm_hat}
+    \widehat{Q}_m(s,a)
+    :=
+    \frac{1}{N}\sum_{i=1}^{N}\psi_i(s,a),
+\end{align}
+and the risk target is the empirical CDF of the same quantiles queried at the budget $b$,
+\begin{align}\label{eq:psi_hat}
+    \widehat{\Psi}(s,a,b)
+    :=
+    \frac{1}{N}\sum_{i=1}^{N}\mathbf{1}\{\psi_i(s,a)\le b\}.
+\end{align}
+Crucially, the budget enters \eqref{eq:psi_hat} \emph{only at query time}: it is never fed to the network, so the critic needs no budget input, suffers no CDF saturation, and handles terminal states automatically.
+
+%------------------------------------------------------------------------------
+\subsection{The DQC-AC-$\beta$ Algorithm}\label{sec:algo}
+We now assemble the per-transition updates. The critic is trained by quantile-regression temporal-difference learning; the actor ascends the local surrogate \eqref{eq:beta_lag_grad}; the dual variable is updated from the empirical violation frequency.
+
+\textbf{Critic update.} For a transition $(s,a,r,s')$ we sample $a'\sim\pi(\cdot\mid s';\theta)$ and form the one-step distributional Bellman targets
+\begin{align}
+    y_j:=r+\eta\,(1-\mathrm{done})\,\bar{\psi}_j(s',a'),
+    \qquad j=1,\dots,N,
+\end{align}
+where $\bar{\psi}$ is a slowly tracking target critic and the factor $(1-\mathrm{done})$ drops the bootstrap at terminal states. The critic parameters minimize the paired quantile Huber loss
+\begin{align}\label{eq:critic_loss}
+    \mathcal{L}_{\mathrm{critic}}(\omega)
+    :=
+    \frac{1}{N}\sum_{i=1}^{N}\frac{1}{N}\sum_{j=1}^{N}
+    \rho_{\hat{\tau}_i}^{\kappa}\!\bigl(y_j-\psi_i(s,a)\bigr).
+\end{align}
+
+\textbf{Actor update.} To reduce variance we subtract action-independent baselines
+\begin{align}
+    \widehat{V}_m(s):=\mathbb{E}_{a\sim\pi}[\widehat{Q}_m(s,a)],
+    \qquad
+    \widehat{V}_c(s,b):=\mathbb{E}_{a\sim\pi}[\widehat{\Psi}(s,a,b)],
+\end{align}
+estimated with $K$ action samples, and form the advantages $\widehat{A}_m(s,a)=\widehat{Q}_m(s,a)-\widehat{V}_m(s)$ and $\widehat{A}_c(s,a,b)=\widehat{\Psi}(s,a,b)-\widehat{V}_c(s,b)$. Maintaining the running weights $d_t=\eta^t$ and $e_t=\beta^t$ alongside $b_t$, the per-transition actor gradient is the sample analogue of \eqref{eq:beta_lag_grad},
+\begin{align}\label{eq:actor_g}
+    g_t
+    =
+    \nabla_{\theta}\log\pi(a_t\mid s_t;\theta)
+    \Bigl(
+        \underbrace{\eta^t\,\widehat{A}_m(s_t,a_t)}_{\text{objective}}
+        -
+        \underbrace{\lambda\,\beta^t\,\widehat{A}_c(s_t,a_t,b_t)}_{\text{constraint}}
+    \Bigr),
+\end{align}
+and the actor ascends $\theta\gets\varphi_{\Theta}\bigl(\theta+\gamma_k\,\widehat{g}\bigr)$ with $\widehat{g}$ the minibatch average of $g_t$.
+
+\textbf{Dual update.} Following the same rule as the Monte-Carlo method, $\lambda$ ascends the empirical constraint violation measured from completed trajectories,
+\begin{align}\label{eq:dual_update}
+    \lambda\gets\left[\lambda+\epsilon_k\bigl(\widehat{\mathbb{P}}(Z\le q)-\alpha\bigr)\right]_{+},
+    \qquad
+    \widehat{\mathbb{P}}(Z\le q)=\frac{1}{|\mathcal{B}|}\sum_{\tau\in\mathcal{B}}\mathbf{1}\{Z(\tau)\le q\},
+\end{align}
+so the dual ascent acts on the \emph{true} constraint $G$ and remains unbiased; the risk discount $\beta$ shapes only the primal direction. The critic-based estimate $\mathbb{E}_{s_0,a_0}[\widehat{\Psi}(s_0,a_0,q)]$ is tracked as a calibration diagnostic.
+
+\begin{algorithm}[ht]
+\small
+\caption{Distributional Quantile-Constrained Actor-Critic with Abel Discount (DQC-AC-$\beta$)}
+\label{alg:dqcacbeta}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} policy $\pi(\cdot|\cdot;\theta)$, distributional critic $\psi(\cdot,\cdot;\omega)$ with $N$ quantiles and target $\bar{\psi}_{\bar{\omega}}$, threshold $q$, level $\alpha$, discounts $\eta,\beta$, dual interval $\mathcal{I}$, inner updates $U$, target rate $\nu$, step-sizes $\{\gamma_k,\epsilon_k,\xi_k\}$.
+\STATE \textbf{Initialize:} $\theta$, $\omega$, $\bar{\omega}\gets\omega$, $\lambda\gets0$, buffer $\mathcal{D}\gets\emptyset$.
+\FOR{$k=1,2,\dots$}
+    \STATE \textbf{Collect rollout:} reset env, $b_0\gets q$, $d_0\gets1$, $e_0\gets1$.
+    \FOR{$t=0,1,\dots$}
+        \STATE sample $a_t\sim\pi(\cdot|s_t;\theta)$, observe $(r_t,s_{t+1})$; store $(s_t,a_t,r_t,s_{t+1},b_t,d_t,e_t)$ in $\mathcal{D}$.
+        \STATE $b_{t+1}\gets(b_t-r_t)/\eta$,\quad $d_{t+1}\gets\eta d_t$,\quad $e_{t+1}\gets\beta e_t$.
+    \ENDFOR
+    \FOR{$U$ inner updates}
+        \STATE \textbf{Critic:} sample minibatch; $a'\sim\pi(\cdot|s';\theta)$; $y_j\gets r+\eta(1-\mathrm{done})\bar{\psi}_j(s',a')$;
+        \STATE \quad $\omega\gets\omega-\xi_k\nabla_{\omega}\frac{1}{N^2}\sum_{i,j}\rho^{\kappa}_{\hat{\tau}_i}(y_j-\psi_i(s,a))$.
+        \STATE \textbf{Actor:} $\widehat{Q}_m\gets\frac{1}{N}\sum_i\psi_i(s,a)$,\ \ $\widehat{\Psi}\gets\frac{1}{N}\sum_i\mathbf{1}\{\psi_i(s,a)\le b\}$;
+        \STATE \quad baselines $\widehat{V}_m,\widehat{V}_c$ via $K$ samples $\tilde{a}\sim\pi(\cdot|s;\theta)$; advantages $\widehat{A}_m,\widehat{A}_c$;
+        \STATE \quad $\theta\gets\varphi_{\Theta}\!\bigl(\theta+\gamma_k\,\mathbb{E}_{\mathcal{B}}[\nabla_{\theta}\log\pi(a|s;\theta)(d\,\widehat{A}_m-\lambda e\,\widehat{A}_c)]\bigr)$;
+        \STATE \quad soft target update $\bar{\omega}\gets(1-\nu)\bar{\omega}+\nu\omega$.
+    \ENDFOR
+    \STATE \textbf{Dual update (every $\mathcal{I}$ iterations):} $\lambda\gets[\lambda+\epsilon_k(\widehat{\mathbb{P}}(Z\le q)-\alpha)]_{+}$ from completed trajectories.
+\ENDFOR
+\STATE \textbf{Return} $\theta$.
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Remark.}
+The critic estimates the conditional return-to-go distribution $\mathcal{Z}^{\pi}(s,a)$, not the realized return of any single trajectory. The budget $b_t$ converts the global event $\{Z\le q\}$ into the local event $\{G_t\le b_t\}$ (Theorem~\ref{theorem:budget}), and the Abel discount $\beta$ converts the resulting undiscounted constraint gradient into a summable, per-transition surrogate. Setting $\beta=1$ and replacing the critic targets $\widehat{Q}_m,\widehat{\Psi}$ by a single Monte-Carlo return recovers the trajectory-based QCPO estimator of the previous section.
+
+%------------------------------------------------------------------------------
+\newpage
+\section{Appendix}
+\subsection{Proof of Theorem~\ref{theorem:budget}}
+\begin{proof}
+\textbf{(i)}\ \ From $Z=C_t+\eta^t G_t$ we have $Z\le q\Leftrightarrow G_t\le b_t$, hence
+\begin{align}
+    \mathbb{P}^{\pi}\!\left(Z\le q\,\middle|\,\mathcal{H}_t,A_t\right)
+    =
+    F^{\pi}_{S_t,A_t}(b_t),
+    \qquad
+    F^{\pi}_{s,a}(x):=\mathbb{P}^{\pi}\!\left(G_t\le x\,\middle|\,S_t=s,A_t=a\right).
+\end{align}
+Two histories with the same $(S_t,A_t)=(s,a)$ but different prefix returns induce different budgets $b_t\neq b_t'$, so $F^{\pi}_{s,a}(b_t)\neq F^{\pi}_{s,a}(b_t')$ whenever $F^{\pi}_{s,a}$ is non-constant between $b_t$ and $b_t'$. Therefore the conditional violation probability cannot be written as a function of $(S_t,A_t)$ alone.
+
+\textbf{(ii)}\ \ The recursion $b_{t+1}=(b_t-R_t)/\eta$ shows $b_{t+1}$ is determined by $(b_t,R_t)$. Let $\mathsf{P}(dr,ds'\mid s,a)$ denote the joint law of $(R_t,S_{t+1})$ given $(S_t,A_t)=(s,a)$. For any measurable $B\subseteq\mathcal{S}\times\mathbb{R}$,
+\begin{align}
+    \mathbb{P}^{\pi}\!\left(X_{t+1}\in B\,\middle|\,\mathcal{H}_t,X_t=(s,b),A_t=a\right)
+    =
+    \int\mathbf{1}\!\left\{\Bigl(s',\tfrac{b-r}{\eta}\Bigr)\in B\right\}\mathsf{P}(dr,ds'\mid s,a)
+    =:K(B\mid(s,b),a),
+\end{align}
+where the first equality uses the Markov property of the underlying MDP. As the right-hand side depends on the past only through $(X_t,A_t)$, the augmented process $\{X_t\}_{t\ge0}$ is a controlled Markov process with kernel $K$. Finally, since $\{Z\le q\}=\{G_t\le b_t\}$ and $b_t$ is $X_t$-measurable,
+\begin{align}
+    \mathbb{E}^{\pi}\!\left[\mathbf{1}\{Z\le q\}\,\middle|\,\mathcal{H}_t,A_t\right]
+    =
+    \mathbb{P}^{\pi}\!\left(G_t\le b_t\,\middle|\,S_t,A_t\right)
+    =
+    \Psi^{\pi}(S_t,A_t,b_t). \qedhere
+\end{align}
+\end{proof}
+%------------------------------------------------------------------------------
+%-----------------------------------------------------------------------------
+\end{document}
+
