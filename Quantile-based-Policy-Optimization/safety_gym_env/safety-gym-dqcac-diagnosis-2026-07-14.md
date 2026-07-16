@@ -1053,3 +1053,21 @@ online/target cost encoder 都已建立并做 Polyak 同步，但当前 C-H1 首
 下一条 C-H1A 是 lambda=0 的 100k 校准门，保持 N32、C20、MC、hard CDF、actor lr 3e-4 与 raw C20 相同，只改变 cost_history_mode。预计训练约 2～4 分钟，70 条终评约 1 分钟。门槛仍是 CDF bias 从 0.0978 降到不高于 0.0734，或 mean relative error 从 22.1% 进入 15%，且另一指标不恶化超过 10%。失败则不跑 300k；通过后才与 sigmoid T2 和 window50 PI 组合。
 
 合理分歧均保留为可执行消融：独立 RMS（C-H1B）、256 hidden 容量控制（C-H1C）、recurrent n-step target（C-H1N）、actor hidden/cell 直接条件化（C-H0.6）、adaptive sigmoid bandwidth（C-Q2）、uniform-IQN/query-mixture-IQN、PID safety setpoint（P-M1）和 checkpoint/eval-only（C-E1）。双向 LSTM 会利用未来 observation/cost，违反部署时的因果信息集，因此不作为合法提升路线。
+
+### 13.22 C-H1A 结果与新根因：全时刻 QR loss 不等于初始 outage 目标（2026-07-16）
+
+C-H1A job DQCAC_DynamicButton_recur_mc_c20_ch1_costlstm_100k_s0（W&B 8vm989u8）从 commit b7f8a9c 启动，训练 72.6s、exit code 0。固定评估 truth 与 raw C20 完全相同：reward 0.5527、outage 0.2286、mean cost 8.957，说明 lambda=0 的 actor/PPO 轨迹仍然配对，比较可归因于 cost critic。
+
+结果明确失败。独立 recurrent cost critic 的 CDF 为 0.0643、predicted mean 为 5.800；raw C20 是 0.1308/6.974。CDF absolute bias 从 0.0978 扩大到 0.1643，mean relative underestimation 从 22.1% 扩大到 35.3%，所以不扩 300k，也不与 T2/PI 组合。
+
+完整 history 还揭示了更重要的目标错配。最后一次训练记录中，C-H1 的 s0 predicted mean 为 7.208，raw 为 8.240，但 C-H1 的 cost QR loss 只有 14.09，远低于 raw 的 43.52。最后一批完整 episode cost mean 约为 15，而所有时间位置的 MC return-to-go target mean 只有 5.697。原因是每条 T=1000 trajectory 只有一个 s0 样本，却有 999 个后续样本；越接近 episode 尾部，remaining cost 越低。均匀 transition QR objective 主要奖励拟合大量后期低 cost-to-go，并不直接奖励 initial distribution calibration。独立 LSTM 容量更强，反而能以牺牲早期状态为代价把总体 loss 降得更低。
+
+C-H1 还在 70k/100k 出现 cost grad norm 20.7/17.6 和 joint clip；提高 clip 到 30（C-H1A2）、hidden 512降到256（C-H1C）、独立 RMS（C-H1B）仍作为合理欠拟合/容量消融保留。但这些路线不能解释低 global loss 与差 s0 calibration 同时出现，因此当前优先级低于直接修正训练分布。
+
+代码新增默认关闭的 cost_critic_time_weighting=uniform|risk_discount。risk_discount 对第 t 步赋 max(discount^t,floor)，然后用全批均值归一化，使 mean weight=1；这样不隐式改变 critic LR，只改变早期与晚期 transition 的相对质量。默认 uniform 继续走旧 mean 运算，合成测试确认 loss 逐元素 exact。full batch、transition chunk 与 recurrent TBPTT 都使用同一组全批归一化权重，chunk 加权和与 full loss 数值等价。日志/profile 新增 weight min/max、ESS fraction、discount 和 floor。
+
+首条 C-W1 不使用过激的 .95，而用最终 constrained actor 已采用的 discount=.995。T=1000 时归一化权重从 5.033 降到 0.0337，ESS fraction为0.3937，相当于每条 trajectory 约394个等效 transition；既显著强化早期，又保留中后期支持。持久化 dqc_cost_time_weight_smoke_20260716 训练6.4s、exit 0，覆盖真实加权 QR、PPO、评估与 JSON。
+
+C-W1 的100k配置保持 raw、N32、C20、MC、hard CDF、lambda0，只打开 risk_discount/.995 并设置 beta=.995。lambda=0 时 beta 不进入 actor objective，因此真实 reward/cost应逐点等于 raw C20。通过门仍是 CDF bias从0.0978至少下降25%（不高于0.0734），或 mean relative error进入15%，且另一量不恶化超过10%。若失败，不扫 .99/.997 discount 小网格；下一步应采用更直接的 s0/early stratified replay 或 initial-distribution auxiliary loss。C-H1A2/A3、adaptive CDF、IQN 和 controller setpoint继续作为独立消融保留。
+
+C-H1A 对齐图位于 _runs/profiles/dqc_cost_history_ch1_100k_2026-07-16/，原始导出位于 _runs/wandb_export/dqc_cost_history_ch1_100k_2026-07-16/。

@@ -554,3 +554,17 @@
 - 100k C-H1A 配方保持 N32+C20+MC+lambda0+hard CDF 与 raw C20 相同，唯一算法变量是 cost_history_mode=cost_lstm。预计训练约 2～4 分钟、70 条评估约 1 分钟。
 - 通过门沿用预注册标准：相对 raw C20 的 CDF bias 0.0978 至少下降 25%（即不高于 0.0734），或 predicted mean relative error 从 22.1% 进入 15%，且另一指标不恶化超过 10%、reward/PPO 正常。明显失败就不扩 300k。
 - 分歧路线全部保留：C-H1B 为独立 encoder 自有 RMS；C-H1C 为 256 hidden 的容量/速度控制；C-H1N 为 recurrent n-step online/target history；C-H0.6 直接使用 actor (h,c)；C-Q2 adaptive bandwidth；uniform/query-mixture IQN；P-M1 safety setpoint；C-E1 checkpoint/eval-only。双向 LSTM 因使用未来信息违反在线因果性，不列为合法主路线。
+
+### E31：C-H1A 负结果与 C-W1 cost 时间目标对齐
+
+- C-H1A：job DQCAC_DynamicButton_recur_mc_c20_ch1_costlstm_100k_s0，W&B 8vm989u8，commit b7f8a9c，训练 72.6s、exit 0。固定 eval truth 与 raw C20 完全相同：reward 0.5527、outage 0.2286、mean cost 8.957。
+- 独立 LSTM 的终评 CDF/mean 只有 0.0643/5.800；raw C20 为 0.1308/6.974。CDF bias 从 0.0978 恶化到 0.1643，mean relative error 从 22.1% 恶化到 35.3%，未过门，不扩 300k。
+- profile 显示最后一次训练 s0 prediction 为 7.208，raw 为 8.240；cost QR loss 却从 raw 43.52 降到 14.09。低 loss 与差 s0 calibration 同时出现，说明并非简单欠拟合。
+- 目标错配证据：最后一批 episode-level s0 cost mean 约 15，而把全部 return-to-go transition 等权平均后的 cost target mean 只有 5.697。T=1000 时每条 episode 只有 1 个 s0，却有大量后期低 remaining-cost transition；更灵活的 LSTM 能降低全局 loss，但可牺牲真正决定 initial outage/actor risk 的早期状态。
+- C-H1 的 cost/joint grad 在 70k 和 100k 分别约 20.7/17.6 并触发 clip=10；提高 clip=30（C-H1A2）与 hidden=256（C-H1C）保留为欠拟合/容量消融，但当前先修证据更直接的 transition objective。
+- 完整 profile：_runs/profiles/dqc_cost_history_ch1_100k_2026-07-16/；export：_runs/wandb_export/dqc_cost_history_ch1_100k_2026-07-16/。
+- 新增默认兼容的 cost_critic_time_weighting=uniform|risk_discount。risk_discount 使用 max(discount^t,floor)，整批归一化到 mean=1；因此只改 transition 相对质量，不改变 loss 总尺度。默认 uniform 走旧浮点分支，loss 逐元素 exact。
+- 加权已覆盖 full/chunk/TBPTT 三路径；chunk 使用全批归一化权重的切片，按 chunk size 聚合，合成测试与 full weighted loss 等价。新增 min/max/ESS、discount/floor 日志和 profile 指标。
+- T=1000、discount=.995、floor=0 时归一化权重范围为 0.0337～5.033，ESS fraction=0.3937（每条轨迹约 394 个等效 transition）；比 beta=.95 的极端约 39 个等效 transition 更稳健，也与最终 constrained 配方 beta=.995 对齐。
+- 持久化 smoke dqc_cost_time_weight_smoke_20260716 训练 6.4s、exit 0，覆盖加权 QR、PPO、评估和 JSON。
+- 下一门 C-W1：raw+C20+MC+lambda0，设置 beta=.995 与 risk_discount/.995；lambda=0 时 beta 不影响 actor，所以真实 reward/cost 应与 raw C20 逐点相同。仍用 CDF bias不高于0.0734或 mean error不高于15%的门；失败则不扫 discount 小网格，转 s0/early stratified replay 或 direct initial-distribution auxiliary loss。

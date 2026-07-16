@@ -174,6 +174,11 @@ def base_args(algo, seed, device, env_key):
         # T=1000 episode 的真实 return-to-go，专门诊断 s0 cost/CDF 低估是否来自
         # bootstrap 传播。默认绝不改变已有实验，只有显式 --set cost_target_mode=mc 才启用。
         a.cost_target_mode = 'nstep'
+        # cost transition objective 默认全时刻等权；risk_discount 显式用
+        # discount^t/mean 对齐风险 actor 的早期有效样本，同时保持 loss 总尺度。
+        a.cost_critic_time_weighting = 'uniform'
+        a.cost_critic_weight_discount = None             # None 时跟随 beta
+        a.cost_critic_weight_floor = 0.0
         # cost history 消融：raw=历史 Markov critic；actor_feature=C-H0.5 共享并
         # detach policy feature；cost_lstm=C-H1 独立同输入 MLP+LSTM（当前要求 MC）。
         a.cost_history_mode = 'raw'

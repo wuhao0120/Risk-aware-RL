@@ -154,6 +154,26 @@ class DQCACBetaGPU(VecAgentBase):
             raise ValueError(
                 "cost_target_mode='mc' requires episodic=True because a truncated "
                 "continuing rollout is not a complete cost return")
+
+        # C-W1 对齐 cost critic 与风险 actor 的有效时间分布。uniform 是逐式
+        # 兼容默认；risk_discount 用 discount^t 并归一化到 batch mean=1，
+        # 因而只改变 transition 相对权重，不隐式改变 critic learning-rate 尺度。
+        self.cost_critic_time_weighting = str(
+            getattr(args, 'cost_critic_time_weighting', 'uniform')).lower()
+        if self.cost_critic_time_weighting not in {'uniform', 'risk_discount'}:
+            raise ValueError(
+                "cost_critic_time_weighting must be 'uniform' or 'risk_discount'")
+        _cost_weight_discount = getattr(
+            args, 'cost_critic_weight_discount', None)
+        self.cost_critic_weight_discount = (
+            float(self.beta) if _cost_weight_discount is None
+            else float(_cost_weight_discount))
+        self.cost_critic_weight_floor = float(
+            getattr(args, 'cost_critic_weight_floor', 0.0))
+        if not 0.0 < self.cost_critic_weight_discount <= 1.0:
+            raise ValueError("cost_critic_weight_discount must be in (0,1]")
+        if self.cost_critic_weight_floor < 0.0:
+            raise ValueError("cost_critic_weight_floor must be non-negative")
         # step feature 默认跟随 episodic: 有限期界下剩余 cost 分布依赖剩余步数 (已验证配方)
         _csf = getattr(args, 'critic_step_feature', None)
         self.critic_step_feature = bool(_csf) if _csf is not None else self.episodic
@@ -427,6 +447,9 @@ class DQCACBetaGPU(VecAgentBase):
               f"d(cost_limit)={self.cost_limit}, cost_gamma={self.cost_gamma}, episodic={self.episodic}, "
               f"step_feature={self.critic_step_feature}, N={self.num_quantiles}, B={self.num_envs}, T={self.n}, "
               f"cost_target={self.cost_target_mode}, cost_history={self.cost_history_mode}, "
+              f"cost_time_weight={self.cost_critic_time_weighting}"
+              f"/d{self.cost_critic_weight_discount:g}"
+              f"/floor{self.cost_critic_weight_floor:g}, "
               f"cost_cdf={self.cost_cdf_mode}/T{self.cost_cdf_temperature:g}, "
               f"cost_grid={self.cost_quantile_grid_mode}/{self.cost_quantile_prediction_weighting}"
               f"/local{self.cost_quantile_local_count}, "
@@ -841,7 +864,8 @@ class DQCACBetaGPU(VecAgentBase):
         return batch
 
     # ============================================================ Critic 更新 (双 QR-TD) ============================================================
-    def _backward_recurrent_cost_loss(self, batch, cost_target):
+    def _backward_recurrent_cost_loss(
+            self, batch, cost_target, cost_sample_weights=None):
         """
         对独立 cost MLP+LSTM 做一次按时间顺序的 truncated-BPTT QR 更新。
 
@@ -862,6 +886,9 @@ class DQCACBetaGPU(VecAgentBase):
         steps = batch['steps'].reshape(self.n, self.num_envs)
         targets = cost_target.reshape(
             self.n, self.num_envs, self.num_quantiles)
+        sample_weights = (
+            None if cost_sample_weights is None else
+            cost_sample_weights.reshape(self.n, self.num_envs))
         hidden, cell = self.cost_history_encoder.initial_state(
             self.num_envs, self.device)
         total_size = float(self.n * self.num_envs)
@@ -888,8 +915,11 @@ class DQCACBetaGPU(VecAgentBase):
                 -1, self.num_quantiles)
 
             prediction = self.cost_critic(chunk_inputs, chunk_actions)
+            chunk_sample_weights = (
+                None if sample_weights is None else
+                sample_weights[begin:finish].reshape(-1))
             chunk_loss = self._cost_quantile_huber_loss(
-                prediction, chunk_targets)
+                prediction, chunk_targets, chunk_sample_weights)
             chunk_weight = float((finish - begin) * self.num_envs) / total_size
             (chunk_weight * chunk_loss).backward()
             loss_value += chunk_weight * float(chunk_loss.item())
@@ -944,6 +974,7 @@ class DQCACBetaGPU(VecAgentBase):
                     -1, self.num_quantiles)
 
         reward_state_inputs = self._aug(states, steps)
+        cost_sample_weights = self._cost_critic_sample_weights(steps)
         recurrent_cost = self.cost_history_mode == 'cost_lstm'
         cost_state_inputs = (
             None if recurrent_cost else self._cost_inputs(
@@ -976,13 +1007,14 @@ class DQCACBetaGPU(VecAgentBase):
                     reward_loss_value += (
                         weight * float(reward_loss_chunk.item()))
             cost_loss_value = self._backward_recurrent_cost_loss(
-                batch, cost_target)
+                batch, cost_target, cost_sample_weights)
         elif not use_chunks:
             # 默认历史路径：构造完整 [T*B,N,N] pairwise error，一次 backward。
             reward_pred = self.reward_critic(reward_state_inputs, actions)
             cost_pred = self.cost_critic(cost_state_inputs, actions)
             reward_loss = self._quantile_huber_loss(reward_pred, reward_target)
-            cost_loss = self._cost_quantile_huber_loss(cost_pred, cost_target)
+            cost_loss = self._cost_quantile_huber_loss(
+                cost_pred, cost_target, cost_sample_weights)
             (reward_loss + cost_loss).backward()
             reward_loss_value = float(reward_loss.item())
             cost_loss_value = float(cost_loss.item())
@@ -999,7 +1031,9 @@ class DQCACBetaGPU(VecAgentBase):
                 reward_loss_chunk = self._quantile_huber_loss(
                     reward_pred, reward_target[begin:finish])
                 cost_loss_chunk = self._cost_quantile_huber_loss(
-                    cost_pred, cost_target[begin:finish])
+                    cost_pred, cost_target[begin:finish],
+                    None if cost_sample_weights is None
+                    else cost_sample_weights[begin:finish])
                 (weight * (reward_loss_chunk + cost_loss_chunk)).backward()
                 reward_loss_value += weight * float(reward_loss_chunk.item())
                 cost_loss_value += weight * float(cost_loss_chunk.item())
@@ -1034,6 +1068,19 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/cost_qr_loss': cost_loss_value,
             'critic/chunked_update': float(use_chunks),
             'critic/cost_recurrent_tbptt': float(recurrent_cost),
+            'critic/cost_time_weighted': float(
+                cost_sample_weights is not None),
+            'critic/cost_time_weight_min': float(
+                1.0 if cost_sample_weights is None
+                else cost_sample_weights.min().item()),
+            'critic/cost_time_weight_max': float(
+                1.0 if cost_sample_weights is None
+                else cost_sample_weights.max().item()),
+            'critic/cost_time_weight_ess_fraction': float(
+                1.0 if cost_sample_weights is None
+                else cost_sample_weights.sum().pow(2).div(
+                    cost_sample_weights.numel()
+                    * cost_sample_weights.pow(2).sum()).item()),
             'critic/cost_target_mean': float(
                 self._cost_quantile_moments(cost_target)[0].mean().item()),
             'critic/cost_target_is_mc': float(self.cost_target_mode == 'mc'),
@@ -1063,7 +1110,27 @@ class DQCACBetaGPU(VecAgentBase):
             return 1.0
         return float(self.quantile_loss_reference_samples) / float(num_target_samples)
 
-    def _cost_quantile_huber_loss(self, psi, y):
+    def _cost_critic_sample_weights(self, steps):
+        """
+        返回 mean=1 的 cost transition 权重；uniform 返回 None 保留旧运算路径。
+
+        risk_discount 的 raw weight=max(discount^t, floor)。归一化只执行一次，
+        chunk/TBPTT 路径随后切片并按 chunk size 聚合，数学上仍是整批加权均值。
+        """
+        if self.cost_critic_time_weighting == 'uniform':
+            return None
+        step_values = steps.to(dtype=torch.float32)
+        discount = torch.tensor(
+            self.cost_critic_weight_discount,
+            dtype=step_values.dtype, device=step_values.device)
+        raw_weights = torch.pow(discount, step_values)
+        if self.cost_critic_weight_floor > 0.0:
+            raw_weights = raw_weights.clamp_min(
+                self.cost_critic_weight_floor)
+        return raw_weights / raw_weights.mean().clamp_min(1e-12)
+
+    def _cost_quantile_huber_loss(
+            self, psi, y, sample_weights=None):
         """
         用 cost-only τ/importance 配置计算 QR loss。
 
@@ -1080,10 +1147,12 @@ class DQCACBetaGPU(VecAgentBase):
         return self._quantile_huber_loss(
             psi, y, taus=self.cost_taus,
             prediction_weights=prediction_weights,
-            target_weights=target_weights)
+            target_weights=target_weights,
+            sample_weights=sample_weights)
 
     def _quantile_huber_loss(self, psi, y, taus=None,
-                              prediction_weights=None, target_weights=None):
+                              prediction_weights=None, target_weights=None,
+                              sample_weights=None):
         """
         计算 pairwise Quantile Huber Loss ρ^κ_τ(u)。
 
@@ -1118,14 +1187,23 @@ class DQCACBetaGPU(VecAgentBase):
             target_sum = target_sum * self._quantile_target_scale(y.shape[-1])
 
         # query_focused 继续对局部加密 prediction heads 等权；importance route
-        # 则恢复 uniform-τ 积分。默认 None 保留旧 mean 的运算顺序。
-        if prediction_weights is None:
+        # 则恢复 uniform-τ 积分。双 None 分支保留旧 mean 的运算顺序。
+        if prediction_weights is None and sample_weights is None:
             return target_sum.mean(dim=1).mean()
-        if prediction_weights.numel() != psi.shape[-1]:
-            raise ValueError("prediction_weights length must match prediction quantile count")
-        per_transition = (
-            target_sum * prediction_weights.view(1, -1)).sum(dim=1)
-        return per_transition.mean()
+        if prediction_weights is None:
+            per_transition = target_sum.mean(dim=1)
+        else:
+            if prediction_weights.numel() != psi.shape[-1]:
+                raise ValueError(
+                    "prediction_weights length must match prediction quantile count")
+            per_transition = (
+                target_sum * prediction_weights.view(1, -1)).sum(dim=1)
+        if sample_weights is None:
+            return per_transition.mean()
+        if sample_weights.numel() != psi.shape[0]:
+            raise ValueError(
+                "sample_weights length must match transition batch size")
+        return (per_transition * sample_weights.reshape(-1)).mean()
 
     # ============================================================ 可选 reward V+GAE ============================================================
     def _prepare_reward_gae(self, batch):
@@ -1820,6 +1898,10 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_history_mode == 'actor_feature'),
             'debug/cost_history_cost_lstm': float(
                 self.cost_history_mode == 'cost_lstm'),
+            'debug/cost_critic_time_weighted': float(
+                self.cost_critic_time_weighting != 'uniform'),
+            'debug/cost_critic_weight_discount': self.cost_critic_weight_discount,
+            'debug/cost_critic_weight_floor': self.cost_critic_weight_floor,
             'debug/cost_cdf_is_sigmoid': float(
                 self.cost_cdf_mode == 'sigmoid'),
             'debug/cost_cdf_temperature': self.cost_cdf_temperature,
@@ -1963,6 +2045,9 @@ class DQCACBetaGPU(VecAgentBase):
             'reward_actor_mode': self.reward_actor_mode,
             'policy_arch': self.policy_arch,
             'cost_history_mode': self.cost_history_mode,
+            'cost_critic_time_weighting': self.cost_critic_time_weighting,
+            'cost_critic_weight_discount': self.cost_critic_weight_discount,
+            'cost_critic_weight_floor': self.cost_critic_weight_floor,
             'cost_cdf_mode': self.cost_cdf_mode,
             'cost_cdf_temperature': self.cost_cdf_temperature,
             'cost_quantile_grid_mode': self.cost_quantile_grid_mode,
