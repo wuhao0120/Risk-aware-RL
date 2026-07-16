@@ -442,3 +442,22 @@
 - 但控制到达工作区间太晚：130 条终评 reward `1.303`、outage `0.508`，训练最后 batch outage `0.3`。相对 P-B1 的 outage `0.462` 未改善，单 seed 波动下不能宣称 PI 更差，但明确仍不可行。
 - critic CDF `0.365` 对 truth `0.508`（bias `-0.142`），pred mean `14.75` 对 truth `22.33`；较大的 lambda 不能补偿 actor risk advantage 的系统低估/表示误差。
 - 只再保留 P-B3：window `100→50`，其余完全不变，让 PI 约早 5 iterations 响应。若仍不可行，停止 Kp/Ki/window 小网格，进入 C-H1 recurrent action-conditioned cost critic；Kp=2 只留作后续消融表选项，不立即运行。
+
+
+### E20：P-B3 window=50 结果与 PID 网格停止门
+
+- P-B3：job `DQCAC_DynamicButton_recur_mc_c20_pi_kp1_w50_300k_s0`，W&B `o8nx0elk`，启动 commit `45697a5`，训练 `157.6s`、exit code 0；相对 P-B2 唯一变化是 `pid_window_episodes=50`。
+- λ 在 150k 已到 `0.088`，并能在 batch outage 回落后降至 170k 的 `0.0095`；最终 `lambda=0.307=I 0.147+P 0.160`。短窗口解决一部分迟滞，但后期仍随经验概率振荡。
+- 300k 后段 reward `0.9806/+3.994/M`；130 条终评 reward `1.132`、outage `0.315`。约束明显优于 P-B1/P-B2 的 `0.462/0.508`，但没有达到 `0.2`，不扩 seed。
+- 终评 CDF `0.294` 对 truth `0.315`，pred mean `12.35` 对 truth `13.07`。旧 E9 seed0 可达 outage `0.2`，但 reward 仅 `0.658`；P-B3 仍只是未可行的高 reward 候选。
+- 对齐 profile：`_runs/profiles/dqc_recurrent_pid_p_b123_300k_2026-07-16/`；原始导出：`_runs/wandb_export/dqc_recurrent_pid_p_b123_300k_2026-07-16/`。
+- 决策：停止 Kp/Ki/window 小网格。Kp=2、Ki=.15/leak=.98、cost-quantile PI、双信号控制保留为后续消融选项；先修 cost-history/risk advantage 表示。
+
+### E21：C-H0.5 actor-history feature 实现与分歧路线
+
+- 根因假设：recurrent policy 下未来动作依赖 hidden，正确 cost value 是 `Z_c(s,h,a)`；D-R0 的 `Z_c(s,a)` 对策略诱导过程并非充分 Markov。
+- 新开关 `cost_history_mode=raw|actor_feature`，默认 raw。actor_feature 保存 rollout 时真正产生动作的 `MLP+LSTM` feature，detach 后送入 action-conditioned cost quantile head；cost loss 不反传 actor。
+- 完整接线：当前/boot/terminal feature、critic target/prediction、risk CDF、K-action baseline、constraint RMS、critic dual、s0 logging 与 recurrent eval。reward critic 与 PPO 路径不变。
+- 接口回归：旧四元 actor forward 与 feature 五元接口数值逐元素相同。持久化 smoke `dqc_ch05_actor_feature_smoke_20260716` 与 `dqc_ch05_raw_regression_smoke_20260716` 均约 `6s`、exit code 0。
+- C-H0.5A 的混杂因素是 feature 容量更大且随 actor 漂移。若 100k 有效，补 C-H0.5B（MLP-only feature/容量匹配 raw projection）；若无效，进入 C-H1 独立 online/target recurrent cost encoder。raw+history concat（C-H2）和允许 cost 梯度进 actor 的 full-shared（C-H3）只作为后续独立消融。
+- 100k 门：C20+MC、actor lr3e-4、lambda0，只改 history mode。相对 raw C20 的 CDF bias `0.0978` 至少降 25%，或 mean-cost 相对误差从 22% 进入 15%，且另一校准量不恶化 >10%；否则不扩 300k。

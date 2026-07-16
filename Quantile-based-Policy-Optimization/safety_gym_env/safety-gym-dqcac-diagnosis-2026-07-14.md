@@ -854,3 +854,41 @@ P-B1 的 300k leaky-I 门控失败于控制偏弱，而非 windup。λ 在 170k 
 P-B2 只增加 `Kp=1`。λ 在 180k/190k 达到 `0.011/0.045`，约为 P-B1 的 9 倍，最终 λ `0.356=I 0.146+P 0.210`；实现和参数确实生效。但 130 条终评 reward `1.303`、outage `0.508`，仍不可行。critic CDF `0.365` 对 truth `0.508`，pred mean `14.75` 对 `22.33`，说明更快 dual 无法自动修复局部 risk advantage 的表示/校准误差。W&B 为 `rgt6qukp`。
 
 只再运行一条 window `100→50` 的 P-B3，隔离 5-iteration 观测滞后；若它仍不可行，就停止 PID 小网格并实现 C-H1 recurrent action-conditioned cost critic。Kp=2、Ki 调大继续记录为可能消融，但不在没有新证据时消耗全量训练预算。
+
+
+### 13.11 P-B3 结果：缩短窗口有效，但 PID 小网格到此停止（2026-07-16）
+
+P-B3 只把 P-B2 的经验窗口从 100 条轨迹缩到 50，其余配置保持不变。job 为 `DQCAC_DynamicButton_recur_mc_c20_pi_kp1_w50_300k_s0`，W&B `o8nx0elk`，启动 commit `45697a5`，训练 `157.6s`、exit code 0。
+
+- λ 比 P-B2 更早响应：150k 时 batch outage `0.5`、λ 已为 `0.088`；约束恢复时能回落到 170k 的 `0.0095`，说明 leaky-I+P 没有继续 windup。后期仍有窗口噪声导致的闭环振荡，最终 `lambda=0.307=I 0.147+P 0.160`。
+- 300k 后段 reward `0.9806`、趋势 `+3.994/M`，训练后 130 条终评 reward `1.132`、outage `0.315`。相对 P-B1/P-B2 的 outage `0.462/0.508` 是明确改善，但仍高于目标 `0.2`，所以不能判为可行解。
+- 终评 cost critic CDF `0.294` 对 truth `0.315`，初始状态的 CDF 偏差已不大；pred mean `12.35` 对真实 mean cost `13.07` 也接近。但训练最后窗口 probability `0.38`、最后 batch `0.2`，说明短窗口同时带来明显估计噪声。
+- 旧 E9 seed0 终评刚好达到 outage `0.2`，但 reward 只有 `0.658`；P-B3 是更好的 reward-risk 候选工作点，却尚未同时满足约束并超过 QCPO_refs。
+
+共同 300k profile 位于 `_runs/profiles/dqc_recurrent_pid_p_b123_300k_2026-07-16/`，原始导出位于 `_runs/wandb_export/dqc_recurrent_pid_p_b123_300k_2026-07-16/`。该 profile 同时包含 P-B1/P-B2/P-B3、E9 seed0 与 QCPO_refs，未发现 NaN/Inf。
+
+**阶段决策**：停止当前 Kp/Ki/window 小网格。P-B3 证明控制迟滞是原因之一，但剩余问题不能仅靠 controller gain 解释；继续放大 Kp 可能只会把窗口噪声变成更强 actor 振荡。`Kp=2`、`Ki=.15/leak=.98`、cost-quantile PI 和双信号 P/I 仍记录为控制器消融路线，只有 cost 表示/局部 risk advantage 校准后再回测，不立即消耗全量预算。
+
+### 13.12 C-H0.5：先用冻结 actor-history feature 检验非 Markov cost critic（2026-07-16）
+
+一个此前容易忽略的结构问题是：环境 observation 对物理系统可能是 Markov 的，但 recurrent policy 的未来动作还依赖 hidden state。因此固定 recurrent policy 下正确的 cost action-value 一般是 `Z_c(s_t,h_t,a_t)`，不是当前实现的 `Z_c(s_t,a_t)`。D-R0 的 cost critic 看不到 `h_t`，同一 observation/action 在不同策略记忆下会被迫拟合成混合分布；这会直接污染查询点 CDF 和 action baseline 差值。
+
+为在重写完整 recurrent critic 前做可归因的轻量验证，新增默认关闭的 `cost_history_mode=raw|actor_feature`：
+
+1. `raw` 完全保留历史 `(normalized state,t/T,a)→N quantiles`；默认值不变。
+2. `actor_feature` 保存产生行为动作的 `φ_t=MLP(obs,prev_cost)+LSTM(history)`，显式 detach 后输入 action-conditioned cost quantile MLP；reward critic/reward-V/actor 均不改变。
+3. n-step bootstrap 同时保存完整历史下的 `a_{t+N}` 与 `φ_{t+N}`；episode 末的未执行 `a_T/φ_T` 也配对保存。MC 路径虽不使用 cost bootstrap，仍保留同一批接口。
+4. rollout risk advantage、K-action baseline、constraint RMS、critic dual、s0 校准和独立评估都走统一 `_cost_inputs`，避免训练用 history、评估却误用 raw state。
+5. feature 在 rollout 的 `no_grad` 内产生并在适配器再次 detach，cost loss 不更新 actor。这是 C-H0.5 shared-input head，不是假装已经实现 C-H1 full recurrent critic。
+
+验证已通过：旧四元 `RecurrentActorValue.forward` 与可选五元 feature 接口的 policy/value/hidden 逐元素完全相同；持久化 `actor_feature` smoke 与只改回 `raw` 的回归 smoke 均训练约 `6s`、exit code 0，覆盖 MC、chunked QR、两次 PPO、PI、recurrent eval 和进程回收。
+
+存在分歧的后续路线全部保留：
+
+- **C-H0.5A（当前门控）**：冻结 actor recurrent feature；实现最轻，直接检验策略历史是否有用，但输入维度/非线性表示也随之增加，且 actor 表示跨 iteration 漂移。
+- **C-H0.5B（容量/表示控制）**：若 A 有效，再比较同维 actor MLP-only feature（无 LSTM history）或容量匹配的 raw projection，区分“历史”与“更大输入表示”。
+- **C-H1（推荐长期主线）**：独立 online/target recurrent cost encoder + action-conditioned quantile head；cost 表示不随 reward actor 漂移，target hidden 语义完整，但实现与计算更重。
+- **C-H2（raw+history concat）**：同时保留物理 state 与 history feature，信息最全但参数最多；只有 A/H1 显示历史有效时作为结构消融。
+- **C-H3（full shared hybrid）**：允许 cost loss 更新共享 actor encoder；样本效率可能更高，但已是新算法，必须与 detach 版本分开报告。
+
+下一条只跑 C-H0.5A reward-only 100k：沿用 C20+MC、actor lr `3e-4`、`lambda=0`，与 raw C20（W&B `059boy42`）一项对照。通过门槛是：CDF 绝对偏差相对 `0.0978` 至少下降 25%，或 mean-cost 相对误差从 22% 降到 15% 内，同时另一校准量不恶化超过 10%、reward/PPO 不异常。未通过就不跑 300k，直接实现 C-H1；通过后才进入 P-B3 控制器下的 300k constrained 门控，并补 C-H0.5B 容量控制。

@@ -197,7 +197,8 @@ class RecurrentActorValue(nn.Module):
         c = torch.zeros(1, int(batch_size), self.lstm_size, device=device)
         return h, c
 
-    def forward(self, observation, prev_action, prev_reward, init_rnn_state=None):
+    def forward(self, observation, prev_action, prev_reward, init_rnn_state=None,
+                return_features=False):
         """
         前向调用。
 
@@ -206,9 +207,12 @@ class RecurrentActorValue(nn.Module):
             prev_action: [T,B,action_dim]。
             prev_reward: [T,B]。
             init_rnn_state: (h,c)，各 [1,B,H]；None 表示零状态。
+            return_features: True 时额外返回产生 policy/value 的历史条件特征。
 
         返回:
-            mean [T,B,A]、log_std [T,B,A]、value [T,B]、(h_n,c_n)。
+            默认返回 mean [T,B,A]、log_std [T,B,A]、value [T,B]、(h_n,c_n)。
+            return_features=True 时再追加 feature [T,B,H]；该接口供 DQCAC
+            的 C-H0.5 cost-history 消融复用，不改变已有调用的四元返回值。
         """
         T, B = observation.shape[:2]
         policy_observation = self.obs_rms(observation)             if self.normalize_observation else observation
@@ -229,6 +233,8 @@ class RecurrentActorValue(nn.Module):
         mean = self.mu(feature).view(T, B, -1)
         log_std = self.log_std.repeat(T * B, 1).view(T, B, -1)
         value = self.value(feature).squeeze(-1).view(T, B)
+        if return_features:
+            return mean, log_std, value, final_state, feature.view(T, B, -1)
         return mean, log_std, value, final_state
 
     @torch.no_grad()

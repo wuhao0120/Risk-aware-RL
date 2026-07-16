@@ -140,6 +140,16 @@ class DQCACBetaGPU(VecAgentBase):
                 normalize_observation=self.normalize_observation,
                 var_clip=self.obs_norm_var_clip).to(self.device)
 
+        # C-H0.5 只改变 cost critic 的条件变量：raw 是历史默认；actor_feature
+        # 使用产生行为动作的 recurrent feature。特征在 rollout 时 detach，cost loss
+        # 不反传 actor，因此它是“共享表示输入”而不是 full shared recurrent critic。
+        self.cost_history_mode = str(
+            getattr(args, 'cost_history_mode', 'raw')).lower()
+        if self.cost_history_mode not in {'raw', 'actor_feature'}:
+            raise ValueError("cost_history_mode must be 'raw' or 'actor_feature'")
+        if self.cost_history_mode == 'actor_feature' and not self.recurrent_policy:
+            raise ValueError("cost_history_mode='actor_feature' requires policy_arch='mlp_lstm'")
+
         # dual 消融：旧 critic_adam 保持可复现；empirical_pid 用真实完成轨迹控制 λ。
         self.dual_update_mode = str(getattr(args, 'dual_update_mode', 'critic_adam')).lower()
         if self.dual_update_mode not in {'critic_adam', 'empirical_pid'}:
@@ -191,18 +201,27 @@ class DQCACBetaGPU(VecAgentBase):
         hidden = getattr(args, 'critic_hidden', [256, 256])   # safety-gym 观测高维 → MLP 大一点
         if isinstance(hidden, str):
             hidden = [int(x) for x in hidden.split(',') if x.strip()]
-        cdim = self.state_dim + (1 if self.critic_step_feature else 0)
+        reward_cdim = self.state_dim + (1 if self.critic_step_feature else 0)
+        cost_base_dim = (
+            self.actor.lstm_size
+            if self.cost_history_mode == 'actor_feature' else self.state_dim)
+        cost_cdim = cost_base_dim + (1 if self.critic_step_feature else 0)
         # reward critic: ψ^r(s,a), 只用其均值 mean(ψ^r) 作 Q̂_m (目标优势)
-        self.reward_critic = DistributionalCritic(cdim, self.action_dim,
-                                                  self.num_quantiles, list(hidden)).to(self.device)
-        self.reward_target_critic = DistributionalCritic(cdim, self.action_dim,
-                                                         self.num_quantiles, list(hidden)).to(self.device)
+        self.reward_critic = DistributionalCritic(
+            reward_cdim, self.action_dim, self.num_quantiles,
+            list(hidden)).to(self.device)
+        self.reward_target_critic = DistributionalCritic(
+            reward_cdim, self.action_dim, self.num_quantiles,
+            list(hidden)).to(self.device)
         self.reward_target_critic.load_state_dict(self.reward_critic.state_dict())
-        # cost critic: ψ^c(s,a), 用【上尾】CDF Ψ̂(s,a,b) 作约束优势 + budget 查询
-        self.cost_critic = DistributionalCritic(cdim, self.action_dim,
-                                                self.num_quantiles, list(hidden)).to(self.device)
-        self.cost_target_critic = DistributionalCritic(cdim, self.action_dim,
-                                                       self.num_quantiles, list(hidden)).to(self.device)
+        # cost critic: raw 路径保持 ψ^c(s,a)；C-H0.5 则为 ψ^c(φ_history,a)。
+        # 两者都保留 action conditioning 和相同 quantile head，避免改变 DQCAC 语义。
+        self.cost_critic = DistributionalCritic(
+            cost_cdim, self.action_dim, self.num_quantiles,
+            list(hidden)).to(self.device)
+        self.cost_target_critic = DistributionalCritic(
+            cost_cdim, self.action_dim, self.num_quantiles,
+            list(hidden)).to(self.device)
         self.cost_target_critic.load_state_dict(self.cost_critic.state_dict())
         # 一个优化器统管两 critic (loss = reward_qr + cost_qr, 一次 backward)
         self.critic_optimizer = Adam(
@@ -214,7 +233,8 @@ class DQCACBetaGPU(VecAgentBase):
         self.reward_value = None
         self.reward_value_optimizer = None
         if self.reward_actor_mode != 'distributional' and not self.recurrent_policy:
-            self.reward_value = ScalarValueCritic(cdim, hidden=list(hidden)).to(self.device)
+            self.reward_value = ScalarValueCritic(
+                reward_cdim, hidden=list(hidden)).to(self.device)
             self.reward_value_optimizer = Adam(
                 self.reward_value.parameters(), self.reward_value_lr, eps=1e-5)
 
@@ -254,7 +274,7 @@ class DQCACBetaGPU(VecAgentBase):
         print(f"DQCACBetaGPU[CMDP]: env={self.env_name}, beta={self.beta}, omega={self.q_alpha}, "
               f"d(cost_limit)={self.cost_limit}, cost_gamma={self.cost_gamma}, episodic={self.episodic}, "
               f"step_feature={self.critic_step_feature}, N={self.num_quantiles}, B={self.num_envs}, T={self.n}, "
-              f"cost_target={self.cost_target_mode}, "
+              f"cost_target={self.cost_target_mode}, cost_history={self.cost_history_mode}, "
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
               f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}, "
@@ -339,20 +359,27 @@ class DQCACBetaGPU(VecAgentBase):
         return (tensor.transpose(0, 1).reshape(
             new_B, self.recurrent_seq_len, *rest).transpose(0, 1).contiguous())
 
-    def _sample_initial_actions(self, states):
-        """在 episode 初始零历史处采样；仅供 s0 dual/CDF 查询，不能用于任意中间状态。"""
+    def _sample_initial_actions(self, states, return_features=False):
+        """
+        在 episode 初始零历史处采样，可选返回与动作严格对齐的 recurrent feature。
+
+        该 helper 只供 s0 dual/CDF 查询；任意中间状态仍必须使用 rollout 保存的
+        历史特征，不能用零 hidden 重新近似。
+        """
         if not self.recurrent_policy:
-            return self._sample_actions(states)
+            action = self._sample_actions(states)
+            return (action, None) if return_features else action
         B = states.shape[0]
         prev_cost = torch.zeros(B, 1, device=states.device)
         prev_action = torch.zeros(B, self.action_dim, device=states.device)
         prev_reward = torch.zeros(B, device=states.device)
         h0, c0 = self.actor.initial_state(B, states.device)
         actor_obs = torch.cat([states, prev_cost], dim=1)
-        means, log_stds, _value, _state = self.actor(
+        means, log_stds, _value, _state, features = self.actor(
             actor_obs.unsqueeze(0), prev_action.unsqueeze(0),
-            prev_reward.unsqueeze(0), (h0, c0))
-        return self._sample_from_params(means[0], log_stds[0])
+            prev_reward.unsqueeze(0), (h0, c0), return_features=True)
+        action = self._sample_from_params(means[0], log_stds[0])
+        return (action, features[0]) if return_features else action
 
     def _rollout_core(self, keep_logp=False):
         """
@@ -373,8 +400,8 @@ class DQCACBetaGPU(VecAgentBase):
 
         states, actions, rewards, costs = [], [], [], []
         actor_obs, prev_actions, prev_rewards = [], [], []
-        hidden_in, cell_in, values, means_all, log_stds_all, log_probs = (
-            [], [], [], [], [], [])
+        hidden_in, cell_in, values, features, means_all, log_stds_all, log_probs = (
+            [], [], [], [], [], [], [])
         disc_return = torch.zeros(B, device=self.device)
         disc_cost = torch.zeros(B, device=self.device)
         undisc_cost = torch.zeros(B, device=self.device)
@@ -386,10 +413,11 @@ class DQCACBetaGPU(VecAgentBase):
                 augmented_obs = torch.cat([state, prev_cost], dim=1)
                 hidden_in.append(hidden[0].clone())
                 cell_in.append(cell[0].clone())
-                means, log_stds, value, (next_hidden, next_cell) = self.actor(
+                means, log_stds, value, (next_hidden, next_cell), feature = self.actor(
                     augmented_obs.unsqueeze(0), prev_action.unsqueeze(0),
-                    prev_reward.unsqueeze(0), (hidden, cell))
-                means, log_stds, value = means[0], log_stds[0], value[0]
+                    prev_reward.unsqueeze(0), (hidden, cell), return_features=True)
+                means, log_stds, value, feature = (
+                    means[0], log_stds[0], value[0], feature[0])
                 action = self._sample_from_params(means, log_stds)
                 if keep_logp:
                     log_probs.append(self._logp_from_params(action, means, log_stds))
@@ -403,6 +431,7 @@ class DQCACBetaGPU(VecAgentBase):
                 prev_actions.append(prev_action.clone())
                 prev_rewards.append(prev_reward.clone())
                 values.append(value)
+                features.append(feature)
                 means_all.append(means)
                 log_stds_all.append(log_stds)
 
@@ -419,9 +448,10 @@ class DQCACBetaGPU(VecAgentBase):
 
             # s_T 的动作仅作为 continuing N-step bootstrap 使用，不与环境交互。
             terminal_obs = torch.cat([next_state, prev_cost], dim=1)
-            terminal_mean, terminal_log_std, _terminal_value, _terminal_state = self.actor(
+            (terminal_mean, terminal_log_std, _terminal_value, _terminal_state,
+             terminal_feature) = self.actor(
                 terminal_obs.unsqueeze(0), prev_action.unsqueeze(0),
-                prev_reward.unsqueeze(0), (hidden, cell))
+                prev_reward.unsqueeze(0), (hidden, cell), return_features=True)
             terminal_action = self._sample_from_params(
                 terminal_mean[0], terminal_log_std[0])
 
@@ -440,9 +470,11 @@ class DQCACBetaGPU(VecAgentBase):
             'h0': torch.stack(hidden_in),
             'c0': torch.stack(cell_in),
             'actor_value': torch.stack(values),
+            'actor_feature': torch.stack(features),
             'actor_mean': torch.stack(means_all),
             'actor_log_std': torch.stack(log_stds_all),
             'terminal_action': terminal_action,
+            'terminal_feature': terminal_feature[0],
         }
         if keep_logp:
             rollout['logp'] = torch.stack(log_probs)
@@ -505,12 +537,15 @@ class DQCACBetaGPU(VecAgentBase):
         t_ar = torch.arange(n, device=self.device)
         boot_idx = torch.clamp(t_ar + Ns, max=n)              # bootstrap 态索引 (可达 s_T=n)
         boot_states = S_ext[boot_idx].reshape(n * B, -1)
-        boot_actions = None
+        boot_actions, boot_cost_features = None, None
         if self.recurrent_policy:
             # recurrent target 使用同一 on-policy rollout 在完整历史下采到的 a_{t+N}。
-            # 末尾索引 n 对应 _rollout_core 单独生成但未执行的 terminal_action。
+            # 末尾索引 n 对应 _rollout_core 单独生成但未执行的 terminal action/feature。
             action_ext = torch.cat([Amat, roll['terminal_action'].unsqueeze(0)], dim=0)
+            feature_ext = torch.cat([
+                roll['actor_feature'], roll['terminal_feature'].unsqueeze(0)], dim=0)
             boot_actions = action_ext[boot_idx].reshape(n * B, -1)
+            boot_cost_features = feature_ext[boot_idx].reshape(n * B, -1)
         if self.episodic:                                     # episode 末不 bootstrap (有限期界)
             boot_mask = (t_ar + Ns < n).float().unsqueeze(1).expand(n, B).reshape(n * B)
         else:                                                 # continuing: 恒 bootstrap
@@ -551,9 +586,13 @@ class DQCACBetaGPU(VecAgentBase):
                 'h0': roll['h0'],
                 'c0': roll['c0'],
                 'actor_value': roll['actor_value'],
+                # rollout feature 已由 no_grad 产生；显式 detach 表明 cost critic
+                # 不会借共享输入把梯度写回 behavior actor。
+                'actor_feature': roll['actor_feature'].reshape(n * B, -1).detach(),
                 'actor_mean': roll['actor_mean'],
                 'actor_log_std': roll['actor_log_std'],
                 'boot_actions': boot_actions.detach(),
+                'boot_cost_features': boot_cost_features.detach(),
             })
         return batch
 
@@ -576,16 +615,18 @@ class DQCACBetaGPU(VecAgentBase):
             boot_actions = (
                 batch['boot_actions'] if self.recurrent_policy
                 else self._sample_actions(boot_states))
-            boot_inputs = self._aug(boot_states, boot_steps)
+            reward_boot_inputs = self._aug(boot_states, boot_steps)
+            cost_boot_inputs = self._cost_inputs(
+                boot_states, boot_steps, batch.get('boot_cost_features'))
 
             # 两条 target 都完整保存为 [T*B,N]；真正的 N² 张量只在下面 chunk 内产生。
-            reward_next = self.reward_target_critic(boot_inputs, boot_actions)
+            reward_next = self.reward_target_critic(reward_boot_inputs, boot_actions)
             reward_target = (
                 batch['nstep_reward'].unsqueeze(1)
                 + (self.gamma ** self.n_step)
                 * boot_mask.unsqueeze(1) * reward_next)
             if self.cost_target_mode == 'nstep':
-                cost_next = self.cost_target_critic(boot_inputs, boot_actions)
+                cost_next = self.cost_target_critic(cost_boot_inputs, boot_actions)
                 cost_target = (
                     batch['nstep_cost'].unsqueeze(1)
                     + (self.cost_gamma ** self.n_step)
@@ -597,7 +638,9 @@ class DQCACBetaGPU(VecAgentBase):
                 cost_target = batch['mc_cost'].unsqueeze(1).expand(
                     -1, self.num_quantiles)
 
-        state_inputs = self._aug(states, steps)
+        reward_state_inputs = self._aug(states, steps)
+        cost_state_inputs = self._cost_inputs(
+            states, steps, batch.get('actor_feature'))
         total_size = int(states.shape[0])
         chunk_size = self.critic_minibatch_size
         use_chunks = 0 < chunk_size < total_size
@@ -605,8 +648,8 @@ class DQCACBetaGPU(VecAgentBase):
 
         if not use_chunks:
             # 默认历史路径：构造完整 [T*B,N,N] pairwise error，一次 backward。
-            reward_pred = self.reward_critic(state_inputs, actions)
-            cost_pred = self.cost_critic(state_inputs, actions)
+            reward_pred = self.reward_critic(reward_state_inputs, actions)
+            cost_pred = self.cost_critic(cost_state_inputs, actions)
             reward_loss = self._quantile_huber_loss(reward_pred, reward_target)
             cost_loss = self._quantile_huber_loss(cost_pred, cost_target)
             (reward_loss + cost_loss).backward()
@@ -619,9 +662,9 @@ class DQCACBetaGPU(VecAgentBase):
                 finish = min(begin + chunk_size, total_size)
                 weight = float(finish - begin) / float(total_size)
                 reward_pred = self.reward_critic(
-                    state_inputs[begin:finish], actions[begin:finish])
+                    reward_state_inputs[begin:finish], actions[begin:finish])
                 cost_pred = self.cost_critic(
-                    state_inputs[begin:finish], actions[begin:finish])
+                    cost_state_inputs[begin:finish], actions[begin:finish])
                 reward_loss_chunk = self._quantile_huber_loss(
                     reward_pred, reward_target[begin:finish])
                 cost_loss_chunk = self._quantile_huber_loss(
@@ -790,8 +833,9 @@ class DQCACBetaGPU(VecAgentBase):
             budgets = batch['budgets']
             steps = batch['steps']
             if '_risk_weight' not in batch:
-                state_inputs = self._aug(states, steps)
-                psi_c = self.cost_critic(state_inputs, batch['actions'])
+                cost_inputs = self._cost_inputs(
+                    states, steps, batch.get('actor_feature'))
+                psi_c = self.cost_critic(cost_inputs, batch['actions'])
                 psi_cdf = (psi_c >= budgets.unsqueeze(1)).float().mean(dim=1)
 
                 behavior_mean = batch['actor_mean'].reshape(n * B, self.action_dim)
@@ -800,7 +844,7 @@ class DQCACBetaGPU(VecAgentBase):
                 for _sample_idx in range(self.num_action_samples):
                     baseline_action = self._sample_from_params(
                         behavior_mean, behavior_log_std)
-                    baseline_psi = self.cost_critic(state_inputs, baseline_action)
+                    baseline_psi = self.cost_critic(cost_inputs, baseline_action)
                     baseline_cdfs.append(
                         (baseline_psi >= budgets.unsqueeze(1)).float().mean(dim=1))
                 baseline_cdf = torch.stack(baseline_cdfs, dim=0).mean(dim=0)
@@ -1061,8 +1105,10 @@ class DQCACBetaGPU(VecAgentBase):
         if self.dual_update_mode == 'critic_adam':
             with torch.no_grad():
                 s0 = batch['s0']
-                a0 = self._sample_initial_actions(s0)
-                psi0 = self.cost_critic(self._aug(s0, 0), a0)  # [B,N]
+                a0, feature0 = self._sample_initial_actions(
+                    s0, return_features=True)
+                cost_input0 = self._cost_inputs(s0, 0, feature0)
+                psi0 = self.cost_critic(cost_input0, a0)       # [B,N]
                 p = float((psi0 >= self.cost_limit).float().mean(dim=1).mean().item())
             self.last_dual_prob = p
             self.last_dual_prob_gap = p - self.q_alpha
@@ -1111,6 +1157,28 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_dual_prob = window_prob
 
     # ============================================================ 辅助 (与模板同语义) ============================================================
+    def _cost_inputs(self, states, steps, actor_features=None):
+        """
+        构造 cost distribution critic 的条件输入。
+
+        raw 路径逐式调用历史 `_aug(state,t)`；actor_feature 路径要求与每个 action
+        同一历史位置的 φ_t，并在这里再次 detach，形成严格的半梯度边界。φ_t 已由
+        actor 自己的 observation RMS/MLP/LSTM 产生，不能再经过 raw-state normalizer。
+        """
+        if self.cost_history_mode == 'raw':
+            return self._aug(states, steps)
+        if actor_features is None:
+            raise RuntimeError(
+                "cost_history_mode='actor_feature' requires aligned recurrent features")
+        features = actor_features.detach()
+        if not self.critic_step_feature:
+            return features
+        if not torch.is_tensor(steps):
+            steps = torch.full(
+                (features.shape[0],), float(steps), device=features.device)
+        step_feature = (steps.float() / self.n).reshape(-1, 1)
+        return torch.cat([features, step_feature], dim=1)
+
     def _aug(self, states, steps):
         """先共享观测归一化，再按需追加 critic/value 的 t/T step feature。"""
         states = self._normalize_states(states)
@@ -1122,7 +1190,8 @@ class DQCACBetaGPU(VecAgentBase):
         return torch.cat([states, sf], dim=1)
 
     def _estimate_baselines(self, states, budgets, steps=None, need_reward=True,
-                            policy_mean=None, policy_log_std=None):
+                            policy_mean=None, policy_log_std=None,
+                            cost_features=None):
         """
         用 K 个策略动作近似 V_c(s,b)，仅在 distributional reward 模式下同时近似 V_m(s)。
 
@@ -1133,6 +1202,11 @@ class DQCACBetaGPU(VecAgentBase):
         # 所有 critic 前向都必须与 actor 共享 observation 统计；steps=None 仅表示
         # 不追加 t/T，不能跳过归一化，否则该兼容分支会混用两套输入尺度。
         s_aug = self._aug(states, steps) if steps is not None else self._normalize_states(states)
+        # raw 路径沿用完全相同的 s_aug；actor_feature 路径只为 cost head 换成
+        # 对齐历史特征，reward baseline 仍保持 state-conditioned 定义。
+        cost_aug = (
+            s_aug if self.cost_history_mode == 'raw'
+            else self._cost_inputs(states, 0 if steps is None else steps, cost_features))
         q_list, c_list = [], []
         for _ in range(self.num_action_samples):
             if self.recurrent_policy:
@@ -1145,7 +1219,7 @@ class DQCACBetaGPU(VecAgentBase):
                 a = self._sample_actions(states)
             if need_reward:
                 q_list.append(self.reward_critic(s_aug, a).mean(dim=1))          # reward 均值
-            c_list.append((self.cost_critic(s_aug, a) >= b_col).float().mean(dim=1))
+            c_list.append((self.cost_critic(cost_aug, a) >= b_col).float().mean(dim=1))
         reward_baseline = torch.stack(q_list, dim=0).mean(dim=0) if need_reward else None
         cost_baseline = torch.stack(c_list, dim=0).mean(dim=0)
         return reward_baseline, cost_baseline
@@ -1179,7 +1253,9 @@ class DQCACBetaGPU(VecAgentBase):
             s, b = batch['states'], batch['budgets']
             a = batch['actions']
             steps = batch['steps']
-            psi_cdf = (self.cost_critic(self._aug(s, steps), a) >= b.unsqueeze(1)).float().mean(dim=1)
+            cost_features = batch.get('actor_feature')
+            cost_inputs = self._cost_inputs(s, steps, cost_features)
+            psi_cdf = (self.cost_critic(cost_inputs, a) >= b.unsqueeze(1)).float().mean(dim=1)
             policy_mean = (
                 batch['actor_mean'].reshape(-1, self.action_dim)
                 if self.recurrent_policy else None)
@@ -1188,7 +1264,8 @@ class DQCACBetaGPU(VecAgentBase):
                 if self.recurrent_policy else None)
             _, v_c = self._estimate_baselines(
                 s, b, steps, need_reward=False,
-                policy_mean=policy_mean, policy_log_std=policy_log_std)
+                policy_mean=policy_mean, policy_log_std=policy_log_std,
+                cost_features=cost_features)
             adv_c = psi_cdf - v_c
         self._ema_update(self.constraint_rms,
                          float(adv_c.mean().item()), float(adv_c.var(unbiased=False).item()))
@@ -1204,8 +1281,10 @@ class DQCACBetaGPU(VecAgentBase):
     def _initial_cdf_estimate(self, s0):
         """cost-critic 在 s0 上的 P(C≥d)/E[C]/std(C) 估计 (校准诊断)。"""
         with torch.no_grad():
-            a0 = self._sample_initial_actions(s0)
-            psi = self.cost_critic(self._aug(s0, 0), a0)      # [B, N]
+            a0, feature0 = self._sample_initial_actions(
+                s0, return_features=True)
+            cost_input0 = self._cost_inputs(s0, 0, feature0)
+            psi = self.cost_critic(cost_input0, a0)           # [B, N]
             self.last_cdf_initial = float(
                 (psi >= self.cost_limit).float().mean(dim=1).mean())      # 上尾
             self.last_pred_cost_mean = float(psi.mean().item())
@@ -1249,6 +1328,8 @@ class DQCACBetaGPU(VecAgentBase):
             'dual/pid_i': self.pid_i,
             'dual/window_size': float(len(self.empirical_cost_window)),
             'dual/sum_norm_enabled': float(self.sum_norm),
+            'debug/cost_history_actor_feature': float(
+                self.cost_history_mode == 'actor_feature'),
             'budget/min': float(np.min(budgets_np)),
             'budget/max': float(np.max(budgets_np)),
             'budget/mean': float(np.mean(budgets_np)),
@@ -1282,7 +1363,7 @@ class DQCACBetaGPU(VecAgentBase):
 
         rounds = max(1, int(np.ceil(num_episodes / vec_env.B)))
         rewards_all, costs_all, undisc_costs_all = [], [], []
-        initial_states, initial_actions = [], []
+        initial_states, initial_actions, initial_features = [], [], []
         with torch.no_grad():
             for _round_idx in range(rounds):
                 B = vec_env.B
@@ -1298,13 +1379,14 @@ class DQCACBetaGPU(VecAgentBase):
 
                 for timestep in range(vec_env.n):
                     actor_obs = torch.cat([state, prev_cost], dim=1)
-                    means, log_stds, _value, (hidden, cell) = self.actor(
+                    means, log_stds, _value, (hidden, cell), features = self.actor(
                         actor_obs.unsqueeze(0), prev_action.unsqueeze(0),
-                        prev_reward.unsqueeze(0), (hidden, cell))
+                        prev_reward.unsqueeze(0), (hidden, cell), return_features=True)
                     action = self._sample_from_params(means[0], log_stds[0])
                     if timestep == 0:
                         initial_states.append(state.clone())
                         initial_actions.append(action.clone())
+                        initial_features.append(features[0].clone())
                     state, reward, cost, _done = vec_env.step(action)
                     reward_return += reward_discount * reward
                     cost_return += cost_discount * cost
@@ -1321,7 +1403,9 @@ class DQCACBetaGPU(VecAgentBase):
             # cost critic 校准使用同一评估批真实 s0 与循环策略零历史下的 a0。
             s0 = torch.cat(initial_states, dim=0)
             a0 = torch.cat(initial_actions, dim=0)
-            psi0 = self.cost_critic(self._aug(s0, 0), a0)
+            feature0 = torch.cat(initial_features, dim=0)
+            cost_input0 = self._cost_inputs(s0, 0, feature0)
+            psi0 = self.cost_critic(cost_input0, a0)
             cost_cdf_initial = float(
                 (psi0 >= float(cost_limit)).float().mean(dim=1).mean().item())
             pred_cost_mean = float(psi0.mean().item())
@@ -1368,6 +1452,7 @@ class DQCACBetaGPU(VecAgentBase):
             'beta': self.beta,
             'reward_actor_mode': self.reward_actor_mode,
             'policy_arch': self.policy_arch,
+            'cost_history_mode': self.cost_history_mode,
             'actor_updates_per_episode': self.actor_updates_per_episode,
             'num_envs': self.num_envs,
             'num_iterations': self.num_iterations,
