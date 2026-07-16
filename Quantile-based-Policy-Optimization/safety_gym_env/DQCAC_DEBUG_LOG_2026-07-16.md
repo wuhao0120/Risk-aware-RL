@@ -331,3 +331,15 @@
   - `_runs/profiles/qcpo_qb_vs_key_100k_2026-07-16/`
   - `_runs/profiles/qcpo_qb_vs_key_300k_2026-07-16/`
 - 最重要结论：QCPO 旧失败由两个层次叠加。未修正 rollout reuse 和未生效 obs RMS 是工程 bug；修完后 Q-A2 能学但慢。把 reward MC 换成 V+GAE 后才追平 QCPO_refs，说明低方差、逐时刻 reward credit assignment 是剩余主因。
+
+#### E12 QCPO 接入状态
+
+- `QCPOGPU` 新增 `policy_arch=mlp|mlp_lstm`，默认仍为 `mlp`，旧 Q-B 路径不变。
+- recurrent rollout 逐步保存 augmented observation、previous action/reward、采样时 old log-prob、reward value，以及每步进入前 `h0/c0`。
+- 更新时按 `recurrent_seq_len=100` 将每条 T=1000 轨迹切块，块维 shuffle 语义与 QCPO_refs 一致；每块使用 rollout 保存的初始 hidden state，8 epochs 中 behavior old log-prob 固定。
+- policy PPO 与 reward-value loss 使用同一个 recurrent model、同一次 backward/optimizer step，与 QCPO_refs 的共享骨干优化方式一致。reward/risk PPO 仍分别使用 min/max。
+- recurrent 专用评估器在每轮 episode batch 开始重置 previous cost/action/reward 与 hidden state，避免 stateless 统一评估器丢失历史。
+- 持久化验证：
+  - `QCPO_DynamicButton_smoke_recurrent_qb_s0`：小型 `[32,32]+LSTM32`、seq=16，训练 `7.1s`，exit code 0，覆盖 rollout/BPTT/联合 loss/终评。
+  - `QCPO_DynamicButton_smoke_mlp_qb_regression_s0`：默认 MLP 分支训练 `7.0s`，exit code 0，确认 recurrent 分支未破坏已校准 Q-B。
+- 下一门：全尺寸 `[512,512]+LSTM512`、seq=100、Q-B reward-only，先 100k seed0；目标是在相同 env steps 下至少复现 MLP Q-B 的明确正趋势，再决定扩 300k。

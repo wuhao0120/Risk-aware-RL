@@ -135,6 +135,12 @@ def base_args(algo, seed, device, env_key):
         a.reward_value_step_feature = True
         a.reward_value_lr = 3e-4
         a.reward_value_grad_clip = 10.0
+        a.policy_arch = 'mlp'
+        a.recurrent_hidden = [512, 512]
+        a.lstm_size = 512
+        a.lstm_skip = True
+        a.recurrent_seq_len = 100
+        a.recurrent_value_loss_coef = 1.0
     elif algo == 'DQCAC':
         # per-transition 双 critic 版 (继承 portfolio DQCACBetaGPU 已验证配方)。
         a.beta = 0.95
@@ -321,7 +327,7 @@ def main():
     eval_vec = make_vec_env(args.env_id, num_envs=args.num_envs, horizon=args.horizon,
                             device=device, ref_env=env, seed=args.seed + 777,
                             backend=getattr(args, 'vec_backend', 'mp'))
-    if cli.algo == 'QCPO_REF':
+    if cli.algo == 'QCPO_REF' or getattr(agent, 'recurrent_policy', False):
         res = agent.evaluate_vec(eval_vec, cli.num_eval, args.gamma, args.cost_gamma,
                                  args.q_alpha, args.cost_limit)
     else:
