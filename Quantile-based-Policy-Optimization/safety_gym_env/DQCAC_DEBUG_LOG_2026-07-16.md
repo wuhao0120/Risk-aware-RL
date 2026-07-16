@@ -343,3 +343,26 @@
   - `QCPO_DynamicButton_smoke_recurrent_qb_s0`：小型 `[32,32]+LSTM32`、seq=16，训练 `7.1s`，exit code 0，覆盖 rollout/BPTT/联合 loss/终评。
   - `QCPO_DynamicButton_smoke_mlp_qb_regression_s0`：默认 MLP 分支训练 `7.0s`，exit code 0，确认 recurrent 分支未破坏已校准 Q-B。
 - 下一门：全尺寸 `[512,512]+LSTM512`、seq=100、Q-B reward-only，先 100k seed0；目标是在相同 env steps 下至少复现 MLP Q-B 的明确正趋势，再决定扩 300k。
+
+
+#### E12 全尺寸 recurrent R0 结果
+
+- QCPO recurrent 100k：job `QCPO_DynamicButton_recur_qb_r0_qbhyper_100k_s0`，W&B `6tfy9aeo`，训练 `63.7s`，exit code 0；后段 reward `0.4006`、slope `+5.006/百万步`，终评 `0.3169`。
+- QCPO recurrent 独立 300k：job `QCPO_DynamicButton_recur_qb_r0_qbhyper_300k_s0`，W&B `312u1kr3`，训练 `159.8s`，exit code 0；后段 reward `1.083`、slope `+4.114/百万步`，终评 reward `1.251`、outage `0.557`。
+- 同预算 MLP Q-B 后段/终评为 `1.317/1.621`；recurrent 能学且数值健康，但当前 Q-B 超参下尚未复现 MLP，不能把 LSTM 当成无条件增益。
+- 对齐 profile：`_runs/profiles/qcpo_recurrent_r0_100k_2026-07-16/`、`_runs/profiles/qcpo_recurrent_r0_300k_2026-07-16/`。
+- 决策路线：保留 Q-R0；轻量验证 Q-R1（ref lr/clip）、Q-R2（value loss 系数）、Q-R3（LSTM256）；MLP Q-B 作为 Q-R4 强控制。100k 不超过 R0 则不扩预算。
+
+### E13：DQCACBeta recurrent actor/reward-V 接入
+
+- 状态：D-R0 已实现，默认 `policy_arch=mlp` 不变；循环分支要求 `reward_actor_mode=gae_ppo`。
+- 历史输入和网络与 QCPO_refs policy/reward-V 对齐：`raw obs+previous cost` 经 RMS/MLP，拼 `previous action/reward` 后进入 LSTM+skip。
+- 行为策略一致性：每个 rollout 固定 old log-prob、GAE/value target、risk advantage 和 chunk 初始 hidden；每个更新后只重算当前策略分子，绝不覆盖 behavior probability。
+- critic target 一致性：循环模式的 N-step boot action 来自相同 rollout 的完整历史，而非对中间 state 使用零 hidden；terminal bootstrap 单独生成 `a_T`。
+- cost baseline：从每个历史位置的行为高斯参数采 K 个动作，保持 DQC action-conditioned cost CDF advantage；分布 critics 首轮仍为 MLP/Markov 路线，不假装已完成 full recurrent critic。
+- RMS：actor 的 augmented RMS 延迟到全部 PPO epoch 后更新；critic 使用独立 raw-state RMS。循环评估器重置完整历史并输出 cost CDF 校准。
+- 持久化 smoke `DQCAC_DynamicButton_smoke_recurrent_dr0_s0`：`B=2,T=32,N=8,[32,32]+LSTM32`，训练 `4.7s`、exit code 0；训练与循环评估全链路通过。
+- 默认路径回归 smoke `DQCAC_DynamicButton_smoke_mlp_regression_after_recurrent_s0`：相同小预算，训练 `4.5s`、exit code 0，确认循环分支没有破坏 MLP 构造、GAE/PPO、critic 或统一评估。
+- 新增 `ppo/first_epoch_ratio_max_error`：首个循环 actor epoch 前 actor/RMS 未改变，理论上 ratio 必须为 1；该指标用于直接发现 history/chunk h0/old probability 接线偏差。
+- 并行保留路线：D-R0 actor/V recurrent；D-R1 独立 recurrent cost critic；D-R2 full-shared recurrent hybrid；D-R3 explicit-budget-fair；D-RC 512 MLP 公平控制。
+- 下一实验：D-R0/E5 reward-only 100k，预计含评估 `2–3min`；前段不形成正 slope 或 PPO/value/critic 数值异常就停止，不直接跑满。

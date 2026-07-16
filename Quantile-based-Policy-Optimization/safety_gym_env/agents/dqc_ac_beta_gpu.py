@@ -36,7 +36,7 @@ import torch.nn as nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 
-from utils import RunningMeanStd
+from utils import RecurrentActorValue, RunningMeanStd
 from .vec_base import VecAgentBase
 from .common import DistributionalCritic, ScalarValueCritic, lr_lambda, indicator_ge
 
@@ -94,6 +94,38 @@ class DQCACBetaGPU(VecAgentBase):
         self.ppo_ratio_clip = float(getattr(args, 'ppo_ratio_clip', 0.1))
         self.reward_value_lr = float(getattr(args, 'reward_value_lr', 3e-4))
         self.reward_value_grad_clip = float(getattr(args, 'reward_value_grad_clip', 10.0))
+        self.log_std_min = float(getattr(args, 'log_std_min', -5.0))
+        self.log_std_max = float(getattr(args, 'log_std_max', 2.0))
+
+        # policy_arch=mlp_lstm 时，actor 与 reward V 共享一个已经和 QCPO_refs
+        # 数值逐项对拍的 MLP+LSTM 骨干。分布 critic 仍保持 DQCAC 所需的
+        # action-conditioned Z(s,a)，不能误换成 QCPO_refs 的 state-value cost head。
+        self.policy_arch = str(getattr(args, 'policy_arch', 'mlp')).lower()
+        if self.policy_arch not in {'mlp', 'mlp_lstm'}:
+            raise ValueError("policy_arch must be 'mlp' or 'mlp_lstm'")
+        self.recurrent_policy = self.policy_arch == 'mlp_lstm'
+        self.recurrent_seq_len = max(1, int(getattr(args, 'recurrent_seq_len', 100)))
+        self.recurrent_value_loss_coef = float(
+            getattr(args, 'recurrent_value_loss_coef', 1.0))
+        if self.recurrent_policy:
+            if self.reward_actor_mode != 'gae_ppo':
+                raise ValueError("DQCAC mlp_lstm currently requires reward_actor_mode=gae_ppo")
+            if self.n % self.recurrent_seq_len != 0:
+                raise ValueError("horizon must be divisible by recurrent_seq_len")
+            recurrent_hidden = getattr(args, 'recurrent_hidden', [512, 512])
+            if isinstance(recurrent_hidden, str):
+                recurrent_hidden = [
+                    int(x) for x in recurrent_hidden.split(',') if x.strip()]
+            self.actor = RecurrentActorValue(
+                observation_dim=self.state_dim + 1,
+                action_dim=self.action_dim,
+                hidden=recurrent_hidden,
+                lstm_size=int(getattr(args, 'lstm_size', 512)),
+                lstm_skip=bool(getattr(args, 'lstm_skip', True)),
+                init_std=float(getattr(args, 'init_std', 1.0)),
+                learn_std=bool(getattr(args, 'learn_std', True)),
+                normalize_observation=self.normalize_observation,
+                var_clip=self.obs_norm_var_clip).to(self.device)
 
         # dual 消融：旧 critic_adam 保持可复现；empirical_pid 用真实完成轨迹控制 λ。
         self.dual_update_mode = str(getattr(args, 'dual_update_mode', 'critic_adam')).lower()
@@ -151,7 +183,7 @@ class DQCACBetaGPU(VecAgentBase):
         # 因此短实验只替换 reward advantage 来源，不偷偷改风险约束链路。
         self.reward_value = None
         self.reward_value_optimizer = None
-        if self.reward_actor_mode != 'distributional':
+        if self.reward_actor_mode != 'distributional' and not self.recurrent_policy:
             self.reward_value = ScalarValueCritic(cdim, hidden=list(hidden)).to(self.device)
             self.reward_value_optimizer = Adam(
                 self.reward_value.parameters(), self.reward_value_lr, eps=1e-5)
@@ -187,7 +219,8 @@ class DQCACBetaGPU(VecAgentBase):
               f"step_feature={self.critic_step_feature}, N={self.num_quantiles}, B={self.num_envs}, T={self.n}, "
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
               f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
-              f"dual={self.dual_update_mode}/{self.dual_pid_signal}, sum_norm={self.sum_norm}, "
+              f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}, "
+              f"sum_norm={self.sum_norm}, "
               f"device={self.device}")
 
         for it in range(self.num_iterations):
@@ -218,7 +251,7 @@ class DQCACBetaGPU(VecAgentBase):
                 critic_info = self.update_critic(batch)
                 # 标量 reward value 在 warmup 中也训练；actor 仍由下面的 in_warmup 控制。
                 # value 每个 epoch 拟合同一批冻结 λ-return，actor 复用冻结 advantage。
-                if self.reward_actor_mode != 'distributional':
+                if self.reward_actor_mode != 'distributional' and not self.recurrent_policy:
                     critic_info.update(self.update_reward_value(batch))
                 if not in_warmup and update_idx < self.actor_updates_per_episode:
                     actor_info = self.update_actor(batch)
@@ -233,12 +266,149 @@ class DQCACBetaGPU(VecAgentBase):
                 self.update_dual(batch)
                 dual_updated = True                            # warmup 时不推进 λ 的学习率时间轴
 
+            # recurrent policy 的 augmented-observation moments 必须在所有 PPO epoch
+            # 完成后再合并；否则固定 old_logπ 与 current logπ 会使用不同输入变换。
+            if self.recurrent_policy and self.normalize_observation:
+                self.actor.update_obs_rms(batch['actor_obs'])
+
             # ===== 4. 日志 + 调度 =====
             self._log(it, batch, critic_info, actor_info)
             if actor_updated:
                 self.actor_scheduler.step()                    # 每个有 actor update 的 rollout 推进一步
             if dual_updated and self.dual_update_mode == 'critic_adam':
                 self.lambda_scheduler.step()                   # 严格位于 lambda_optimizer.step() 之后
+
+    # ============================================================ 循环策略 rollout / BPTT 工具 ============================================================
+    @staticmethod
+    def _logp_from_params(actions, means, log_stds):
+        """由循环策略输出计算对角高斯 logπ；支持任意 leading 维。"""
+        std = torch.exp(log_stds)
+        standardized = (actions - means) / (std + 1e-8)
+        action_dim = actions.shape[-1]
+        return -((log_stds + 0.5 * standardized.pow(2)).sum(dim=-1)
+                 + 0.5 * action_dim * np.log(2.0 * np.pi))
+
+    @staticmethod
+    def _sample_from_params(means, log_stds):
+        """从已带历史条件的高斯参数采样，避免错误地用零 hidden 重算动作。"""
+        return means + torch.exp(log_stds) * torch.randn_like(means)
+
+    def _transform_recurrent(self, tensor):
+        """把时间主序 [T,B,*] 切成 QCPO_refs 相同的 [seq_len,new_B,*]。"""
+        T, B = tensor.shape[:2]
+        rest = tuple(tensor.shape[2:])
+        new_B = T * B // self.recurrent_seq_len
+        return (tensor.transpose(0, 1).reshape(
+            new_B, self.recurrent_seq_len, *rest).transpose(0, 1).contiguous())
+
+    def _sample_initial_actions(self, states):
+        """在 episode 初始零历史处采样；仅供 s0 dual/CDF 查询，不能用于任意中间状态。"""
+        if not self.recurrent_policy:
+            return self._sample_actions(states)
+        B = states.shape[0]
+        prev_cost = torch.zeros(B, 1, device=states.device)
+        prev_action = torch.zeros(B, self.action_dim, device=states.device)
+        prev_reward = torch.zeros(B, device=states.device)
+        h0, c0 = self.actor.initial_state(B, states.device)
+        actor_obs = torch.cat([states, prev_cost], dim=1)
+        means, log_stds, _value, _state = self.actor(
+            actor_obs.unsqueeze(0), prev_action.unsqueeze(0),
+            prev_reward.unsqueeze(0), (h0, c0))
+        return self._sample_from_params(means[0], log_stds[0])
+
+    def _rollout_core(self, keep_logp=False):
+        """
+        MLP 沿用共享基类；MLP+LSTM 显式保存每步历史输入与进入前 hidden。
+
+        额外计算 terminal_action：DQCAC 的 N-step target 在 t+N=T 时仍可能
+        bootstrap。该动作必须来自同一行为策略和完整历史，不能用零 hidden 近似。
+        """
+        if not self.recurrent_policy:
+            return super()._rollout_core(keep_logp=keep_logp)
+
+        n, B = self.n, self.num_envs
+        state = self.vec_env.reset()
+        prev_cost = torch.zeros(B, 1, device=self.device)
+        prev_action = torch.zeros(B, self.action_dim, device=self.device)
+        prev_reward = torch.zeros(B, device=self.device)
+        hidden, cell = self.actor.initial_state(B, self.device)
+
+        states, actions, rewards, costs = [], [], [], []
+        actor_obs, prev_actions, prev_rewards = [], [], []
+        hidden_in, cell_in, values, means_all, log_stds_all, log_probs = (
+            [], [], [], [], [], [])
+        disc_return = torch.zeros(B, device=self.device)
+        disc_cost = torch.zeros(B, device=self.device)
+        undisc_cost = torch.zeros(B, device=self.device)
+        reward_discount, cost_discount = 1.0, 1.0
+        next_state = state
+
+        with torch.no_grad():
+            for _t in range(n):
+                augmented_obs = torch.cat([state, prev_cost], dim=1)
+                hidden_in.append(hidden[0].clone())
+                cell_in.append(cell[0].clone())
+                means, log_stds, value, (next_hidden, next_cell) = self.actor(
+                    augmented_obs.unsqueeze(0), prev_action.unsqueeze(0),
+                    prev_reward.unsqueeze(0), (hidden, cell))
+                means, log_stds, value = means[0], log_stds[0], value[0]
+                action = self._sample_from_params(means, log_stds)
+                if keep_logp:
+                    log_probs.append(self._logp_from_params(action, means, log_stds))
+
+                next_state, reward, cost, _done = self.vec_env.step(action)
+                states.append(state)
+                actions.append(action)
+                rewards.append(reward)
+                costs.append(cost)
+                actor_obs.append(augmented_obs)
+                prev_actions.append(prev_action.clone())
+                prev_rewards.append(prev_reward.clone())
+                values.append(value)
+                means_all.append(means)
+                log_stds_all.append(log_stds)
+
+                disc_return += reward_discount * reward
+                disc_cost += cost_discount * cost
+                undisc_cost += cost
+                reward_discount *= self.gamma
+                cost_discount *= self.cost_gamma
+
+                prev_cost = cost.unsqueeze(1)
+                prev_action, prev_reward = action, reward
+                hidden, cell = next_hidden, next_cell
+                state = next_state
+
+            # s_T 的动作仅作为 continuing N-step bootstrap 使用，不与环境交互。
+            terminal_obs = torch.cat([next_state, prev_cost], dim=1)
+            terminal_mean, terminal_log_std, _terminal_value, _terminal_state = self.actor(
+                terminal_obs.unsqueeze(0), prev_action.unsqueeze(0),
+                prev_reward.unsqueeze(0), (hidden, cell))
+            terminal_action = self._sample_from_params(
+                terminal_mean[0], terminal_log_std[0])
+
+        rollout = {
+            'S': torch.stack(states),
+            'A': torch.stack(actions),
+            'R': torch.stack(rewards),
+            'C': torch.stack(costs),
+            'S2_last': next_state,
+            'disc_return': disc_return,
+            'disc_cost': disc_cost,
+            'undisc_cost': undisc_cost,
+            'actor_obs': torch.stack(actor_obs),
+            'prev_action': torch.stack(prev_actions),
+            'prev_reward': torch.stack(prev_rewards),
+            'h0': torch.stack(hidden_in),
+            'c0': torch.stack(cell_in),
+            'actor_value': torch.stack(values),
+            'actor_mean': torch.stack(means_all),
+            'actor_log_std': torch.stack(log_stds_all),
+            'terminal_action': terminal_action,
+        }
+        if keep_logp:
+            rollout['logp'] = torch.stack(log_probs)
+        return rollout
 
     # ============================================================ 采样 + 后处理 (对齐模板, budget 换 cost) ============================================================
     def _rollout_vec(self):
@@ -287,6 +457,12 @@ class DQCACBetaGPU(VecAgentBase):
         t_ar = torch.arange(n, device=self.device)
         boot_idx = torch.clamp(t_ar + Ns, max=n)              # bootstrap 态索引 (可达 s_T=n)
         boot_states = S_ext[boot_idx].reshape(n * B, -1)
+        boot_actions = None
+        if self.recurrent_policy:
+            # recurrent target 使用同一 on-policy rollout 在完整历史下采到的 a_{t+N}。
+            # 末尾索引 n 对应 _rollout_core 单独生成但未执行的 terminal_action。
+            action_ext = torch.cat([Amat, roll['terminal_action'].unsqueeze(0)], dim=0)
+            boot_actions = action_ext[boot_idx].reshape(n * B, -1)
         if self.episodic:                                     # episode 末不 bootstrap (有限期界)
             boot_mask = (t_ar + Ns < n).float().unsqueeze(1).expand(n, B).reshape(n * B)
         else:                                                 # continuing: 恒 bootstrap
@@ -315,6 +491,20 @@ class DQCACBetaGPU(VecAgentBase):
         }
         if keep_logp:
             batch['old_log_probs'] = roll['logp'].reshape(n * B).detach()  # rollout 固定行为策略
+        if self.recurrent_policy:
+            # 保留时间主序张量；actor update 再按 recurrent_seq_len 切块，保证每个
+            # chunk 的初始 (h,c) 正是行为策略采样时进入该位置的状态。
+            batch.update({
+                'actor_obs': roll['actor_obs'],
+                'prev_action': roll['prev_action'],
+                'prev_reward': roll['prev_reward'],
+                'h0': roll['h0'],
+                'c0': roll['c0'],
+                'actor_value': roll['actor_value'],
+                'actor_mean': roll['actor_mean'],
+                'actor_log_std': roll['actor_log_std'],
+                'boot_actions': boot_actions.detach(),
+            })
         return batch
 
     # ============================================================ Critic 更新 (双 QR-TD) ============================================================
@@ -325,7 +515,11 @@ class DQCACBetaGPU(VecAgentBase):
         steps, boot_steps = batch['steps'], batch['boot_steps']
 
         with torch.no_grad():                                 # target 不建图
-            a_boot = self._sample_actions(boot_s)             # a''~π(·|s_{t+N})
+            # MLP 可直接在 boot state 重采；recurrent 必须使用完整历史下保存的
+            # on-policy boot action，否则这里会隐式把所有中间状态当作 episode 起点。
+            a_boot = (
+                batch['boot_actions'] if self.recurrent_policy
+                else self._sample_actions(boot_s))
             # reward target
             psi_r_next = self.reward_target_critic(self._aug(boot_s, boot_steps), a_boot)
             y_r = batch['nstep_reward'].unsqueeze(1) + \
@@ -371,16 +565,21 @@ class DQCACBetaGPU(VecAgentBase):
         所以这里末步 next_value=0；中间步仍用 V(s_{t+1})。target 在 PPO/GAE 的
         多个 epoch 之间保持冻结，避免 value 网络每更新一次就移动一次监督目标。
         """
-        if self.reward_value is None:
+        if self.reward_value is None and not self.recurrent_policy:
             raise RuntimeError("reward GAE requested in distributional mode")
 
         n, B = self.n, self.num_envs
         states = batch['states']                              # [T·B, state_dim]，时间主序
-        value_states = self._aug(states, batch['steps'])         # episodic 模式追加 t/T
+        value_states = None if self.recurrent_policy else self._aug(
+            states, batch['steps'])                           # MLP episodic 模式追加 t/T
         rewards = batch['rewards'].reshape(n, B)              # [T,B] 原始每步 reward
 
         with torch.no_grad():
-            values_old = self.reward_value(value_states).reshape(n, B)
+            # recurrent value 是 rollout 时共享 actor/V 骨干的冻结输出；所有 PPO
+            # epoch 共用它构造的 GAE target，不能在 value 更新后重新计算移动目标。
+            values_old = (
+                batch['actor_value'] if self.recurrent_policy
+                else self.reward_value(value_states).reshape(n, B))
             # episode 最后一步不 bootstrap；其它位置的 next value 来自同一轨迹下一状态。
             next_values = torch.cat([values_old[1:], torch.zeros_like(values_old[:1])], dim=0)
             deltas = rewards + self.gamma * next_values - values_old
@@ -440,9 +639,153 @@ class DQCACBetaGPU(VecAgentBase):
             'reward_value/target_mean': float(value_targets.mean().item()),
         }
 
+    # ============================================================ 循环 Actor + reward-V 联合更新 ============================================================
+    def _update_recurrent_actor_value(self, batch):
+        """
+        用固定 behavior hidden/logπ/GAE target 执行一次 recurrent PPO 更新。
+
+        reward-V 与 actor 共享 QCPO_refs 同形骨干，因此只做一次联合 backward；cost
+        advantage 仍来自 DQCAC 的 action-conditioned distributional critic，并在首个
+        actor epoch 后缓存，防止后续 critic epoch 移动 PPO 的监督目标。
+        """
+        transform = self._transform_recurrent
+        n, B = self.n, self.num_envs
+
+        # [T,B,*] 按每条轨迹切成 seq_len 块；h0/c0 取每块进入前行为状态。
+        observations = transform(batch['actor_obs'])
+        prev_actions = transform(batch['prev_action'])
+        prev_rewards = transform(batch['prev_reward'])
+        actions = transform(batch['actions'].reshape(n, B, self.action_dim))
+        old_log_probs = transform(batch['old_log_probs'].reshape(n, B))
+        reward_weight = transform(batch['_reward_advantage'].reshape(n, B))
+        value_targets = transform(batch['_reward_value_targets'].reshape(n, B))
+        hidden0 = transform(batch['h0'])[0].unsqueeze(0).contiguous()
+        cell0 = transform(batch['c0'])[0].unsqueeze(0).contiguous()
+
+        means, log_stds, value_pred, _final_state = self.actor(
+            observations, prev_actions, prev_rewards, (hidden0, cell0))
+
+        # cost advantage 固定在 behavior policy：实际动作和 K 个 baseline 动作均具有
+        # rollout 的完整历史条件。不能对中间 state 调 _sample_initial_actions。
+        with torch.no_grad():
+            states = batch['states']
+            budgets = batch['budgets']
+            steps = batch['steps']
+            if '_risk_weight' not in batch:
+                state_inputs = self._aug(states, steps)
+                psi_c = self.cost_critic(state_inputs, batch['actions'])
+                psi_cdf = (psi_c >= budgets.unsqueeze(1)).float().mean(dim=1)
+
+                behavior_mean = batch['actor_mean'].reshape(n * B, self.action_dim)
+                behavior_log_std = batch['actor_log_std'].reshape(n * B, self.action_dim)
+                baseline_cdfs = []
+                for _sample_idx in range(self.num_action_samples):
+                    baseline_action = self._sample_from_params(
+                        behavior_mean, behavior_log_std)
+                    baseline_psi = self.cost_critic(state_inputs, baseline_action)
+                    baseline_cdfs.append(
+                        (baseline_psi >= budgets.unsqueeze(1)).float().mean(dim=1))
+                baseline_cdf = torch.stack(baseline_cdfs, dim=0).mean(dim=0)
+                raw_adv_c = psi_cdf - baseline_cdf
+
+                if self.advantage_norm == 'qcpo':
+                    normalized_adv_c = raw_adv_c / self.constraint_rms.std
+                else:
+                    normalized_adv_c = self._maybe_norm(raw_adv_c)
+                risk_weight_flat = batch['e'] * normalized_adv_c
+                batch['_risk_weight'] = risk_weight_flat.detach()
+                batch['_risk_advantage_raw'] = raw_adv_c.detach()
+                batch['_risk_cdf'] = psi_cdf.detach()
+            else:
+                risk_weight_flat = batch['_risk_weight']
+                raw_adv_c = batch['_risk_advantage_raw']
+                psi_cdf = batch['_risk_cdf']
+            risk_weight = transform(risk_weight_flat.reshape(n, B))
+
+        # PPO 分母始终是 rollout 时保存的 logπ_old；每个 epoch 只重算分子。
+        log_probs = self._logp_from_params(actions, means, log_stds)
+        log_ratio = log_probs - old_log_probs
+        ratio = torch.exp(log_ratio)
+        if '_first_epoch_ratio_max_error' not in batch:
+            # 首个 actor epoch 前 actor/RMS 均未改变；若 history、chunk h0 或行为
+            # probability 接错，这个误差会立刻非零，是比最终 KL 更敏感的自检。
+            batch['_first_epoch_ratio_max_error'] = float(
+                (ratio.detach() - 1.0).abs().max().item())
+        clipped_ratio = torch.clamp(
+            ratio, 1.0 - self.ppo_ratio_clip, 1.0 + self.ppo_ratio_clip)
+
+        # reward 最大化采用 pessimistic min；cost 风险要最小化，采用 conservative max。
+        reward_surr = torch.minimum(
+            ratio * reward_weight, clipped_ratio * reward_weight)
+        risk_surr = torch.maximum(
+            ratio * risk_weight, clipped_ratio * risk_weight)
+        lagrange = self.lambda_dual.detach()
+        normalizer = 1.0 + lagrange if self.sum_norm else torch.ones_like(lagrange)
+        reward_coef = normalizer.reciprocal()
+        risk_coef = lagrange / normalizer
+
+        entropy = (0.5 * (1.0 + self._log_2pi) + log_stds).sum(dim=-1).mean()
+        policy_loss = (
+            -reward_coef * reward_surr.mean()
+            + risk_coef * risk_surr.mean()
+            - self.entropy_coef * entropy)
+        value_error = value_pred - value_targets
+        value_loss = 0.5 * value_error.pow(2).mean()
+        total_loss = policy_loss + self.recurrent_value_loss_coef * value_loss
+
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        total_loss.backward()
+        if self.actor_grad_clip and self.actor_grad_clip > 0:
+            grad_norm = nn.utils.clip_grad_norm_(
+                self.actor.parameters(), self.actor_grad_clip)
+        else:
+            grad_norm = torch.zeros((), device=self.device)
+        self.actor_optimizer.step()
+        with torch.no_grad():
+            self.actor.log_std.clamp_(self.log_std_min, self.log_std_max)
+
+        # value explained variance 与 MLP 路径同定义；这里的 grad_norm 是共享骨干
+        # policy+value 联合梯度，另用 joint 键明确标注，避免误读为纯 value 梯度。
+        target_var = value_targets.var(unbiased=False)
+        explained_var = torch.where(
+            target_var > 1e-8,
+            1.0 - value_error.detach().var(unbiased=False) / target_var,
+            torch.zeros_like(target_var))
+        combined_weight = reward_coef * reward_weight - risk_coef * risk_weight
+        return {
+            'actor/loss': float(policy_loss.item()),
+            'actor/grad_norm': float(grad_norm.item()),
+            'actor/entropy': float(entropy.item()),
+            'actor/reward_coefficient': float(reward_coef.item()),
+            'actor/risk_coefficient': float(risk_coef.item()),
+            'actor/w_mean': float(combined_weight.mean().item()),
+            'actor/w_std': float(combined_weight.std(unbiased=False).item()),
+            'actor/log_std_mean': float(self.actor.log_std.detach().mean().item()),
+            'advantage/mean_adv_std': float(
+                batch['_reward_advantage_raw'].std(unbiased=False).item()),
+            'advantage/risk_adv_std': float(raw_adv_c.std(unbiased=False).item()),
+            'constraint/psi_c_mean': float(psi_cdf.mean().item()),
+            'reward_value/loss': float(value_loss.item()),
+            'reward_value/explained_variance': float(explained_var.item()),
+            'reward_value/joint_grad_norm': float(grad_norm.item()),
+            'ppo/ratio_mean': float(ratio.detach().mean().item()),
+            'ppo/ratio_std': float(ratio.detach().std(unbiased=False).item()),
+            'ppo/first_epoch_ratio_max_error': float(
+                batch['_first_epoch_ratio_max_error']),
+            'ppo/clip_fraction': float(
+                ((ratio.detach() - 1.0).abs() > self.ppo_ratio_clip).float().mean().item()),
+            'ppo/approx_kl': float(
+                ((ratio.detach() - 1.0) - log_ratio.detach()).mean().item()),
+            'debug/reward_actor_is_gae': 1.0,
+            'debug/reward_actor_is_ppo': 1.0,
+            'debug/policy_is_recurrent': 1.0,
+        }
+
     # ============================================================ Actor 更新 (reward 主干可消融) ============================================================
     def update_actor(self, batch):
         """按 reward_actor_mode 选择 distributional / GAE / GAE+PPO，cost 风险优势保持一致。"""
+        if self.recurrent_policy:
+            return self._update_recurrent_actor_value(batch)
         s, a, b = batch['states'], batch['actions'], batch['budgets']
         d, e = batch['d'], batch['e']
         steps = batch['steps']
@@ -554,7 +897,7 @@ class DQCACBetaGPU(VecAgentBase):
         if self.dual_update_mode == 'critic_adam':
             with torch.no_grad():
                 s0 = batch['s0']
-                a0 = self._sample_actions(s0)
+                a0 = self._sample_initial_actions(s0)
                 psi0 = self.cost_critic(self._aug(s0, 0), a0)  # [B,N]
                 p = float((psi0 >= self.cost_limit).float().mean(dim=1).mean().item())
             self.last_dual_prob = p
@@ -613,7 +956,8 @@ class DQCACBetaGPU(VecAgentBase):
         sf = (steps.float() / self.n).reshape(-1, 1)
         return torch.cat([states, sf], dim=1)
 
-    def _estimate_baselines(self, states, budgets, steps=None, need_reward=True):
+    def _estimate_baselines(self, states, budgets, steps=None, need_reward=True,
+                            policy_mean=None, policy_log_std=None):
         """
         用 K 个策略动作近似 V_c(s,b)，仅在 distributional reward 模式下同时近似 V_m(s)。
 
@@ -626,7 +970,14 @@ class DQCACBetaGPU(VecAgentBase):
         s_aug = self._aug(states, steps) if steps is not None else self._normalize_states(states)
         q_list, c_list = [], []
         for _ in range(self.num_action_samples):
-            a = self._sample_actions(states)
+            if self.recurrent_policy:
+                # 中间时刻的策略分布必须由 rollout 的完整历史给出；这里使用固定
+                # behavior 参数，使 cost advantage 在所有 PPO epoch 中保持一致。
+                if policy_mean is None or policy_log_std is None:
+                    raise RuntimeError("recurrent baseline requires history-conditioned policy params")
+                a = self._sample_from_params(policy_mean, policy_log_std)
+            else:
+                a = self._sample_actions(states)
             if need_reward:
                 q_list.append(self.reward_critic(s_aug, a).mean(dim=1))          # reward 均值
             c_list.append((self.cost_critic(s_aug, a) >= b_col).float().mean(dim=1))
@@ -664,7 +1015,15 @@ class DQCACBetaGPU(VecAgentBase):
             a = batch['actions']
             steps = batch['steps']
             psi_cdf = (self.cost_critic(self._aug(s, steps), a) >= b.unsqueeze(1)).float().mean(dim=1)
-            _, v_c = self._estimate_baselines(s, b, steps, need_reward=False)
+            policy_mean = (
+                batch['actor_mean'].reshape(-1, self.action_dim)
+                if self.recurrent_policy else None)
+            policy_log_std = (
+                batch['actor_log_std'].reshape(-1, self.action_dim)
+                if self.recurrent_policy else None)
+            _, v_c = self._estimate_baselines(
+                s, b, steps, need_reward=False,
+                policy_mean=policy_mean, policy_log_std=policy_log_std)
             adv_c = psi_cdf - v_c
         self._ema_update(self.constraint_rms,
                          float(adv_c.mean().item()), float(adv_c.var(unbiased=False).item()))
@@ -680,7 +1039,7 @@ class DQCACBetaGPU(VecAgentBase):
     def _initial_cdf_estimate(self, s0):
         """cost-critic 在 s0 上的 P(C≥d)/E[C]/std(C) 估计 (校准诊断)。"""
         with torch.no_grad():
-            a0 = self._sample_actions(s0)
+            a0 = self._sample_initial_actions(s0)
             psi = self.cost_critic(self._aug(s0, 0), a0)      # [B, N]
             self.last_cdf_initial = float(
                 (psi >= self.cost_limit).float().mean(dim=1).mean())      # 上尾
@@ -731,14 +1090,94 @@ class DQCACBetaGPU(VecAgentBase):
             extra['norm/return_sigma_ema'] = float(self.return_rms.std)
             extra['norm/constraint_sigma_ema'] = float(self.constraint_rms.std)
         if self.normalize_observation:
-            obs_std = self.obs_normalizer.var.detach().clamp_min(0.0).sqrt()
-            extra['obs_norm/count'] = float(self.obs_normalizer.count.item())
-            extra['obs_norm/mean_abs'] = float(self.obs_normalizer.mean.detach().abs().mean().item())
+            # recurrent actor 的 RMS 覆盖 [state, previous_cost]；MLP 使用共享 raw-state RMS。
+            obs_rms = self.actor.obs_rms if self.recurrent_policy else self.obs_normalizer
+            obs_std = obs_rms.var.detach().clamp_min(0.0).sqrt()
+            extra['obs_norm/count'] = float(obs_rms.count.item())
+            extra['obs_norm/mean_abs'] = float(obs_rms.mean.detach().abs().mean().item())
             extra['obs_norm/std_min'] = float(obs_std.min().item())
             extra['obs_norm/std_median'] = float(obs_std.median().item())
             extra['obs_norm/std_max'] = float(obs_std.max().item())
 
         self._log_core(it, R_np, Zc_np, Cu_np, extra=extra)  # 控制台两行由 _log_core 统一打
+
+    # ============================================================ 循环策略独立评估 ============================================================
+    def evaluate_vec(self, vec_env, num_episodes, gamma, cost_gamma,
+                     omega, cost_limit):
+        """用完整 previous cost/action/reward 与 hidden 评估循环 DQCAC，并校准 cost critic。"""
+        if not self.recurrent_policy:
+            raise RuntimeError("evaluate_vec is only needed for mlp_lstm DQCAC")
+
+        rounds = max(1, int(np.ceil(num_episodes / vec_env.B)))
+        rewards_all, costs_all, undisc_costs_all = [], [], []
+        initial_states, initial_actions = [], []
+        with torch.no_grad():
+            for _round_idx in range(rounds):
+                B = vec_env.B
+                state = vec_env.reset()
+                prev_cost = torch.zeros(B, 1, device=self.device)
+                prev_action = torch.zeros(B, self.action_dim, device=self.device)
+                prev_reward = torch.zeros(B, device=self.device)
+                hidden, cell = self.actor.initial_state(B, self.device)
+                reward_return = torch.zeros(B, device=self.device)
+                cost_return = torch.zeros(B, device=self.device)
+                undisc_cost = torch.zeros(B, device=self.device)
+                reward_discount, cost_discount = 1.0, 1.0
+
+                for timestep in range(vec_env.n):
+                    actor_obs = torch.cat([state, prev_cost], dim=1)
+                    means, log_stds, _value, (hidden, cell) = self.actor(
+                        actor_obs.unsqueeze(0), prev_action.unsqueeze(0),
+                        prev_reward.unsqueeze(0), (hidden, cell))
+                    action = self._sample_from_params(means[0], log_stds[0])
+                    if timestep == 0:
+                        initial_states.append(state.clone())
+                        initial_actions.append(action.clone())
+                    state, reward, cost, _done = vec_env.step(action)
+                    reward_return += reward_discount * reward
+                    cost_return += cost_discount * cost
+                    undisc_cost += cost
+                    reward_discount *= gamma
+                    cost_discount *= cost_gamma
+                    prev_cost = cost.unsqueeze(1)
+                    prev_action, prev_reward = action, reward
+
+                rewards_all.append(reward_return)
+                costs_all.append(cost_return)
+                undisc_costs_all.append(undisc_cost)
+
+            # cost critic 校准使用同一评估批真实 s0 与循环策略零历史下的 a0。
+            s0 = torch.cat(initial_states, dim=0)
+            a0 = torch.cat(initial_actions, dim=0)
+            psi0 = self.cost_critic(self._aug(s0, 0), a0)
+            cost_cdf_initial = float(
+                (psi0 >= float(cost_limit)).float().mean(dim=1).mean().item())
+            pred_cost_mean = float(psi0.mean().item())
+            pred_cost_std = float(psi0.std(dim=1).mean().item())
+
+        reward_np = torch.cat(rewards_all).cpu().numpy().astype(np.float64)
+        cost_np = torch.cat(costs_all).cpu().numpy().astype(np.float64)
+        undisc_np = torch.cat(undisc_costs_all).cpu().numpy().astype(np.float64)
+        transformed = -cost_np
+        threshold = -float(cost_limit)
+        empirical = float(np.mean(transformed <= threshold))
+        quantile = float(np.percentile(transformed, omega * 100))
+        return {
+            'mean': float(reward_np.mean()),
+            'reward_std': float(reward_np.std()),
+            'empirical_prob': empirical,
+            'quantile_return': quantile,
+            'quantile_margin_to_threshold': quantile - threshold,
+            'constraint_margin': omega - empirical,
+            'cost_disc_mean': float(cost_np.mean()),
+            'cost_undisc_mean': float(undisc_np.mean()),
+            'outage_prob': empirical,
+            'cost_quantile': float(np.percentile(cost_np, (1.0 - omega) * 100)),
+            'num_episodes': int(reward_np.shape[0]),
+            'cost_cdf_initial': cost_cdf_initial,
+            'pred_cost_mean': pred_cost_mean,
+            'pred_cost_std': pred_cost_std,
+        }
 
     # ============================================================ 总结接口 ============================================================
     def get_training_summary(self):
@@ -756,6 +1195,7 @@ class DQCACBetaGPU(VecAgentBase):
             'sum_norm': self.sum_norm,
             'beta': self.beta,
             'reward_actor_mode': self.reward_actor_mode,
+            'policy_arch': self.policy_arch,
             'actor_updates_per_episode': self.actor_updates_per_episode,
             'num_envs': self.num_envs,
             'num_iterations': self.num_iterations,

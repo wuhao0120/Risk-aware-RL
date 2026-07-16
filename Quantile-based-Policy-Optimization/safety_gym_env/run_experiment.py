@@ -182,6 +182,17 @@ def base_args(algo, seed, device, env_key):
         a.ppo_ratio_clip = 0.1
         a.reward_value_lr = 3e-4
         a.reward_value_grad_clip = 10.0
+        # 默认继续使用旧 MLP，保证历史实验可复现；mlp_lstm 显式开启 QCPO_refs
+        # 同形 actor/reward-V，分布 critic 仍保留 DQCAC 的 action-conditioned 输出。
+        a.policy_arch = 'mlp'
+        a.recurrent_hidden = [512, 512]
+        a.lstm_size = 512
+        a.lstm_skip = True
+        a.recurrent_seq_len = 100
+        a.recurrent_value_loss_coef = 1.0
+        a.learn_std = False
+        a.log_std_min = -5.0
+        a.log_std_max = 2.0
         a.dual_update_mode = 'critic_adam'              # 旧 cost-critic CDF + Adam dual（兼容默认）
         a.dual_pid_signal = 'outage'                    # empirical_pid 可选 outage / cost_quantile
         a.pid_Ki = 0.1                                  # QCPO_refs 默认仅启用积分项

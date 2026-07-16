@@ -734,3 +734,52 @@ DQCAC 理论上可能超过 QCPO_refs 的理由是：它用每个 transition 学
 该门已通过：Q-B 在 100k 后段达到 reward `0.557/+6.950`，独立 300k 后段达到 `1.317/+5.059`，130 条终评 `1.621`。它与 QCPO_refs 同预算 `1.355/+5.431` 和 DQCAC E5 终评 `1.690` 已处于同一量级，reward 主干可判为表现正常。reward-only outage `0.546` 不代表约束版本失败；lambda 此处刻意固定为 0。
 
 因此下一步进入统一 MLP+LSTM，同时保留 Q-B 作为 MLP 复现基准。完整 100k/300k 对齐 profile 位于 `_runs/profiles/qcpo_qb_vs_key_100k_2026-07-16/` 与 `_runs/profiles/qcpo_qb_vs_key_300k_2026-07-16/`。
+
+
+### 13.3 全尺寸 MLP+LSTM 的实测结论（2026-07-16）
+
+QCPO 的 QCPO_refs 等价 recurrent adapter 已完成 100k 和独立 300k reward-only 校准；两次均通过持久化后台运行并 exit code 0。
+
+- 100k：job `QCPO_DynamicButton_recur_qb_r0_qbhyper_100k_s0`，W&B `6tfy9aeo`，训练 `63.7s`。后 20% reward `0.4006`、趋势 `+5.006/百万步`，70 条终评 reward `0.3169`、outage `0.1714`。
+- 独立 300k：job `QCPO_DynamicButton_recur_qb_r0_qbhyper_300k_s0`，W&B `312u1kr3`，训练 `159.8s`。后 20% reward `1.083`、趋势 `+4.114/百万步`，70 条终评 reward `1.251`、outage `0.557`。
+- 同预算 MLP Q-B 的 100k/300k 后段 reward 为 `0.557/+6.950` 与 `1.317/+5.059`，终评为 `0.541/1.621`。因此 recurrent R0 会稳定学习，但 300k 终评比 MLP 低约 `22.8%`，尚不能说“换 LSTM 后复现旧结果”。
+- recurrent 数值健康：100k value explained variance `0.647`，PPO KL `0.00224`、clip fraction `0.119`；300k value explained variance 终点约 `0.787`，没有 NaN/Inf。失败形态是优化速度偏慢，而不是 hidden reset、old-log-prob 或 BPTT 接线错误。
+- 共同 300k 下 QCPO_refs 后段 reward `1.355/+5.431`，DQCAC E5 为 `1.662/+6.816`。QCPO_refs 在该时点 lambda 已约 `0.94`，所以 reward/outage 联合比较要等统一约束实验；本节只判定 reward 学习主干。
+
+完整对齐数据：
+
+- `_runs/profiles/qcpo_recurrent_r0_100k_2026-07-16/`
+- `_runs/profiles/qcpo_recurrent_r0_300k_2026-07-16/`
+
+由此保留而不提前合并的 QCPO recurrent 路线：
+
+- **Q-R0（已完成）**：Q-B 的 `lr=3e-4/grad_clip=1/value_coef=1` 原样换 LSTM，回答“只换网络是否自动变好”；答案是否定的。
+- **Q-R1（参考优化器）**：改用 QCPO_refs 的 `lr=1e-4/clip_grad=1e4`，其余不变；隔离大共享网络是否被过强 clipping 或偏高学习率限制。
+- **Q-R2（共享 loss 比例）**：`value_coef∈{0.25,0.5,1}`，记录 policy/value 各自梯度或 PCGrad/分离 head 作为后续选项；检验共享 value loss 是否压慢 actor representation。
+- **Q-R3（容量控制）**：`256×256+LSTM256` 与 `512×512+LSTM512` 在相同预算下比较；若小网络更快，只说明优化/容量问题，正式结构公平表仍保留 512 版本。
+- **Q-R4（长期回退）**：保留 512×512 MLP Q-B 作为强控制组。若 recurrent 在多个环境不占优，不因“参考算法用了 LSTM”而强行把它设为默认。
+
+前半段门控：Q-R1/R2/R3 各先 100k；若后段 reward/斜率不能超过 R0 的 `0.401/+5.01`，不扩 300k。只有至少接近 MLP 的 `0.557/+6.95` 才扩大预算。
+
+### 13.4 DQCACBeta 的 MLP+LSTM 接入设计与当前状态（2026-07-16）
+
+已实现默认关闭的 `policy_arch=mlp|mlp_lstm`。默认仍为 MLP，保证 E1–E10 可复现。首条 D-R0 路线的边界是：
+
+- actor 与 reward-V 使用和 QCPO_refs 数值对拍过的 `[obs,prev_cost]→MLP512→[prev_action,prev_reward]→LSTM512+skip` 共享骨干；
+- PPO rollout 保存固定 `old_log_prob`、每步进入前 `h0/c0`、previous action/reward/cost 和 rollout value；按 seq=100 做 BPTT，value 与 policy 联合 backward；
+- reward/cost distributional critics 暂时保持 DQCAC 的 action-conditioned `Z(h_t,a_t)` 的 Markov 近似输入 `(state,t/T,a)`。这不是把 QCPO_refs 的 state-value cost head硬套进 DQC；
+- N-step bootstrap 的动作取同一 on-policy rollout 在完整历史下保存的 `a_{t+N}`，包括单独生成但不执行的 `a_T`。不能在中间 state 用零 hidden 重采；
+- cost baseline 的 K 个动作从该时刻 rollout 保存的历史条件行为高斯参数采样；risk advantage 在首个 actor epoch 固定，和 old-log-prob/GAE target 一起跨 epoch 冻结；
+- actor 的 augmented-observation RMS 在所有 PPO epochs 后才合并；critic 继续使用独立 raw-state RMS；循环独立评估器会逐 episode 重置历史并保留 cost-critic CDF 校准输出。
+
+持久化小网络 smoke `DQCAC_DynamicButton_smoke_recurrent_dr0_s0` 使用 `B=2,T=32,N=8,[32,32]+LSTM32,seq=16`，2 个 critic/actor epochs，训练 `4.7s`、exit code 0；rollout、on-policy bootstrap、联合 BPTT、RMS、dual 初始动作和独立评估全链路通过。旧 MLP 回归 smoke `DQCAC_DynamicButton_smoke_mlp_regression_after_recurrent_s0` 训练 `4.5s`、exit code 0，确认默认构造、GAE/PPO、critic 和统一评估未被循环分支破坏。另记录 `ppo/first_epoch_ratio_max_error`：首个循环 actor epoch 前 actor/RMS 尚未变化，ratio 应严格接近 1，可直接检测 history/chunk h0/old probability 接线错误。
+
+DQC 的网络分歧继续保留为显式消融：
+
+- **D-R0（当前、最低风险）**：recurrent actor/reward-V + 原 action-conditioned MLP distribution critics。Safety-Gym 原始 state 在 Markov 假设下足以预测 future cost，历史主要用于策略；先回答结构公平是否改善 reward。
+- **D-R1（历史 cost critic）**：给 cost critic 独立 recurrent history encoder，再接 action-conditioned quantile head；online/target encoder 都按历史 unroll，显式处理 target hidden。它回答 partial observability/历史 cost 是否改善查询 CDF。
+- **D-R2（full-shared hybrid）**：actor、V、reward/cost critic 共享 recurrent encoder，target 保留独立副本；样本效率可能更高，但 critic 梯度直接改变 policy representation，必须单列为新算法。
+- **D-R3（explicit-budget fair）**：三个算法策略都额外输入 `t/T、累计 cost、remaining budget`；DQC 不独占 budget 信息。与 QCPO_refs 原输入的 history-fair 口径分开报告。
+- **D-RC（MLP 公平控制）**：三算法均使用 512×512 MLP、可学习 sigma、相同显式历史统计；用于区分 recurrence 与容量/归一化贡献。
+
+下一门是 D-R0 reward-only 100k、seed 0，复用 E5 的 `GAE+PPO8+obs RMS` 并固定 lambda=0。预计训练约 `70–100s`，加 70 轨迹评估约 `2–3min`。通过条件：后段 reward 与 slope 至少形成 E5 同方向增长，PPO ratio/KL、联合 value EV、critic loss 无异常；明显低于 E5 前段时不直接扩全预算，而先在 Q-R1/R2 类型的循环优化超参中做轻量分支。
