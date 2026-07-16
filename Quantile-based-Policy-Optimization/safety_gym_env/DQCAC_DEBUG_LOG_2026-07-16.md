@@ -788,3 +788,15 @@
 - 工程门：两条actor/真实reward-cost逐点相同，无NaN/OOM，aux cost总尺度与grad clipping不能显著恶化。
 - 算法门：相对新基线，独立评估CDF absolute bias或mean-cost relative error至少改善25%；同时最后三批prequential CDF error或Brier至少改善20%，否则只能说明同批记忆，不能晋级闭环。
 - 若C-S0A通过，先做replay=4的同预算正交门，再把胜者放回B20/PID跑300k；若失败停止coef小网格，转独立holdout early stopping或显式ensemble/uncertainty，而不是扫`.1/.25/.5/1`碰运气。
+
+
+### E55：C-S0A结果与训练预算判定——局部机制100k已足够，策略性能不能据此下结论（2026-07-16）
+
+- 三条持久化后台run均正常exit 0：baseline/replay1/replay4的W&B分别为`j6cd5p1c/5lpevd9t/uyjull0z`，纯训练耗时`45.9/46.5/46.6s`。配置、seed和100k数据预算完全相同，只改变`cost_s0_aux_coef/replay_batches=0/1、.25/1、.25/4`。
+- 固定`lambda_max=0`后，三条最终真实policy评估逐位相同：140条reward `0.19234±0.17293`、outage `0.05`、mean cost `3.51429`、Q80 cost `6.2`。baseline与replay1 checkpoint的obs RMS、actor、reward critic/target、lambda及全部runtime状态逐tensor exact，只有cost critic/target的6个参数张量变化。这排除了初始化、策略采样和actor更新差异。
+- baseline/replay1/replay4的最终hard CDF分别为`0.01473/0.01629/0.01183`，相对真实`0.05`的absolute error为`0.03527/0.03371/0.03817`。replay1仅改善`4.43%`，replay4反而恶化`8.23%`，均未达到预注册`25%`门。
+- 最终predicted mean cost为`2.1851/2.2838/2.0512`，相对真实`3.5143`的relative error约`37.82%/35.01%/41.63%`；replay1只改善约`7.4%`，replay4恶化约`10.1%`。
+- 最后三批60k/80k/100k的prequential pre-CDF absolute error三者完全相同，均值`0.017708`；pre-Brier baseline/replay1/replay4为`0.016732/0.016699/0.016699`，改善不足`0.2%`。同批更新后的post-Brier为`0.017611/0.015462/0.017171`，replay1改善约`12.2%`、replay4约`2.5%`，仍低于`20%`门。辅助项主要改变见过数据的拟合，没有改善下一批泛化。
+- 结论：停止recent-s0 replay的coef/replay小网格，不把它放入PID闭环跑1M。100k在这里不是用来评价最终策略，而是固定策略下提供5批独立数据刷新和100次cost-critic更新，直接检验该局部作用链；继续长跑缺乏晋级证据。
+- 对“短跑会不会误杀慢热组合”的统一规则：100k只否决确定性bug或可直接观测且不过门的局部机制；策略/dual/LSTM组合不能据此作长期结论，至少给300k趋势窗，仍在改善则续到600k/1M。P-M1的520条复评`0.776/0.248→0.814/0.225→0.632/0.244`已经证明中期可改善、后期又回退；因此候选看多个checkpoint而非单个终点，最终至少3 seeds，并与QCPO_refs对齐相同环境步数。
+- 完整history与对齐图：`_runs/wandb_export/dqc_cs0_baseline_r1_r4_100k_2026-07-16/`、`_runs/profiles/dqc_cs0_baseline_r1_r4_100k_2026-07-16/`。

@@ -1266,3 +1266,14 @@ K16在300–600k有真实的阶段性收益：K4→K16使训练outage `0.237→0
 第一门固定P-M3的B20/N32/MC/time-weight/recurrent配置并令lambda最大值为0，比较aux关闭与`c=.25,replay=1`，各100k。由于cost critic不能影响actor，两条真实policy/reward/cost应逐点相同；差异只允许来自cost critic。
 
 通过条件不是post同批loss下降，而是独立140条终评的CDF bias或mean error至少改善25%，且最后三批prequential CDF error或Brier至少改善20%。replay=1通过或只改善post时，再单独测试replay=4；失败则停止coef网格。每条预计含评估约1.5～2分钟，全部持久化后台串行运行。
+
+
+### 13.44 C-S0A结论：短预算是否足够取决于要回答的问题（2026-07-16）
+
+三条100k固定策略实验只改变recent-s0辅助监督。baseline、replay1和replay4训练均约46秒；真实140条评估完全相同，reward/outage/mean-cost为`0.19234/0.05/3.51429`。baseline与replay1的actor、RMS、reward critic/target、lambda和runtime又逐tensor完全一致，所以比较没有被初始化或策略轨迹差异污染。
+
+最终CDF absolute error依次为`0.03527/0.03371/0.03817`，replay1只改善`4.43%`，replay4恶化`8.23%`。最终mean-cost relative error约为`37.82%/35.01%/41.63%`。最后三批更新前prequential CDF error三者完全相同；replay1只把更新后的同批Brier改善约`12.2%`，没有达到独立泛化门。这说明简单增加recent-s0重复权重更像记忆当前布局，不是当前critic低估的主修复，因此停止coef/replay网格。
+
+这不能推广成“100k足以评价所有算法组合”。本实验在100k内已有5个新rollout批次和100个cost-critic optimizer steps，且被测变量的直接输出就是holdout calibration，所以足以否决这项局部机制。相反，actor、PID、LSTM和distributional critic构成慢闭环；P-M1从300k到600k确实由`reward/outage=0.776/0.248`改善到`0.814/0.225`，随后1M又退到`0.632/0.244`。这既证明早期false negative真实存在，也证明盲目延长不能保证最终变好。
+
+后续执行分层预算：100k只做bug、尺度和局部因果screen；策略组合至少300k，若末段仍有方向性改善则续到600k/1M；若多个checkpoint重复极限环或独立holdout不过门才停止；主候选至少3 seeds，最终与QCPO_refs同环境步数比较。140条评估只screen，边界候选用至少520条确认。完整数据和图保存在`_runs/wandb_export/dqc_cs0_baseline_r1_r4_100k_2026-07-16/`与`_runs/profiles/dqc_cs0_baseline_r1_r4_100k_2026-07-16/`。
