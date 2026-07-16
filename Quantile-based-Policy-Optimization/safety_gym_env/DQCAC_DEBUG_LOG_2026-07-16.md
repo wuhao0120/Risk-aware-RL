@@ -178,9 +178,21 @@
 
 ### E8：有限时域 β=1.0 诊断
 
-- 状态：待启动；只把 E7 的 `beta=0.99` 改为 `1.0`。
+- 状态：已完成（exit code 0）；只把 E7 的 `beta=0.99` 改为 `1.0`。
+- job：`DQCAC_DynamicButton_dbg_e8_beta100_empiricalpid_300k_s0`；W&B run id：`o23rzgg8`；启动 commit：`0ad877e`。
 - 目的：在有限 T=1000 下去掉 Abel 偏差，测试现有 risk advantage 的控制上限；这不是建议无限时域使用 β=1。
-- 判据：若 outage 接近 0.2 且 reward 可接受，后续在 `0.99~1.0` 细调；若仍明显违规，则停止调 β，转向平滑 CDF/局部 quantile 或 IQN。
+- 实际训练耗时 `142.0s`；评估 reward `0.1355`、outage `0.000`、λ `0.113`。
+- 30 万步 profile：late reward `0.238`、slope `+1.351/百万步`、outage `0.0167`、λ `0.1375`；与 E7 的 `1.182/+5.005/0.433` 相比，已经跨过风险—收益最优区间并过度保守。
+- 控制动态：训练 reward 在 190k 达 `1.185`，随后 outage 先降而 100 条窗口仍使 λ 上升，reward 到 290k 回落至 `0.174`；这是 PID 窗口滞后与 β=1 强风险梯度共同造成的过度校正。
+- 数值健康：late PPO clip `0.122`、approx KL `0.00227`，仍无 NaN/Inf；critic CDF `0.062` 对 truth `0`，此时方向转为轻微高估。
+- 结论：risk critic/advantage 有能力控制约束，问题不是风险梯度无效；`β=1` 不作为最终配置，工作点位于 `0.99~1.0`。
+- 最终导出：`_runs/wandb_export/final_e8_dynamicbutton_2026-07-16/`；profile：`_runs/profiles/final_e8_dynamicbutton_2026-07-16/`。
+
+### E9：β=0.995 中间工作点
+
+- 状态：待启动；只把 E7 的 `beta=0.99` 改为 `0.995`，其余保持不变。
+- 覆盖解释：`β=0.995` 的 90% 累计 risk 权重约覆盖前 459 步，介于 E7 的 229 步和 E8 的整段等权之间。
+- 判据：优先看独立评估是否接近 outage `0.2`，其次比较 reward；若仍过冲，再调 PID window/Ki，而不是继续盲目细分 β。
 
 ## 4. 分阶段改进路线
 
