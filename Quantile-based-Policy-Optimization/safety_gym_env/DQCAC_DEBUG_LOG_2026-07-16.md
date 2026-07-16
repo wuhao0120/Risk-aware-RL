@@ -190,9 +190,31 @@
 
 ### E9：β=0.995 中间工作点
 
-- 状态：待启动；只把 E7 的 `beta=0.99` 改为 `0.995`，其余保持不变。
+- seed 0 状态：已完成（exit code 0）；只把 E7 的 `beta=0.99` 改为 `0.995`，其余保持不变。job 为 `DQCAC_DynamicButton_dbg_e9_beta0995_empiricalpid_300k_s0`，W&B run id 为 `nyypklpy`，启动 commit 为 `f282b48`。
 - 覆盖解释：`β=0.995` 的 90% 累计 risk 权重约覆盖前 459 步，介于 E7 的 229 步和 E8 的整段等权之间。
-- 判据：优先看独立评估是否接近 outage `0.2`，其次比较 reward；若仍过冲，再调 PID window/Ki，而不是继续盲目细分 β。
+- 实际训练耗时 `143.8s`；独立评估 70 条轨迹得到 reward `0.6576`、outage `0.200`、cost-return 0.8 quantile `14.2`、λ `0.357`，在 seed 0 上恰好达到 `ω=0.2`。
+- cost critic 查询 CDF 为 `0.211`，相对经验 truth `0.200` 只偏高 `0.011`；reward value explained variance 为 `0.841`。因此这个工作点的主要不确定性已经不是“查询处 critic 严重失准”，而是短预算与单 seed 的策略/约束方差。
+- 终点 PPO ratio std `0.0638`、clip fraction `0.1108`、approx KL `0.00202`，无 NaN/Inf；importance ratio 与 clip 工作在合理量级。
+- 30 万步训练最后 20% 窗口 reward `0.9967`、slope `+4.432/百万步`、outage `0.400`、λ `0.294`。训练窗口与独立终评存在明显差异，不能只凭 seed 0 的 `0.200` 宣称稳定可行。
+- 完整导出：`_runs/wandb_export/final_e9_dynamicbutton_2026-07-16/`；同 30 万步 profile：`_runs/profiles/final_e9_dynamicbutton_2026-07-16/`。
+- seed 1/2 均通过持久化后台正常完成，训练耗时分别 `201.1s/193.4s`；W&B run id 为 `tuo3ehve/uq7crzsu`。并行共享 GPU 使单 run 比 seed 0 慢，但总墙钟约 4 分钟。
+- 三 seed 终评（每 seed 70 条、共 210 条）：reward `0.889±0.229`、outage `0.262±0.054`、cost 0.8 quantile `17.2±2.69`、λ 均值 `0.317`；这里 `±` 是跨 seed 样本标准差。seed 0/1/2 outage 分别为 `0.200/0.286/0.300`，E9 尚不能判为多 seed 可行。
+- critic CDF 三 seed 为 `0.211/0.244/0.218`，平均 `0.224`；相对各自经验 outage 的偏差为 `+0.011/-0.042/-0.082`，平均低估 `0.0375`。critic 查询精度已进入约 0.04 量级但仍有 seed 相关偏差，暂不足以取代经验 dual。
+- 三 seed 的训练后 20% reward 为 `0.997/1.268/1.174`，outage 为 `0.400/0.400/0.417`；同 30 万步 QCPO_refs seed 0 为 `1.355/0.517`。DQCAC 已不再“reward 不涨”，且更早施加风险控制，但当前控制仍有滞后。
+- 多 seed 导出：`_runs/wandb_export/final_e9_multiseed_dynamicbutton_2026-07-16/`；profile：`_runs/profiles/final_e9_multiseed_dynamicbutton_2026-07-16/`。
+- 决策：不把 E9 直接扩至 500 万步，也不继续盲目细分 β。先验证 QCPO_refs 原式的 cost-quantile PID；由于 E9 查询处 CDF 平均偏差已约 0.04，局部 quantile 加密/IQN 的优先级低于 dual 响应与多 seed 验证。
+
+### E10：QCPO_refs 风格 cost-quantile PID
+
+- 状态：已完成（exit code 0）；job 为 `DQCAC_DynamicButton_dbg_e10_quantilepid_beta0995_300k_s0`，W&B run id 为 `kivy3xs4`。
+- 只把 E9 的 `dual_pid_signal=outage` 改为 `cost_quantile`，并令 `pid_cost_scale=10`；其余 β、Ki、窗口、reward/PPO/obs-norm 和预算不变。
+- 更新式为 `I←clip(I+0.1·(Q_0.8(C)-15)/10)`，逐式对应 QCPO_refs 的最近 100 条轨迹 quantile PID。它不仅判断是否超限，还利用超限严重度。
+- 训练耗时 `142.4s`；独立评估 reward `-0.1749`、outage `0`、mean cost `0.057`、λ 终点 `0.880`。它满足约束但完全丢失任务性能，未通过短预算门。
+- 训练后 20% reward `-0.0937`、slope `-0.5105/百万步`、outage `0`、λ `1.088`；数值无 NaN/Inf，失败来自控制过强而非数值崩溃。
+- 控制动态给出直接证据：190k 时 reward/outage/λ 为 `0.871/0.20/0.34`；250k 时变为 `0.364/0/1.16`；290k 时为 `-0.379/0/1.01`。约束已经安全后，积分状态仍长期维持高惩罚，形成 windup/滞后。
+- critic CDF `0.0549` 对 truth `0`，此时略高估，但它不是 dual 输入；因此不能把 E10 的过保守归咎于 critic CDF。
+- 完整导出：`_runs/wandb_export/final_e10_dynamicbutton_2026-07-16/`；profile：`_runs/profiles/final_e10_dynamicbutton_2026-07-16/`。
+- 结论：不能把 QCPO_refs 的 quantile-PID 原参数机械移植到 DQCAC。DQC risk advantage 与 β=0.995 的控制增益更强；下一步若继续 PID，应优先使用更小 quantile `Ki`、leaky-I/anti-windup 或基于 outage 的 PI/PID，而不是为 E10 扩预算/seed。
 
 ## 4. 分阶段改进路线
 
