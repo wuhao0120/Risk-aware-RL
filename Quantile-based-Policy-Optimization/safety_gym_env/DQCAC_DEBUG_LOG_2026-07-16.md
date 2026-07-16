@@ -151,13 +151,25 @@
 
 ### E6：恢复经验 PID dual 与 sum normalization
 
-- 状态：实现与验证已完成，待启动短预算训练；只恢复约束，不改 E5 的 reward 主干、网络、观测归一化或 std。
+- 状态：已完成（exit code 0）；只恢复约束，不改 E5 的 reward 主干、网络、观测归一化或 std。
+- job：`DQCAC_DynamicButton_dbg_e6_empiricalpid_sum_norm_300k_s0`；W&B run id：`43ftc79n`；启动 commit：`e6b443c`。
 - 必修一致性：同一 rollout 的 cost advantage 必须在 PPO epochs 之前冻结；不能一边更新 cost critic，一边让 8 个 actor epoch 使用不断移动的 risk advantage。
 - dual 输入优先使用 rollout/最近窗口的经验 outage 或 `(1-ω)` cost quantile；当前 cost critic CDF 仍有 `-0.101` 偏差，只作为校准指标，不直接全权驱动 λ。
 - 采用 QCPO_refs 风格积分 PID 与 `(J_r+λJ_c)/(1+λ)`；分别记录经验 gap、cost quantile gap、积分状态、effective reward/risk coefficient 与 CDF calibration error。
 - 实现保持旧 `critic_adam`/无 sum-norm 为默认；实验开关使用最近 100 条轨迹 outage。risk advantage 在首个 actor epoch 计算后缓存，后续 7 个 epoch 不再随 critic 移动。
 - 验证：outage/quantile 两种 PID 确定性单测均与手算完全一致；持久化后台烟测 exit 0，强制正误差时 λ 按 `0→0.08→0.16` 增长，并覆盖 observation warmup、两轮 PPO 和 sum normalization；另一次旧 `critic_adam + distributional` 默认路径回归烟测也 exit 0。
-- 预算先 30 万步，预计约 3 分钟；若前 150k reward 已坍塌且 outage 没有向 0.2 收敛，则早停调 Ki/尺度，不浪费全量预算。
+- 实际训练耗时 `142.7s`；评估 70 条轨迹 mean reward `1.640`、outage `0.600`，λ 终点 `0.374`。
+- 30 万步 profile：late reward `1.499`、slope `+6.450/百万步`、empirical outage `0.550`；reward 仍高于 QCPO_refs 同预算的 `1.355`，但约束没有向 `0.2` 收敛。
+- PID 确实生效：late window outage `0.528`、λ `0.287`、effective risk coefficient `0.221`；终点分别为 `0.570/0.374/0.272`。失败不是 λ 不更新，而是 risk gradient 控制力不足。
+- PPO/拟合健康：late clip fraction `0.0274`、approx KL `0.00072`、reward value explained variance `0.662`，无 NaN/Inf。
+- 约束根因：late raw risk advantage std 仅 `0.0137`；cost critic CDF 评估为 `0.307` 对真实 `0.600`，偏差扩大到 `-0.293`。此外 `β=0.95` 使 90% 累计 risk 权重落在前 45 步，与 T=1000 未折扣整段 cost 不匹配。
+- 最终导出：`_runs/wandb_export/final_e6_dynamicbutton_2026-07-16/`；profile：`_runs/profiles/final_e6_dynamicbutton_2026-07-16/`。
+
+### E7：只提高 Abel risk discount 到 β=0.99
+
+- 状态：待启动；完全复用 E6，只把 `beta=0.95` 改为 `0.99`。
+- 算法依据：β 是无限期 Abel 可和性带来的偏差—方差旋钮，β→1 恢复精确约束梯度；本实验是有限 T=1000，`0.99` 将 90% 累计权重覆盖从前 45 步扩到前 229 步，同时比直接 `β=1` 更保守。
+- 预算 30 万步、约 3 分钟；150k 检查 outage 是否较 E6 同点下降。若改善，再决定是否测 `β=1`；若无改善，转向 CDF 平滑/局部 quantile 精度而非继续加 λ。
 
 ## 4. 分阶段改进路线
 
