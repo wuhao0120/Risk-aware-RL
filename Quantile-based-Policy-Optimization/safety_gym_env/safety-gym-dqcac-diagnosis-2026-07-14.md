@@ -1135,3 +1135,19 @@ C-W4（W&B `5lfdb3hn`）训练 `157.9s`、exit code 0。后60k reward/outage/lam
 写盘用同目录临时文件加原子replace。`--eval_only`从checkpoint自动重建algo/env/seed/网络，strict加载所有Module，并允许只覆盖num_envs等评估参数。持久化400-step smoke训练6.1秒，生成两个pre-update和一个final；两个独立恢复job均exit0。step400的pre/post actor hash分别为 `5a39d09395733a38/fa4f4d591309a5b5`，JSON也正确保存phase/env_steps。
 
 下一条C-E2复跑C-W4并每20k保存，共15个评估快照。先用便宜rollout门筛选，再对少量快照做512条同协议复评。若pre-update候选确实安全，说明策略空间中已有优于旧E9/QCPOrefs匹配预算的点；若下一次PPO立刻失效，则后续必须用lambda floor/hysteresis、safety setpoint或update-level安全回退稳定闭环，不能把best checkpoint当成算法已经稳定。
+
+### 13.28 C-E2：大样本复评否定“末轮安全”，但找到接近可行的180k策略（2026-07-16）
+
+C-E2（W&B `4dd8zrqf`）逐点复现C-W4并保存15个pre-update快照加final，总计168MB。300k快照在训练B=10上是 `reward/outage=1.218/0.10`，但140条独立复评为 `1.219/0.471`；critic CDF/mean仅 `0.079/5.889`，truth为 `0.471/17.286`。这证明最后PPO相位错位之外，小批rollout选择偏差和critic跨初始状态泛化同样严重。
+
+控制最强的180k快照在140条上为 `0.746/0.264`，扩到520条后为 reward `0.7148`、outage `123/520=0.2365`、Q80 cost `16`。Wilson 95%区间约 `[0.202,0.275]`；它接近但没有通过预注册0.22门。critic CDF `0.316`相对truth偏保守，说明这一步主要需要稳定controller，不是继续抬高critic风险估计。
+
+阶段结论：checkpoint揭示策略空间中已有reward约0.715的近可行点，但算法不能稳定停在该区域；best-checkpoint不能替代稳定训练。其余低lambda快照停止评估，避免把B=10的偶然低outage继续放大。
+
+### 13.29 P-M1：真实alpha不变的PID safety setpoint（2026-07-16）
+
+代码新增默认兼容的 `pid_target_prob`。None等于真实alpha=.2，手算输出逐位exact；显式.15只让empirical PID使用 `window_prob-.15`，而日志真实gap、critic查询阈值和最终约束仍使用.2。新增control gap/target/safety-margin日志，避免语义混淆。
+
+合成例中window outage=.3、pid_i=.1时，target=.2输出lambda `.1850000024`，target=.15输出`.2399999946`；两者真实gap都为.1。持久化400-step smoke训练6.1秒、exit0。
+
+P-M1相对C-W4只设target=.15，并继续每20k保存phase-aligned快照。300k seed0门为130条reward>0.658且outage≤0.22，通过后扩520条。若过保守测试target=.175或较小Kp；若仍不安全测试target=.10或lambda floor/hysteresis。T1.5、自适应bandwidth与显式risk gain仍作为独立actor路线，不混入本run。

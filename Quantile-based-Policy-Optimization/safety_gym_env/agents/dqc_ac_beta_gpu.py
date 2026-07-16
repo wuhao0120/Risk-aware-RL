@@ -287,6 +287,13 @@ class DQCACBetaGPU(VecAgentBase):
         self.dual_pid_signal = str(getattr(args, 'dual_pid_signal', 'outage')).lower()
         if self.dual_pid_signal not in {'outage', 'cost_quantile'}:
             raise ValueError("dual_pid_signal must be 'outage' or 'cost_quantile'")
+        # 控制器可瞄准比真实 alpha 更保守的概率，吸收 window 估计误差和一次
+        # PPO update 的闭环相位滞后。None 精确退化为旧 window_prob-q_alpha。
+        raw_pid_target = getattr(args, 'pid_target_prob', None)
+        self.pid_target_prob = (
+            self.q_alpha if raw_pid_target is None else float(raw_pid_target))
+        if not 0.0 <= self.pid_target_prob <= self.q_alpha:
+            raise ValueError("pid_target_prob must lie in [0, q_alpha]")
         self.pid_Ki = float(getattr(args, 'pid_Ki', 0.1))
         self.pid_Kp = float(getattr(args, 'pid_Kp', 0.0))
         if self.pid_Kp < 0.0:
@@ -429,7 +436,8 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_dual_raw_prob = 0.0                          # 当前 rollout 的经验 outage
         self.last_dual_window_prob = 0.0                       # 最近窗口经验 outage
         self.last_dual_cost_quantile = float(self.cost_limit)  # 窗口 Q_(1-ω)(C)
-        self.last_dual_prob_gap = 0.0                          # window outage - ω
+        self.last_dual_prob_gap = 0.0                          # window outage - 真实 ω
+        self.last_dual_control_prob_gap = 0.0                  # window outage - PID safety setpoint
         self.last_dual_quantile_gap = 0.0                      # Q_(1-ω)(C) - d
         self.last_dual_control_error = 0.0                     # deadband 前的原始控制误差
         self.last_dual_filtered_error = 0.0                    # deadband 后实际积分误差
@@ -456,7 +464,8 @@ class DQCACBetaGPU(VecAgentBase):
               f"qr_target={self.quantile_target_reduction}/ref{self.quantile_loss_reference_samples}, "
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
               f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
-              f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}, "
+              f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}"
+              f"/target{self.pid_target_prob:g}, "
               f"sum_norm={self.sum_norm}, "
               f"device={self.device}")
 
@@ -1614,6 +1623,8 @@ class DQCACBetaGPU(VecAgentBase):
                         psi0, self.cost_limit, mode='hard').mean().item())
             self.last_dual_prob = p
             self.last_dual_prob_gap = p - self.q_alpha
+            # critic_adam 不是 empirical PID，继续严格优化真实 alpha，不应用 safety setpoint。
+            self.last_dual_control_prob_gap = self.last_dual_prob_gap
             self.last_dual_control_error = self.last_dual_prob_gap
 
             gap = torch.tensor(
@@ -1639,11 +1650,14 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_dual_raw_prob = raw_prob
         self.last_dual_window_prob = window_prob
         self.last_dual_cost_quantile = cost_quantile
+        # prob_gap 始终报告真实约束违反；control_prob_gap 才使用保守 setpoint。
+        # 默认 target=q_alpha 时两者逐位相同，所有历史配置保持不变。
         self.last_dual_prob_gap = window_prob - self.q_alpha
+        self.last_dual_control_prob_gap = window_prob - self.pid_target_prob
         self.last_dual_quantile_gap = cost_quantile - self.cost_limit
 
         if self.dual_pid_signal == 'outage':
-            control_error = self.last_dual_prob_gap
+            control_error = self.last_dual_control_prob_gap
         else:
             if self.pid_cost_scale <= 0:
                 raise ValueError("pid_cost_scale must be positive for cost_quantile PID")
@@ -1886,6 +1900,9 @@ class DQCACBetaGPU(VecAgentBase):
             'dual/window_empirical_prob': self.last_dual_window_prob,
             'dual/window_cost_quantile': self.last_dual_cost_quantile,
             'dual/prob_gap': self.last_dual_prob_gap,
+            'dual/control_prob_gap': self.last_dual_control_prob_gap,
+            'dual/pid_target_prob': self.pid_target_prob,
+            'dual/pid_safety_margin': self.q_alpha - self.pid_target_prob,
             'dual/quantile_gap': self.last_dual_quantile_gap,
             'dual/control_error': self.last_dual_control_error,
             'dual/filtered_error': self.last_dual_filtered_error,
@@ -2042,6 +2059,8 @@ class DQCACBetaGPU(VecAgentBase):
             'dual_prob': self.last_dual_prob,
             'dual_update_mode': self.dual_update_mode,
             'dual_pid_signal': self.dual_pid_signal,
+            'pid_target_prob': self.pid_target_prob,
+            'pid_safety_margin': self.q_alpha - self.pid_target_prob,
             'pid_i': self.pid_i,
             'dual_cost_quantile': self.last_dual_cost_quantile,
             'sum_norm': self.sum_norm,

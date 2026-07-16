@@ -156,7 +156,8 @@ class VecAgentBase(object):
         runtime_names = (
             'learning_steps', 'pid_i', 'last_empirical_prob', 'last_outage_prob',
             'last_dual_prob', 'last_dual_raw_prob', 'last_dual_window_prob',
-            'last_dual_cost_quantile', 'last_dual_prob_gap', 'last_dual_quantile_gap',
+            'last_dual_cost_quantile', 'last_dual_prob_gap',
+            'last_dual_control_prob_gap', 'last_dual_quantile_gap',
             'last_dual_control_error', 'last_dual_filtered_error',
             'last_pid_episode_scale', 'last_pid_effective_leak', 'last_pid_delta',
             'last_pid_actual_delta', 'last_pid_proportional', 'last_pid_output',

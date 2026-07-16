@@ -631,3 +631,21 @@
 - 持久化 smoke `dqc_checkpoint_eval_smoke_train_20260716`：2×2×100=400 env steps，训练 `6.1s`、exit 0；生成step200/400两个pre-update和一个post-update final，各326KB。两个独立eval-only job均严格加载、评估、写JSON并回收worker，exit 0。
 - step400 pre/post actor SHA256前16位分别为 `5a39d09395733a38` 与 `fa4f4d591309a5b5`，证明phase确实保存不同策略而非重复文件。JSON正确记录`checkpoint_loaded/phase/env_steps`。
 - 下一验证 C-E2：复跑 C-W4 且每20k保存一次，先用 rollout 指标筛选 2～3 个快照，再用统一512条评估确认是否存在 reward>0.658 且outage≤0.22 的真实策略。预计训练约160秒；15个快照的空间在 /vepfs 项目盘，不使用20G根目录。若只有pre-update安全而下一次update立即失效，则主修正应是lambda hysteresis/floor或安全setpoint，不是best-checkpoint掩盖训练不稳定。
+
+### E39：C-E2 phase-aligned 快照复评——B=10 rollout 不能替代独立大样本约束判断（2026-07-16）
+
+- C-E2 job `DQCAC_DynamicButton_cw4_timew995_pi_kp1_w50_smoothT1_ckpt20k_300k_s0`（W&B `4dd8zrqf`）从 commit `ad965d7` 启动，训练 `158.3s`、exit 0。它逐点复现 C-W4 的30个 reward/outage/PPO记录，证明保存checkpoint不改变RNG或训练行为。
+- 每20k保存一次，共15个pre-update快照和1个post-update final，总计168MB、每个约11MB。便宜门筛出140k/180k/260k/280k/300k五个点，但只对信息量最高的300k和控制最强的180k做独立评估。
+- 300k pre-update在训练B=10上是 `reward=1.218,outage=0.10`；140条独立评估却是 `1.219/0.471`，critic CDF/mean为 `0.0790/5.889`，truth outage/mean cost为 `0.471/17.286`。因此即使排除最后PPO相位，10条轨迹仍造成严重选择偏差和critic泛化错觉。
+- 180k快照保存时lambda `0.1473`、B=10为 `reward=0.836,outage=0.10`。140条复评为 `0.746/0.264`；扩到520条后为 reward `0.7148`、outage `123/520=0.2365`、Q80 cost `16`、mean cost `10.742`。critic CDF `0.3162`偏保守约0.080，pred mean `12.270`。
+- 520条outage的Wilson 95%区间约 `[0.202,0.275]`。它接近真实alpha=0.2且reward超过E9的0.658，但点估计仍高于预注册 `≤0.22` 门，不能宣布可行。其余更弱控制快照不再评估。
+- 结论：策略空间中已经出现接近可行、reward约0.715的点，但训练闭环没有稳定停留；checkpoint只揭示问题，不能作为掩盖不稳定的最终算法trick。
+
+### E40：P-M1 PID safety setpoint 实现与正式实验计划
+
+- 新增 `pid_target_prob`，默认None即`target=q_alpha`，旧控制式逐位不变。显式0.15时仅把empirical PID control gap改为`window_prob-0.15`；真实约束gap、critic阈值、最终评估仍严格使用alpha=0.2。
+- 日志分离 `dual/prob_gap=window_prob-0.2` 与 `dual/control_prob_gap=window_prob-target`，并记录target/safety margin。这样不会把保守设点误报成论文约束改变。
+- 手算测试：同一window outage=0.3、旧pid_i=.1时，默认/显式target=.2都精确输出lambda `.1850000024`；target=.15输出`.2399999946`，真实gap仍0.1、control gap为0.15。语法和diff check通过。
+- 持久化 `dqc_pid_target015_smoke_20260716`：400 env steps，训练6.1s、完整评估exit0；启动摘要正确显示`target0.15`。
+- P-M1保持C-W4的N32/C20/MC/time-weight.995/sigmoidT1/window50 PI等全部配置，只设`pid_target_prob=.15`，每20k保存快照。预计训练约160秒，总计3～4分钟。
+- 通过门：优先看post-update final 130条；若reward>0.658且outage≤0.22，再用520条确认。若接近门则评phase-aligned候选；若明显过保守，下一单变量是target .175或降低Kp；若仍不安全，下一路线是target .10或lambda floor/hysteresis。T1.5、adaptive bandwidth与risk gain保留为actor查询核消融，不与P-M1同时改。
