@@ -137,12 +137,25 @@
 
 ### E5：在 E4 上只增加逐维 observation normalization
 
-- 状态：实现与验证已完成，待启动短预算训练；保持 MLP、固定 std=1.0、GAE/PPO、epochs、学习率和 `lambda_max=0` 不变。
+- 状态：已完成（exit code 0）；保持 MLP、固定 std=1.0、GAE/PPO、epochs、学习率和 `lambda_max=0` 不变。
+- job：`DQCAC_DynamicButton_dbg_e5_obsnorm_gaeppo8_300k_s0`；W&B run id：`xjc6hrke`；启动 commit：`7dc2bb1`。
 - 选择顺序依据：QCPO_refs 与 E4 都从 `σ=1` 开始，30 万步 entropy 仅为 `2.809` vs `2.838`，可学习 std 变化很小；而 QCPO_refs 明确使用 running mean/variance、clip 到 [-10,10]。
 - 实现要求：actor、reward value、reward/cost critics 共用同一份逐维统计；rollout 期间统计冻结，rollout 后更新；首次仅刷统计、不更新 actor，避免新旧归一化导致虚假 PPO ratio。
 - 实现验证：Chan 合并公式与 QCPO_refs `RunningMeanStdModel` 数值逐项对拍，`mean/var/output` 最大绝对误差均为 `0`；持久化后台端到端烟测正常退出，覆盖首次统计 warmup、GAE、PPO 两轮 actor update 和训练后评估。
-- 预算：30 万步、评估 64 条轨迹，预计总计约 3 分钟；与 E4/QCPO_refs 做同预算和 actor-rollout 双重对齐。
-- 判据：若 late reward/斜率没有明显超过 E4，则保留开关但不默认启用，下一项才测试 learnable std 或 LSTM/prev-action-reward。
+- 实际训练耗时 `147.8s`；评估 70 条轨迹 mean reward `1.690`、outage `0.514`。
+- 30 万步 profile：late reward mean `1.662`、slope `+6.816/百万步`，显著超过 E4 的 `0.2146/+0.9341`，也超过 QCPO_refs 同预算的 `1.355/+5.431`；reward 学习门通过，不扩跑 reward-only。
+- PPO/拟合健康：终点 ratio std `0.0490`、clip fraction `0.0603`、approx KL `0.00121`；reward value explained variance `0.7368`，无 NaN/Inf。
+- 约束诊断：训练后段 empirical outage `0.667`，统一评估 truth `0.514`；cost critic CDF `0.413`，低估 `0.101`。观测归一化解决了 reward 停滞，但 reward-only 策略明确违反 `ω=0.2`，下一阶段必须恢复 dual/risk 分支。
+- 结论：旧 DQCACBeta 不涨的核心工程原因是高维异尺度 observation 未归一化；配合前面已经验证的 GAE、固定行为策略 old log-prob、importance ratio 和 PPO clip 后，DQCAC reward 主干不弱于 QCPO_refs。
+- 最终导出：`_runs/wandb_export/final_e5_dynamicbutton_2026-07-16/`；profile：`_runs/profiles/final_e5_dynamicbutton_2026-07-16/`。
+
+### E6：恢复经验 PID dual 与 sum normalization
+
+- 状态：设计审计中；只恢复约束，不改 E5 的 reward 主干、网络、观测归一化或 std。
+- 必修一致性：同一 rollout 的 cost advantage 必须在 PPO epochs 之前冻结；不能一边更新 cost critic，一边让 8 个 actor epoch 使用不断移动的 risk advantage。
+- dual 输入优先使用 rollout/最近窗口的经验 outage 或 `(1-ω)` cost quantile；当前 cost critic CDF 仍有 `-0.101` 偏差，只作为校准指标，不直接全权驱动 λ。
+- 采用 QCPO_refs 风格积分 PID 与 `(J_r+λJ_c)/(1+λ)`；分别记录经验 gap、cost quantile gap、积分状态、effective reward/risk coefficient 与 CDF calibration error。
+- 预算先 30 万步，预计约 3 分钟；若前 150k reward 已坍塌且 outage 没有向 0.2 收敛，则早停调 Ki/尺度，不浪费全量预算。
 
 ## 4. 分阶段改进路线
 
