@@ -1091,3 +1091,19 @@ T=1000下实际归一化weight范围是0.0337到5.033，ESS fraction为0.3937；
 完整对齐图位于 _runs/profiles/dqc_cost_time_weight_100k_2026-07-16/，原始history位于 _runs/wandb_export/dqc_cost_time_weight_100k_2026-07-16/。
 
 下一条C-W2以目前Pareto最好但尚未达约束门的P-S2为基线：保留sigmoid T=2、window50 PI、beta=.995、sum normalization，只加入cost risk-discount weighting。相对P-S2是一个变量。300k seed0硬门为outage不高于0.22且reward高于E9的0.658，并要求critic calibration不比P-S2恶化；通过后才进入多seed与更大评估。hard-CDF+C-W1、discount .99/.997、direct s0 auxiliary、early stratified replay、C-H1+time weighting都保留为独立消融，不与C-W2同时加入。
+
+### 13.24 C-W2：时间加权与 T=2 平滑 CDF 叠加后，安全但过度保守（2026-07-16）
+
+C-W2 job `DQCAC_DynamicButton_recur_mc_c20_timew995_pi_kp1_w50_smoothT2_300k_s0`（W&B `lkdu70i5`）从 commit `abd86c6` 启动，训练 `164.7s`、exit code 0。它相对 P-S2 只增加 cost critic 的 `.995` risk-discount time weighting。
+
+130 条终评 reward/outage 为 `0.4798/0.1308`，真实 mean cost 为 `9.838`；hard/smooth critic CDF 为 `0.0822/0.0882`，predicted mean cost 为 `4.472`，最终 lambda 为 `0.1273`。P-S2 对照是 reward `0.9725`、outage `0.2385`、hard CDF `0.1834`、predicted mean `8.97`、lambda `0.1212`。因此 C-W2 用 `0.4927` reward 换来 `0.1077` outage 降幅，越过约束后继续向安全侧移动，按 `reward>0.658` 的预注册门判定失败。
+
+这个结果并不否定时间加权。C-W2 的 hard-CDF absolute error 为 `0.0486`，略好于 P-S2 的 `0.0551`；后60k训练窗口 reward/outage 为 `0.609/0.183`，末两批 rollout outage 均为0，证明保守性来自策略而不是130条评估噪声。更关键的是，两条最终 lambda 几乎相同，却产生完全不同的安全行为。这说明时间加权提高了查询附近 critic/risk advantage 的有效性；它与 sigmoid T=2 同时使用，相当于既修正风险信号幅值，又去掉 hard count 的局部稀疏性，单位 lambda 的实际策略作用被显著放大。
+
+末段 PPO KL `0.00385`、clip fraction `0.187`，没有数值崩坏。cost grad norm 均值约 `11.34`，joint critic clip fraction约 `0.667`，所以提高 critic grad clip（C-WG1）值得作为单独优化实验，但不能与 controller/CDF 同时改。终评 predicted mean 仍从 truth `9.838` 低估到 `4.472`，提示末次 on-policy 加权训练与终评状态分布存在漂移；不过查询处 CDF 误差较小，当前应优先按真正使用的 outage 查询指标选择 actor，而不是仅靠全局 mean 排名。
+
+profile 位于 `_runs/profiles/dqc_cost_time_weight_cw2_300k_2026-07-16/`，完整 history 位于 `_runs/wandb_export/dqc_cost_time_weight_cw2_300k_2026-07-16/`。
+
+下一条 C-W3 是最小且信息量最高的消融：保留 C-W1 time weighting、window50 PI 与其余全部配置，只将 `cost_cdf_mode=sigmoid→hard`。它相对 C-W2 只移除平滑，相对 P-B3 只增加时间加权。预期它能降低 risk-gradient 连续强度，在 P-B3 的 `1.132/0.315` 与 C-W2 的 `0.480/0.131` 之间寻找 reward/outage 折中。300k seed0 门仍为 outage `≤0.22` 且 reward `>0.658`；预计训练约160秒，失败不扩 seed。
+
+分歧路线全部保留而不混跑：若 C-W3 仍过安全，依次测试 actor `beta=.99`、controller safety setpoint、较小 Kp/lambda gain；若不安全，则测试 time-weighted sigmoid `T=.5/1`。direct s0 auxiliary、early stratified replay、C-H1+time weighting、IQN 与 adaptive bandwidth 属于 critic 表示/目标路线，不能拿来同时修 controller 强度。

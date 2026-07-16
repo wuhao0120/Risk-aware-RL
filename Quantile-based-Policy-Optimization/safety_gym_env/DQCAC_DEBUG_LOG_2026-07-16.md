@@ -580,3 +580,21 @@
 - 结论：当前首要瓶颈是均匀 transition QR objective 与 initial-outage/β-risk 的时间分布错配，不是 N=32 分辨率，也不是缺少 LSTM history。C-H1、N64、local τ 的负/弱结果现在得到统一解释：它们没有改变监督质量在时间上的分配。
 - 下一门 C-W2：在当前最好 P-S2（T2 sigmoid + window50 PI）上只加入 risk_discount/.995，300k seed0。硬门：outage不高于0.22且reward高于E9的0.658；相对P-S2还要求校准不恶化。预计训练约160s、总计3～4min。
 - 保留消融：hard-CDF+C-W1（隔离平滑交互）、discount .99/.997（只做曲线消融，不在当前通过点继续扫）、direct s0 auxiliary、early stratified replay、C-H1+time-weight（检验history在正确目标下是否才有用）。
+
+### E33：C-W2 结果——校准后的 critic 与平滑 CDF 叠加导致过度保守（2026-07-16）
+
+- C-W2 job `DQCAC_DynamicButton_recur_mc_c20_timew995_pi_kp1_w50_smoothT2_300k_s0`（W&B `lkdu70i5`）从 commit `abd86c6` 启动，训练 `164.7s`、exit code 0。相对 P-S2 唯一增加 `cost_critic_time_weighting=risk_discount, discount=.995`；其余 N32、C20、MC、raw cost critic、sigmoid T=2、window50 PI、beta=.995 与 P-S2 相同。
+- 130 条终评为 reward `0.4798`、outage `0.1308`、mean cost `9.838`、hard/smooth critic CDF `0.0822/0.0882`、predicted mean cost `4.472`，最终 lambda `0.1273`。相对 P-S2 的 `reward=0.9725, outage=0.2385`，outage 下降 `0.1077`，但 reward 损失 `0.4927`。
+- CDF absolute calibration error 为 `|0.0822-0.1308|=0.0486`，略优于 P-S2 的 `|0.1834-0.2385|=0.0551`。因此风险方向并未失效；失败点是 actor 被推到明显过安全的策略区域。按预注册门，虽然 outage 远低于 `0.22`，reward `0.4798<0.658`，故 C-W2 不进入多 seed。
+- 后 60k 训练窗口中，P-S2 的 reward/outage/lambda 为 `0.9715/0.2833/0.1730`，C-W2 为 `0.6090/0.1833/0.2235`；C-W2 最后两次 rollout 的 outage 都为 0，reward 为 `0.448/0.520`。这不是终评 130 条造成的偶然偏差，而是训练末策略本身已经保守。
+- 两条最终 lambda 很接近（P-S2 `0.1212`，C-W2 `0.1273`），但行为差异很大。直接原因不是 PID 给了更大的 lambda，而是时间加权改善查询区域后，同样单位 lambda 产生更强、更连续的 risk gradient；再与 T=2 平滑 CDF 叠加，风险梯度强度被重复放大。
+- 末段 PPO KL 约 `0.00385`、clip fraction `0.187`，无 NaN/Inf；cost grad norm 均值约 `11.34`，joint critic clip fraction 约 `0.667`。梯度裁剪可能限制 critic 跟随末期策略分布，但不能解释策略为何更安全；提高 critic clip 到20（C-WG1）应作为独立优化消融，而不是与控制强度调整同时改变。
+- 终评 predicted mean `4.472` 对 truth `9.838` 仍明显低估，说明 on-policy 最后一次训练批的加权拟合不能保证终评状态分布上的全局 mean 校准。由于 hard CDF 误差只有 `0.0486`，当前 actor 查询点仍比全局 mean 更可信；direct s0 auxiliary、early replay 与 checkpoint 后大样本评估继续保留。
+- profile：`_runs/profiles/dqc_cost_time_weight_cw2_300k_2026-07-16/`；完整 history：`_runs/wandb_export/dqc_cost_time_weight_cw2_300k_2026-07-16/`。
+
+### E34：C-W3 单变量计划——保留时间加权，只把 smooth CDF 改回 hard CDF
+
+- C-W3 与 C-W2 唯一差异是 `cost_cdf_mode=sigmoid→hard`；温度仍记录为2但 hard 路径不使用。它同时也是相对 hard P-B3 只增加 time weighting 的正交对照。
+- 目的：检验 C-W2 的过度保守是否来自“校准增强 + 平滑查询”叠加。理论预期是 hard CDF 降低候选动作风险差的连续强度，使结果落在 P-B3 的 `1.132/0.315` 与 C-W2 的 `0.480/0.131` 之间。
+- 仍用 300k seed0 与 130 条终评；预计训练约160秒、含导出分析约5分钟。硬门保持 outage `≤0.22` 且 reward `>0.658`，校准不能明显差于 C-W2/P-S2；失败不扩 seed。
+- 若 C-W3 仍过保守，分歧路线依次保留为：actor risk discount `beta .995→.99`；PID 内部 safety setpoint 小于0.2；降低 Kp 或 lambda gain。若 C-W3 不安全，则考虑 time-weighted sigmoid `T=.5/1`。这些都按单变量轻量门测试，不并入同一 run。
