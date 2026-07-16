@@ -961,3 +961,34 @@
 - 校准改善是实质性的。hard CDF absolute error从`|0.10427-0.30577|=0.20150`降至`|0.26929-0.20769|=0.06160`，改善`69.4%`；smooth CDF error `0.19837→0.06670`，改善`66.4%`；predicted mean-cost error `5.74198→1.00415`，改善`82.5%`。真实cost mean/Q80也从`12.3308/18`降到`10.1865/15`。
 - 预注册裁决：outage `≤0.22`且降低至少`.08`两项通过，但reward `0.58645<0.75`失败，末200k周期也比baseline大。因此C-X3保留为“切断同批反馈能换来更准critic和更安全policy，但会明显压低reward”的机制消融；不扩seed0/2、不扫缓存间隔、不叠加target-KL。
 - 正式数据和图位于`_runs/wandb_export/dqc_pm3_seed1_vs_cx3_preupdate_1m_2026-07-16/`和`_runs/profiles/dqc_pm3_seed1_vs_cx3_preupdate_1m_2026-07-16/`；后者含`phase_comparison.csv`、`eval520_comparison.csv`、`eval520_summary.json`、`overview.png`及`eval520_comparison.png`（2700×1350，PIL解码通过）。
+
+
+### E71：C-IQN1 cost-only uniform IQN 实现、回归与冻结策略校准预注册（2026-07-16）
+
+- 完成度复核：QCPO 的未修正 rollout reuse 与未更新 observation RMS 两个确定性 bug 已修；Q-B 在300k终评 reward=1.621，已回到 QCPO_refs 的正常量级。QCPO 和 DQCAC 的 [512,512]+LSTM512 都完成全尺寸100k/300k验证；DQCAC recurrent 300k终评1.442，高于同结构 QCPO 的1.251。当前主缺口已从网络接线转为 cost distribution 泛化校准和 policy-critic-PID闭环。
+- 新增 cost_distribution_model=qr|iqn，默认 qr 保持旧结果。IQN 只替换 action-conditioned cost critic；actor、共享 recurrent reward-V、reward critic、PPO、PID 和 observation normalization 均不变。网络为 (s,a) MLP feature × cosine(πiτ) embedding → scalar quantile head；训练每个 transition 随机采32个 uniform τ，CDF/mean/std 查询使用128个确定性 midpoint τ。
+- 概念边界：IQN不是“直接输出CDF”。它估计连续 quantile function Q(s,a,τ)；P(C≥b) 仍由 uniform τ 上的 indicator 或 sigmoid 积分得到。当前先做 uniform-IQN；只有它能提高独立泛化校准，才考虑 query-mixture IQN 或查询附近自适应采样，避免再做没有作用链证据的小网格。
+- IQN τ 使用独立 torch.Generator，seed=training_seed+104729。测试证明一次 [5,7] τ 采样前后全局 torch RNG state 完全相同，重置专用 generator 后 τ 逐位复现；所以 critic 采样不会偷偷改变策略动作噪声。
+- 数学/工程验证：
+  1. IQN default query [6,17] 与显式传入同一 midpoint τ 逐位相同；随机 [6,11] τ 输出具有非零 τ 方向标准差0.11086，所有参数梯度有限。
+  2. per-transition 2D τ quantile-Huber loss 与手算误差5.96e-8（float32求和次序），反向梯度有限。
+  3. 同一模型/τ/target/time-weight 下，M=11、chunk=4 的 full/chunk loss 误差1.73e-7，最大参数梯度误差2.98e-8。
+  4. 对旧提交0c58963做配对短训练：34个 module tensor leaf、lambda tensor和全部runtime逐位相同；summary差异仅为新增IQN元数据。默认QR训练语义未改变。
+  5. CPU端到端 IQN smoke（Ntrain=8,Nquery=17,cos=8,chunk=17）训练8.2s、exit0；checkpoint eval-only恢复exit0，随机评估逐项复现。
+  6. P-M3 LSTM512 policy-only + CUDA IQN smoke训练6.6s、exit0，覆盖recurrent rollout、CUDA专用τ generator、chunk update、checkpoint和recurrent评估。
+- 第一次CUDA smoke不计为算法结果：为了省时把horizon从1000缩至32，却遗漏源配置n_step=100，rollout后处理按空切片报维度错。已增加 n_step<=horizon 的构造期显式校验，并用n_step=8原样重跑通过；该问题与IQN数值无关。
+- 评估协议同时修正：任何agent训练/构造完成后、独立评估开始前，都用 seed+777 重置host/CUDA动作RNG；环境worker本来就用seed+777。不同critic参数量不再通过“初始化消耗了多少随机数”污染随机策略评估。通用评估器也改为调用 cost critic 自身的加权CDF/分布矩接口，修正非均匀QR网格过去被简单mean误报的问题。
+- 新增 monotonicity 诊断 cost_quantile_crossing_fraction：在升序查询τ上统计 Q(τ[j+1])<Q(τ[j]) 的比例。IQN不强制单调，这个指标用于区分“更密查询”与“高频crossing造成的伪分辨率”。
+
+#### C-IQN1 冻结成熟策略校准门
+
+- 数据源固定为 P-M3 seed1 的1M final actor，原fresh520 reward/outage=0.8622/0.3058；校准rollout seed=101。QR和IQN都只恢复actor与两套observation RMS，critic/target/optimizer从头初始化，policy、dual和RMS完全冻结。
+- 两条均使用 B20、T1000、15 iterations=300k、20 critic updates/rollout、MC cost target、risk-discount=.995、critic [256,256]、lr=1e-3、Ntarget=32和chunk=2500。两条都设 advantage_norm=separate，使冻结实验不执行无用的K动作risk-baseline查询；因此每轮behavior数据只由同一个成熟策略和相同action RNG生成。
+- 唯一算法差异：baseline为固定 QR-N32；candidate为 uniform-IQN，Ntrain=32、Nquery=128、cosines=64。内置140条只作screen；训练后若方向合格再从两个final checkpoint做同seed、同动作RNG的fresh520配对评估。
+- 预注册晋级门：
+  1. QR/IQN每批真实reward/cost/outage必须逐点相同，否则先判定配对协议失败；
+  2. 最后5批prequential CDF absolute error或Brier至少改善20%，另一项不得恶化超过10%；
+  3. 独立评估的hard-CDF absolute error或mean-cost absolute error至少改善25%，另一项不得恶化超过10%；
+  4. crossing不能比QR恶化超过0.10，且末段无发散。
+- 只有140 screen和fresh520都通过，才在P-M3压力seed1进入一次完整1M live闭环；否则停止standard uniform-IQN，不扫cosine数、Ntrain或Nquery碰运气。query-mixture IQN作为有分歧的独立路线保留，不和uniform-IQN同时修改。
+- 既有QR冻结300k纯训练121s。新配对QR预计约2–3min训练、加140评估总约4min；IQN因τ embedding和chunk前向预计训练4–7min、总约6–10min。两条串行总墙钟约10–14min，全程由launch_background.sh持久化，输出只写/vepfs项目盘。

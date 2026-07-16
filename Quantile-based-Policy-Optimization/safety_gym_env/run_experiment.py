@@ -162,6 +162,13 @@ def base_args(algo, seed, device, env_key):
         a.lambda_min = 0.0
         a.outer_interval = 1
         a.num_quantiles = 32
+        # cost-only distribution family。qr 保持所有历史结果；iqn 连续采样 τ，
+        # 训练仍用32点控制计算量，查询用128个确定性点提高 CDF 积分分辨率。
+        a.cost_distribution_model = 'qr'
+        a.cost_iqn_train_quantiles = 32
+        a.cost_iqn_query_quantiles = 128
+        a.cost_iqn_cosines = 64
+        a.cost_iqn_seed = seed + 104729
         a.huber_kappa = 0.1                             # 近纯分位回归 → critic 无偏 (已验证)
         a.critic_hidden = [256, 256]
         a.critic_lr = 1e-3
@@ -489,6 +496,14 @@ def main():
             f"step={checkpoint_payload.get('env_steps')}")
 
     # ---- 统一评估 (同协议; QCPO_REF 为 LSTM 策略, 用其自管状态的同口径评估器) ----
+    # agent 构造和训练会消耗不同数量的随机数；在评估开始前统一重置，令相同 seed
+    # 的 QR/IQN、MLP/LSTM 使用同一 Gaussian action-noise 序列。环境 worker 仍使用
+    # 独立 seed+777，因此这一步不回灌训练，也不依赖网络参数规模。
+    eval_rng_seed = int(args.seed) + 777
+    random.seed(eval_rng_seed); np.random.seed(eval_rng_seed)
+    torch.manual_seed(eval_rng_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(eval_rng_seed)
     eval_vec = make_vec_env(args.env_id, num_envs=args.num_envs, horizon=args.horizon,
                             device=device, ref_env=env, seed=args.seed + 777,
                             backend=getattr(args, 'vec_backend', 'mp'))
@@ -541,6 +556,9 @@ def main():
             eval_log['eval/pred_cost_mean'] = res['pred_cost_mean']
         if res.get('pred_cost_std') is not None:
             eval_log['eval/pred_cost_std'] = res['pred_cost_std']
+        if res.get('cost_quantile_crossing_fraction') is not None:
+            eval_log['eval/cost_quantile_crossing_fraction'] = (
+                res['cost_quantile_crossing_fraction'])
         for key in (
                 'cost_cdf_primary_initial', 'cost_cdf_peer_initial',
                 'cost_cdf_crossfit_peer_abs_mean'):

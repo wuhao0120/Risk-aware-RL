@@ -120,6 +120,14 @@ KEY_METRICS: Tuple[str, ...] = (
     "debug/cost_actor_query_is_target",
     "critic/quantile_target_scale",
     "critic/quantile_target_reference",
+    "critic/cost_iqn_tau_mean",
+    "critic/cost_iqn_tau_std",
+    "critic/cost_iqn_tau_min",
+    "critic/cost_iqn_tau_max",
+    "debug/cost_distribution_is_iqn",
+    "debug/cost_iqn_train_quantiles",
+    "debug/cost_iqn_query_quantiles",
+    "debug/cost_iqn_cosines",
     "debug/cost_quantile_grid_is_query",
     "debug/cost_quantile_prediction_is_importance",
     "debug/cost_quantile_local_count",
@@ -132,6 +140,7 @@ KEY_METRICS: Tuple[str, ...] = (
     "critic/q_mean",
     "critic/pred_cost_mean",
     "critic/pred_cost_std",
+    "critic/cost_quantile_crossing_fraction",
     "debug/cost_mean",
     "action/avg_step_reward",
     "action/avg_step_cost",
@@ -152,6 +161,7 @@ EVAL_METRICS: Tuple[str, ...] = (
     "eval/cost_cdf_smooth_initial",
     "eval/pred_cost_mean",
     "eval/pred_cost_std",
+    "eval/cost_quantile_crossing_fraction",
 )
 
 

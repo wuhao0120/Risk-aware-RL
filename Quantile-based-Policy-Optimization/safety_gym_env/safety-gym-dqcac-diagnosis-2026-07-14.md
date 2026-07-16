@@ -1428,3 +1428,12 @@ fresh520严格比较中，P-M3→C-X3的reward从0.86220降到0.58645，差`-0.2
 distributional critic却显著变准：hard/smooth CDF error分别改善69.4%/66.4%，predicted mean-cost error改善82.5%。这个结果把问题定位得更清楚：“critic不准”和“actor–PID时序不稳”都存在，但只修正前者或只切断即时反馈都不会自动产生高reward的安全policy。更合理的后续方向是将reward和risk的policy位移分开限制，并让dual根据critic不确定性或延迟量自适应，而不是继续扫一批、两批的缓存间隔。
 
 预注册门中两项安全条件通过，reward条件失败，末段周期也恶化。因此不扩seed0/2，不为了找一个好看seed继续花费。C-X3的定位是一个有信息量的负消融：它证明延迟当前标签可以大幅改善校准和outage，同时也证明未补偿的延迟会严重伤害reward。
+
+
+### 13.60 C-IQN1：先证明 IQN 能改善 critic 泛化，再让它进入 PID 闭环（2026-07-16）
+
+当前证据不支持“quantile越多就自然更好”：uniform N64在修正loss尺度后仍未改善校准，查询点局部加密只有约7%～8%收益；C-X3甚至证明critic更准和policy更安全可以同时伴随约32%的reward损失。因此IQN的价值必须先在固定成熟策略下隔离验证，不能直接凭1M策略曲线归因。
+
+本次实现是cost-only uniform IQN。reward/PPO/PID/recurrent actor全部不变；训练随机采32个τ，查询用128个确定性τ。它输出Q(τ)，再通过uniform-τ积分得到hard/smooth CDF，并不是直接拟合CDF。专用τ RNG不改变行为动作流；评估前统一重置动作RNG，QR/IQN可以使用完全相同的随机策略样本。新增crossing比例监控IQN非单调输出。
+
+正式门使用P-M3 seed1成熟actor、rollout seed101、B20×T1000×15=300k固定数据，QR-N32与IQN-32/128/64只改变cost表示。先看末五批prequential CDF/Brier，再看独立140和必要时520回合的CDF/mean-cost误差。要求局部泛化至少改善20%、独立误差至少改善25%，另一项不明显恶化且crossing可控；不过门就停止standard IQN，不用延长live训练移动门槛。通过后才允许压力seed1跑完整1M闭环，再按原规则扩三seed。

@@ -23,19 +23,32 @@ import torch
 def _cost_critic_initial_stats(agent, S0, A0, d):
     """
     用 agent 的【cost 分布式 critic】在 eval 批 (s0,a0) 上估计 P(C≥d)/E[C]/std(C)。
-    仅当 agent 有 .cost_critic 和 .num_quantiles (DQCAC) 时计算; 否则返回 (None,None,None)。
+    仅当 agent 有 .cost_critic 和 .num_quantiles (DQCAC) 时计算；否则四项均为 None。
     数值上 P(C≥d)=P(Z≤q), 与 empirical_prob 同口径可比。
     """
     if not (hasattr(agent, 'cost_critic') and hasattr(agent, 'num_quantiles')):
-        return None, None, None
+        return None, None, None, None
     with torch.no_grad():
         # episodic 配方下 critic 带 step 特征 → 用 agent._aug 做 s0(step=0) 增广
         S0_in = agent._aug(S0, 0) if hasattr(agent, '_aug') else S0
         psi = agent.cost_critic(S0_in, A0)                    # [N, N_q] cost 回报分位数
-        cdf = float((psi >= d).float().mean(dim=1).mean().item())   # P(C≥d|s0,a0)
-        pmean = float(psi.mean().item())                     # E[C|s0,a0]
-        pstd = float(psi.std(dim=1).mean().item())           # std(C|s0,a0)
-    return cdf, pmean, pstd
+        if hasattr(agent, '_cost_tail_probability'):
+            # query-mixture QR 需要 quadrature 权重；IQN 的 default grid 是 uniform。
+            cdf = float(agent._cost_tail_probability(
+                psi, d, mode='hard').mean().item())
+        else:
+            cdf = float((psi >= d).float().mean(dim=1).mean().item())
+        if hasattr(agent, '_cost_quantile_moments'):
+            means, stds = agent._cost_quantile_moments(psi)
+            pmean = float(means.mean().item())
+            pstd = float(stds.mean().item())
+        else:
+            pmean = float(psi.mean().item())
+            pstd = float(psi.std(dim=1).mean().item())
+        crossing = float(
+            0.0 if psi.shape[-1] < 2 else
+            (psi[:, 1:] < psi[:, :-1]).float().mean().item())
+    return cdf, pmean, pstd, crossing
 
 
 def evaluate_policy_vec(agent, vec_env, num_episodes, gamma, cost_gamma, omega, cost_limit):
@@ -99,8 +112,10 @@ def evaluate_policy_vec(agent, vec_env, num_episodes, gamma, cost_gamma, omega, 
     # cost critic 校准 (仅 DQCAC); 数值 = P(Z≤q|s0)
     S0 = torch.cat(S0_all, dim=0)
     A0 = torch.cat(A0_all, dim=0)
-    cdf, pmean, pstd = _cost_critic_initial_stats(agent, S0, A0, d)
+    cdf, pmean, pstd, crossing = _cost_critic_initial_stats(
+        agent, S0, A0, d)
     result['cost_cdf_initial'] = cdf
     result['pred_cost_mean'] = pmean
     result['pred_cost_std'] = pstd
+    result['cost_quantile_crossing_fraction'] = crossing
     return result
