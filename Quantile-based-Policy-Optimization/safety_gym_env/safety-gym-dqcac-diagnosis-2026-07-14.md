@@ -783,3 +783,35 @@ DQC 的网络分歧继续保留为显式消融：
 - **D-RC（MLP 公平控制）**：三算法均使用 512×512 MLP、可学习 sigma、相同显式历史统计；用于区分 recurrence 与容量/归一化贡献。
 
 下一门是 D-R0 reward-only 100k、seed 0，复用 E5 的 `GAE+PPO8+obs RMS` 并固定 lambda=0。预计训练约 `70–100s`，加 70 轨迹评估约 `2–3min`。通过条件：后段 reward 与 slope 至少形成 E5 同方向增长，PPO ratio/KL、联合 value EV、critic loss 无异常；明显低于 E5 前段时不直接扩全预算，而先在 Q-R1/R2 类型的循环优化超参中做轻量分支。
+
+
+### 13.5 DQCACBeta recurrent D-R0 的 100k/300k 结果（2026-07-16）
+
+D-R0 已先后完成 100k 门控和独立 300k 扩展，均由持久化 launcher 运行并 exit code 0。
+
+- 100k：job `DQCAC_DynamicButton_recur_dr0_e5hyper_100k_s0`，W&B `j57xp70k`，训练 `55.4s`。后段 reward `0.4278`、趋势 `+6.164/百万步`，70 条终评 reward `0.4965`、outage `0.1286`。
+- 同预算 DQC E5 MLP 为 `0.4441/+6.291`，QCPO_refs 为 `0.4776/+7.008`，循环 QCPO 为 `0.4006/+5.006`。因此 D-R0 在前 100k 已基本复现 E5，不存在“换网络后完全不学”的问题。
+- 首 actor epoch 的 `max|ratio-1|` 全程约 `0.7e-5～1.1e-5`；这是 LSTM 逐步 rollout 与 chunk forward 的浮点累积误差量级，证明 old probability、history 和 chunk h0 对齐。100k 终点 value EV `0.594`、PPO KL `0.00338`、clip `0.192`。
+- 独立 300k：job `DQCAC_DynamicButton_recur_dr0_e5hyper_300k_s0`，W&B `tavefru8`，训练 `153.1s`。后段 reward `1.381`、趋势 `+5.672/百万步`，70 条终评 reward `1.442`。
+- 共同 300k 的后段 reward：D-R0 `1.381` 已略高于 QCPO_refs `1.355`、MLP Q-B `1.317` 和循环 QCPO `1.083`，但低于 DQC E5 MLP `1.662`。因此同 recurrent actor/V 下 DQC 的 reward 学习已超过 QCPO 路线，但当前尚未超过最强 MLP DQC 控制组。
+- 300k 后段 PPO KL `0.00103`、clip `0.0456`，value EV `0.722`，没有更新过猛或数值异常。差距更像大共享网络在后期更新不足；下一轻量消融是提高 actor LR/epochs，及把 shared value coefficient 从 1 降到 0.5，而不是继续修 hidden state。
+
+完整 profile：
+
+- `_runs/profiles/dqc_recurrent_dr0_100k_2026-07-16/`
+- `_runs/profiles/dqc_recurrent_dr0_300k_2026-07-16/`
+
+必须同时记录一个新的约束警报：D-R0 300k cost critic CDF `0.322` 对真实 outage `0.586`，低估 `0.263`；预测 mean cost `12.47` 对实际 `23.56` 也明显偏低。E5 MLP 同预算的 CDF 偏差仅约 `-0.101`。所以当前结果只能证明 reward 主干，不能证明 constrained DQC 已胜出。恢复约束时优先使用经验 trajectory PID；D-R1 recurrent cost critic、n-step/target 传播和大 N/smooth CDF 分开消融。当前主要是整段分布传播/条件表示偏差，单纯把 N 从 32 加大不会自动消除 mean/CDF 低估。
+
+### 13.6 大 B/大 N 的 QR transition chunking（2026-07-16）
+
+已加入默认关闭的 `critic_minibatch_size=0`；0 保持历史整批 `[T·B,N,N]` QR loss，正数则按 transition 顺序分块：
+
+1. target quantiles 仍一次冻结为 `[T·B,N]`；
+2. 每块只构造 `[chunk,N,N]` pairwise error；
+3. chunk mean loss 乘 `chunk_size/(T·B)` 后 backward；
+4. 所有块共享一次 `zero_grad → clip → optimizer.step`。
+
+因此块数不会放大学习率或 optimizer step 数。合成 `M=11,N=7,chunk=4` 的 uneven-chunk 对拍中，full/chunk loss 绝对误差 `4.33e-8`，quantile prediction 梯度最大绝对误差 `0.0`。持久化集成 smoke `DQCAC_DynamicButton_smoke_chunked_qr_s0` 使用 `T·B=64,N=16,chunk=17`，训练 `4.4s`、exit code 0，并通过 actor/critic/eval 全链路。
+
+这只是显存基础设施，不宣称性能提升。后续先做 B=10/20/32 的 wall-time/peak-memory benchmark，再用 chunking 比较 N=32/64/128；所有大 N 实验同时报告吞吐，避免以数倍计算换来不可比的微小变化。

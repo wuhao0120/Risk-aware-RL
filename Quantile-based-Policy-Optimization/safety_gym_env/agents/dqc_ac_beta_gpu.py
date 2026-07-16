@@ -74,6 +74,10 @@ class DQCACBetaGPU(VecAgentBase):
         self.lambda_min = getattr(args, 'lambda_min', 0.0)
         self.critic_grad_clip = getattr(args, 'critic_grad_clip', 10.0)
         self.actor_grad_clip = getattr(args, 'actor_grad_clip', 100.0)
+        # 0 表示历史整批 QR loss；正数按 transition 分块累计等权梯度，只降低
+        # [batch,N,N] pairwise TD-error 峰值显存，不改变 optimizer step 次数。
+        self.critic_minibatch_size = max(
+            0, int(getattr(args, 'critic_minibatch_size', 0)))
 
         # reward actor 主干做成显式消融开关，默认 distributional 完全复现旧实现。
         # - distributional: Q_r(s,a)-E_a Q_r(s,a)，即排查前 DQCACBeta；
@@ -509,41 +513,80 @@ class DQCACBetaGPU(VecAgentBase):
 
     # ============================================================ Critic 更新 (双 QR-TD) ============================================================
     def update_critic(self, batch):
-        """reward critic (QR-TD on reward) + cost critic (QR-TD on cost), 合并一次 backward。"""
-        s, a = batch['states'], batch['actions']
-        boot_s, boot_mask = batch['boot_states'], batch['boot_mask']
+        """
+        更新 reward/cost 两个 QR-TD critic；可选 transition chunking 降低 N² 峰值显存。
+
+        chunk 路径对每块 mean loss 乘 `chunk_size/total_size` 后 backward，所有块
+        共享一次 zero_grad/clip/optimizer.step。因此它与整批 mean loss 的梯度定义
+        相同，不会因为块数增加而偷偷放大学习率。
+        """
+        states, actions = batch['states'], batch['actions']
+        boot_states, boot_mask = batch['boot_states'], batch['boot_mask']
         steps, boot_steps = batch['steps'], batch['boot_steps']
 
-        with torch.no_grad():                                 # target 不建图
+        with torch.no_grad():                                 # target 分支不建立 autograd 图
             # MLP 可直接在 boot state 重采；recurrent 必须使用完整历史下保存的
             # on-policy boot action，否则这里会隐式把所有中间状态当作 episode 起点。
-            a_boot = (
+            boot_actions = (
                 batch['boot_actions'] if self.recurrent_policy
-                else self._sample_actions(boot_s))
-            # reward target
-            psi_r_next = self.reward_target_critic(self._aug(boot_s, boot_steps), a_boot)
-            y_r = batch['nstep_reward'].unsqueeze(1) + \
-                (self.gamma ** self.n_step) * boot_mask.unsqueeze(1) * psi_r_next
-            # cost target
-            psi_c_next = self.cost_target_critic(self._aug(boot_s, boot_steps), a_boot)
-            y_c = batch['nstep_cost'].unsqueeze(1) + \
-                (self.cost_gamma ** self.n_step) * boot_mask.unsqueeze(1) * psi_c_next
+                else self._sample_actions(boot_states))
+            boot_inputs = self._aug(boot_states, boot_steps)
 
-        psi_r = self.reward_critic(self._aug(s, steps), a)    # [n·B, N] (建图)
-        psi_c = self.cost_critic(self._aug(s, steps), a)      # [n·B, N] (建图)
-        loss_r = self._quantile_huber_loss(psi_r, y_r)
-        loss_c = self._quantile_huber_loss(psi_c, y_c)
-        loss = loss_r + loss_c
+            # 两条 target 都完整保存为 [T*B,N]；真正的 N² 张量只在下面 chunk 内产生。
+            reward_next = self.reward_target_critic(boot_inputs, boot_actions)
+            reward_target = (
+                batch['nstep_reward'].unsqueeze(1)
+                + (self.gamma ** self.n_step)
+                * boot_mask.unsqueeze(1) * reward_next)
+            cost_next = self.cost_target_critic(boot_inputs, boot_actions)
+            cost_target = (
+                batch['nstep_cost'].unsqueeze(1)
+                + (self.cost_gamma ** self.n_step)
+                * boot_mask.unsqueeze(1) * cost_next)
 
+        state_inputs = self._aug(states, steps)
+        total_size = int(states.shape[0])
+        chunk_size = self.critic_minibatch_size
+        use_chunks = 0 < chunk_size < total_size
         self.critic_optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+
+        if not use_chunks:
+            # 默认历史路径：构造完整 [T*B,N,N] pairwise error，一次 backward。
+            reward_pred = self.reward_critic(state_inputs, actions)
+            cost_pred = self.cost_critic(state_inputs, actions)
+            reward_loss = self._quantile_huber_loss(reward_pred, reward_target)
+            cost_loss = self._quantile_huber_loss(cost_pred, cost_target)
+            (reward_loss + cost_loss).backward()
+            reward_loss_value = float(reward_loss.item())
+            cost_loss_value = float(cost_loss.item())
+        else:
+            # 顺序分块避免额外 permutation 张量并保持可复现；每块图在 backward 后释放。
+            reward_loss_value, cost_loss_value = 0.0, 0.0
+            for begin in range(0, total_size, chunk_size):
+                finish = min(begin + chunk_size, total_size)
+                weight = float(finish - begin) / float(total_size)
+                reward_pred = self.reward_critic(
+                    state_inputs[begin:finish], actions[begin:finish])
+                cost_pred = self.cost_critic(
+                    state_inputs[begin:finish], actions[begin:finish])
+                reward_loss_chunk = self._quantile_huber_loss(
+                    reward_pred, reward_target[begin:finish])
+                cost_loss_chunk = self._quantile_huber_loss(
+                    cost_pred, cost_target[begin:finish])
+                (weight * (reward_loss_chunk + cost_loss_chunk)).backward()
+                reward_loss_value += weight * float(reward_loss_chunk.item())
+                cost_loss_value += weight * float(cost_loss_chunk.item())
+
         if self.critic_grad_clip and self.critic_grad_clip > 0:
             nn.utils.clip_grad_norm_(
                 list(self.reward_critic.parameters()) + list(self.cost_critic.parameters()),
                 self.critic_grad_clip)
         self.critic_optimizer.step()
-        return {'critic/reward_qr_loss': float(loss_r.item()),
-                'critic/cost_qr_loss': float(loss_c.item())}
+        return {
+            'critic/reward_qr_loss': reward_loss_value,
+            'critic/cost_qr_loss': cost_loss_value,
+            'critic/chunked_update': float(use_chunks),
+        }
 
     def _quantile_huber_loss(self, psi, y):
         """Quantile Huber Loss ρ^κ_τ(u) (QR-DQN 核心, 与模板一致)。"""

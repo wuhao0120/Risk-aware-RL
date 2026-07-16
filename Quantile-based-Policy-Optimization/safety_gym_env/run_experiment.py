@@ -158,6 +158,7 @@ def base_args(algo, seed, device, env_key):
         a.huber_kappa = 0.1                             # 近纯分位回归 → critic 无偏 (已验证)
         a.critic_hidden = [256, 256]
         a.critic_lr = 1e-3
+        a.critic_minibatch_size = 0                     # 0=历史整批；大 B/N 时显式设 chunk
         a.target_tau = 0.05                             # 消除 critic 滞后 (已验证)
         a.target_update_interval = 1
         # n-step TD: T=1000 未折扣口径下 1-step 传播太慢 (600 updates 传不满 1000 步链,

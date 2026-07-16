@@ -366,3 +366,23 @@
 - 新增 `ppo/first_epoch_ratio_max_error`：首个循环 actor epoch 前 actor/RMS 未改变，理论上 ratio 必须为 1；该指标用于直接发现 history/chunk h0/old probability 接线偏差。
 - 并行保留路线：D-R0 actor/V recurrent；D-R1 独立 recurrent cost critic；D-R2 full-shared recurrent hybrid；D-R3 explicit-budget-fair；D-RC 512 MLP 公平控制。
 - 下一实验：D-R0/E5 reward-only 100k，预计含评估 `2–3min`；前段不形成正 slope 或 PPO/value/critic 数值异常就停止，不直接跑满。
+
+
+#### E13 D-R0 100k/300k 结果
+
+- 100k：job `DQCAC_DynamicButton_recur_dr0_e5hyper_100k_s0`，W&B `j57xp70k`，训练 `55.4s`；后段 reward `0.4278/+6.164/百万步`，终评 reward `0.4965`、outage `0.1286`。
+- 同 100k E5 MLP 为 `0.4441/+6.291`，QCPO_refs `0.4776/+7.008`，循环 QCPO `0.4006/+5.006`；D-R0 基本复现旧 E5 前段，门控通过。
+- 首 epoch `max|ratio-1|≈0.7e-5～1.1e-5`，证明 history/chunk h0/old probability 对齐；100k 终点 value EV `0.594`、KL `0.00338`、clip `0.192`。
+- 独立 300k：job `DQCAC_DynamicButton_recur_dr0_e5hyper_300k_s0`，W&B `tavefru8`，训练 `153.1s`；后段 reward `1.381/+5.672`，终评 reward `1.442`。
+- 同 300k DQC E5 MLP `1.662`、QCPO_refs `1.355`、MLP Q-B `1.317`、循环 QCPO `1.083`。D-R0 已超过同 recurrent/QCPO 路线，但仍低于最强 MLP DQC；不扩 seed，先做 LR/value coefficient 轻量消融。
+- 300k 后段 KL `0.00103`、clip `0.0456`、value EV `0.722`，更像后期更新不足而非过强或 hidden bug。
+- 约束警报：cost critic CDF `0.322` 对 truth `0.586`，bias `-0.263`；pred mean cost `12.47` 对真实 `23.56`。恢复 lambda 时必须先用 empirical dual，D-R1 cost-history 与 critic 校准单独验证。
+- profiles：`_runs/profiles/dqc_recurrent_dr0_100k_2026-07-16/`、`_runs/profiles/dqc_recurrent_dr0_300k_2026-07-16/`。
+
+### E14：QR transition chunking
+
+- 新开关 `critic_minibatch_size`，默认 0 完全保留整批路径；正数按 transition 分块构造 N² TD-error。
+- 每个 chunk loss 按样本比例加权，所有块只执行一次 optimizer step；不是增加 critic update 次数。
+- 合成 uneven chunk 对拍 `M=11,N=7,chunk=4`：loss 误差 `4.33e-8`、prediction gradient 最大误差 `0.0`。
+- 持久化集成 smoke `DQCAC_DynamicButton_smoke_chunked_qr_s0`：`T·B=64,N=16,chunk=17`，训练 `4.4s`、exit code 0。
+- 用途：先解除 B=32 与 N=64/128 的峰值显存限制；性能、wall time 和 peak memory 后续作为独立实验报告。
