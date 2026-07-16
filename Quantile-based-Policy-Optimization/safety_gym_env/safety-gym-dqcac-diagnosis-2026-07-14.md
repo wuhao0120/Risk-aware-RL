@@ -1314,3 +1314,13 @@ critic修复与安全收益方向一致。baseline CDF `0.10427`相对truth `0.3
 但训练动力学仍非单调。300–600k candidate同时提高reward并降低outage，若在600k停止会宣布全面成功；600–800k随即出现更大的风险/lambda回摆；最后200k outage与baseline接近，而reward均值低约0.22。当前结论应写成“校准组件有效、闭环与reward权衡仍待稳定”，不能写成DQCAC已经稳定超过参考算法。
 
 因此seed0/2沿用完全相同配置各跑1M，不调coef、不挑checkpoint。多seed结果若仍能降低聚合outage且reward保持可接受，再进入1.5M和与QCPO_refs同预算比较；若只在原失败seed1有效，则将它视为压力场景修复，并转向separate critic grad clipping、cross-fit/ensemble uncertainty和更慢的dual控制消除周期。
+
+### 13.49 三seed推翻“simple replay是主配置”，也给出训练长度的边界（2026-07-16）
+
+seed0/2各完整训练1M并做520条fresh eval-only。baseline→aux的reward/outage分别为：seed0 `0.7180/0.1673→0.5152/0.1558`，seed1 `0.8622/0.3058→0.6875/0.1885`，seed2 `0.8670/0.2115→0.6320/0.3288`。三seed平均reward从0.8157降到0.6116；合并outage只从356/1560=0.2282变为350/1560=0.2244，区间高度重叠。它救回一个最差seed，却把几乎相同数量的失约转移到另一个seed，并一致损害reward。
+
+校准结果解释了这种不稳定，而不是为它辩护。三个seed的CDF absolute error从`0.0615/0.2015/0.0458`变成`0.0273/0.0485/0.1586`：前两个seed改善，第三个扩大3.46倍。recent replay与当前policy/critic/controller形成同批反馈，既可能修复低估，也可能强化错误动作排序；平均误差变好不能保证每个seed的闭环方向正确。
+
+本轮也校正了实验预算规则。100k确实对慢校准组件太短，300k固定策略才发现价值，1M seed1才证明它能改变policy；但是3 seeds×1M已足以拒绝当前`.25/r4`精确组合。它末200k没有跨seed一致的安全趋势，reward又在所有seed下降，因此继续1.5M主要是在等待周期换相位，收益概率低，不值得直接消耗预算。
+
+后续不再扫描simple replay系数。更合理的两条独立路线是：用cross-fit、慢target或ensemble uncertainty隔离“同批标签→共享critic→actor→下一批标签”的正反馈；给8-epoch PPO加入默认关闭的target-KL early stop，限制critic校准变化后单次策略回摆。joint critic clip确有工程耦合，但只在约8–12%的step触发且reward梯度远小于cost梯度，优先级低于上述两项。

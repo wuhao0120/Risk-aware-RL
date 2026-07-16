@@ -841,3 +841,13 @@
 - 时间结构不能被final点掩盖：300–600k candidate相对baseline的reward/outage为`0.827/0.207 vs 0.783/0.243`，看似全面占优；600–800k却回摆为`0.639/0.300 vs 0.823/0.260`，lambda均值`0.454 vs 0.341`；800k–1M为`0.603/0.170 vs 0.825/0.180`。因此600k会产生false positive，完整1M揭示了真实reward代价和中段极限环。
 - 结论：recent-s0 auxiliary不再是“只改善冻结critic”的局部trick；它在最差seed1上把大样本outage拉回0.2以内，并通过live晋级门。但它没有消除闭环周期，而且安全收益以明显reward损失为代价，尚不能作为稳定主配置。
 - 下一步保持单变量设计，在seed0/2各跑完整1M；不根据seed1结果回调coef或replay次数。两条并行预计训练约12分钟、含140条终评约14分钟。只有多seed聚合仍改善约束且reward可接受，才继续1.5M/同QCPO_refs预算确认。
+
+### E60：C-S0 live三seed结论——救回seed1但把风险转移到seed2，不进入1.5M（2026-07-16）
+
+- seed0/2完整1M训练均exit0，耗时`696.2s/695.7s`，W&B为`nle3jm1q/alf53xvv`。由于seed1已经证明140条outage会漏掉520条改善，本轮透明取消原140 screen，对两个不好看的seed都做了fresh eval-only 520，没有选择性丢弃。
+- 520条baseline→aux结果：seed0 `reward 0.7180→0.5152, outage 0.1673→0.1558`；seed1 `0.8622→0.6875, 0.3058→0.1885`；seed2 `0.8670→0.6320, 0.2115→0.3288`。aux在所有seed都降低reward，只在seed1提供大安全收益，并在seed2造成等量反向恶化。
+- 三seed reward从`0.8157±0.0847`降到`0.6116±0.0880`。outage从`0.2282±0.0707`变为`0.2244±0.0920`；合并事件仅从`356/1560`降到`350/1560`，Wilson 95%区间`[0.2081,0.2497]`与`[0.2043,0.2457]`高度重叠，不构成有意义的聚合安全改善。
+- per-seed CDF absolute error从baseline的`0.0615/0.2015/0.0458`变为aux的`0.0273/0.0485/0.1586`。平均误差虽从0.1029降到0.0781，但seed2误差扩大3.46倍；simple recent replay把一致低估换成更高的seed间偏差，没有形成可靠校准器。
+- 末200k训练rollout的三seed均值同样显示reward/outage约为baseline `0.808/0.205`、aux `0.647/0.202`：训练窗口安全几乎不变，reward代价已出现。独立初始状态上的改善只发生在部分seed，不能靠挑checkpoint解释。
+- 长度判断：100k不足以否定s0 replay，300k冻结策略发现其校准价值，1M seed1发现live价值；但3 seeds×1M已足以拒绝当前`.25/r4`作为主配置。继续1.5M可能改变周期相位，却没有跨seed定向改善证据，低优先级且不值得直接续跑。
+- 下一步停止simple coef/replay网格，转向不会把同批反馈直接灌回共享critic的cross-fit/target-stabilized calibration，以及限制PPO闭环回摆的target-KL early stop；二者分别做默认关闭的单变量消融。
