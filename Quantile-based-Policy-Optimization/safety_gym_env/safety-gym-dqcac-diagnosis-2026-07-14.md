@@ -1342,3 +1342,21 @@ fresh 520条终评把P-M3→P-M5的reward/outage从`0.8622/159/520=0.3058`变为
 critic CDF误差从0.2015降到0.1264，仍然明显且符号由低估变为高估；因此target-KL不是distributional critic校准的替代品。更合理的解释是，8个PPO epoch中的整批策略位移被限制，缓和了critic/PID发生变化后actor一次性过冲。训练末20%outage反而由0.18变为0.235，也提醒target-KL可能减慢约束反馈，必须看独立策略而非只看20条训练batch。
 
 本配置通过预注册的seed1晋级门，seed0/2已经以完全相同的`.004`阈值、B20、1M预算和post-update final协议在后台并行运行。预计约11～13分钟完成训练与内置评估，之后各做520条fresh evaluation。只有三seed聚合仍改善且reward不退化，target-KL才进入主推荐；若只救seed1，它将被定级为压力seed稳定器，下一路线仍是cross-fit/慢target critic而不是扫描KL阈值。
+
+### 13.52 P-M5三seed结论：固定target-KL是安全—性能权衡，不是稳定支配改进（2026-07-16）
+
+seed0/2各完整跑满1M步并做520条fresh evaluation。baseline→target-KL的reward/outage分别为：seed0 `0.7180/0.1673→0.7140/0.2442`，seed1 `0.8622/0.3058→0.8684/0.1692`，seed2 `0.8670/0.2115→0.6780/0.1846`。固定`.004`在一个压力seed上大幅改善，却在原本安全的seed0上显著恶化约束，并使seed2 reward下降0.189。
+
+三seed合并outage从`356/1560=0.2282`降到`311/1560=0.1994`，Wilson 95%区间由`[0.2081,0.2497]`变为`[0.1803,0.2199]`；跨seed reward则从`0.8157±0.0847`降为`0.7535±0.1012`。按episode池化，outage差值区间刚好不跨0；但三个配对seed的变化是`+0.0769/-0.1365/-0.0269`，seed间sample std为0.1067。episode并非独立于初始化，不能用1560条池化把这种异质性抹掉。
+
+target-KL确实删除了相当数量的更新：三个seed分别完成`321/308/305`个actor epoch，而最大值均为400。三seed全程训练outage均值从0.1973降到0.1657，reward也从0.6590降到0.5731；因此机制是可解释的平均保守化，而不是免费稳定化。更关键的是，critic CDF误差均值从0.1029降到0.0633，seed0几乎精确校准但策略反而失约，证明校准准确性、PPO步长和PID响应必须作为闭环共同处理。
+
+所以`.004`保留为安全优先消融，不作为当前主推荐，不做阈值网格，也不续1.5M等待相位翻转。完整数据、配对CSV/JSON和图在`_runs/wandb_export/dqc_pm3_vs_pm5_targetkl004_multiseed_1m_2026-07-16/`及`_runs/profiles/dqc_pm3_vs_pm5_targetkl004_multiseed_1m_2026-07-16/`。这轮也直接回答训练长度问题：seed1×1M仍会给出错误的普适结论，3 seeds×1M才足以拒绝这个精确配置作为支配方案。
+
+### 13.53 C-X1：用上一批Polyak cost critic隔离同批critic→actor反馈（2026-07-16）
+
+现有inner loop先用当前rollout更新online critic，再让actor查询同一个online critic，最后才软更新target。即使不使用recent replay，当前批标签仍可经一次critic step立即改变当前批的risk advantage。C-X1新增`cost_actor_query_mode=target`：actor实际动作、行为策略动作baseline和constraint RMS改查Polyak target；QR训练、holdout、最终CDF和经验PID继续使用online。这让首个actor查询只依赖上一批之前形成的target，随后risk weight冻结供全部PPO epoch复用。
+
+默认仍为online。提交前后80环境步CPU回归中，6个module、lambda、RMS/runtime、训练指标和评估逐位一致；模块身份/故意扰动测试证明target查询不受online即时改动；target smoke正常退出并记录非零query gap。新增gap指标会告诉我们正式训练中两网是否真的分离，而不是仅凭配置名称推断有效。
+
+首个正式C-X1只在P-M3失败seed1上改这一项，target-KL关闭，simple replay关闭，完整跑1M而非100k。520门为outage不高于0.22且至少改善0.08、reward不低于0.75，并检查成熟阶段gap和末段周期。预计总墙钟12～14分钟。若通过再扩seed0/2；若失败，不扫tau，进入两折cross-fit或独立ensemble critic，因为那才提供更强的训练样本隔离。

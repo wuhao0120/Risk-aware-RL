@@ -871,3 +871,25 @@
 - critic也有改善但尚未校准：初始状态CDF absolute error从`|0.10427-0.30577|=0.20150`降至`|0.29561-0.16923|=0.12638`，约改善37.3%，但由严重低估转成明显高估。P-M5的主要收益不能归因于critic目标变化，因为critic配置与P-M3完全一致，更符合“限制8-epoch PPO过冲、改变策略—PID周期相位”的机制。
 - 该结果通过预注册门：outage不高于0.22、相对baseline下降超过0.08、reward不低于0.75，且520条而非140条给出一致方向。因此已原样启动seed0/2各1M的持久化后台复现，不调阈值、不挑checkpoint。两条并行预计约11～13分钟完成训练和内置评估，随后各做同协议520条fresh evaluation；多seed裁决仍使用全部三个seed，不能只保留压力seed1。
 - 对齐history与图位于`_runs/wandb_export/dqc_pm3_seed1_vs_pm5_targetkl004_1m_2026-07-16/`和`_runs/profiles/dqc_pm3_seed1_vs_pm5_targetkl004_1m_2026-07-16/`。seed0/2后台job分别为`DQCAC_DynamicButton_pm5_targetkl004_timew995_pi_target015_smoothT1_b20_ckpt100k_1m_s0`和同名`s2`。
+
+### E63：P-M5三seed裁决——聚合更安全，但固定KL阈值不稳定支配baseline（2026-07-16）
+
+- seed0/2完全复用seed1的P-M5配置，各训练1M步，训练耗时`700.3s/690.2s`，W&B run为`deugfqif/5y3izber`；两条后台作业、内置140评估和fresh 520评估均exit code 0。并行共享GPU使wall time高于seed1独占的`391.2s`，环境步与算法预算不变。
+- target-KL在seed0/1/2分别触发`15/19/20`个rollout，实际完成actor epoch为`321/308/305`，合计`934/1200`，即跳过22.2%的最大更新。它不是仅对seed1生效的偶然开关。
+- 520条严格同协议baseline→target-KL为：seed0 reward/outage `0.7180/87/520=0.1673 → 0.7140/127/520=0.2442`；seed1 `0.8622/159/520=0.3058 → 0.8684/88/520=0.1692`；seed2 `0.8670/110/520=0.2115 → 0.6780/96/520=0.1846`。
+- candidate逐seed outage Wilson 95%区间为`[0.2093,0.2829]`、`[0.1395,0.2039]`、`[0.1536,0.2202]`。seed0相对baseline恶化`+0.0769`，episode-level差值近似95%区间`[+0.0280,+0.1258]`；seed1改善`-0.1365`，区间`[-0.1876,-0.0855]`。相反方向都超出单纯520回合抽样噪声，说明真正的seed异质性。
+- 跨seed reward从`0.8157±0.0847`降为`0.7535±0.1012`，平均下降7.6%，主要来自seed2的`-0.1890`；合并outage从`356/1560=0.2282`降为`311/1560=0.1994`，Wilson区间从`[0.2081,0.2497]`变为`[0.1803,0.2199]`。按episode池化的差值区间刚好为`[-0.05760,-0.00009]`，但三个配对seed差为`+0.0769/-0.1365/-0.0269`、sample std达`0.1067`，不能忽略seed聚类后宣称稳健显著。
+- 训练曲线同样表现为安全—性能交换：三seed全程均值reward/outage由`0.6590/0.1973`变为`0.5731/0.1657`；末20%由`0.8083/0.2050`变为`0.6642/0.1933`。target-KL平均减少风险更新幅度，也同时减少有用reward更新。
+- critic CDF absolute error的seed均值从`0.1029`降至`0.0633`；seed0甚至由`0.0615`降至`0.0080`，最终outage却从0.1673升到0.2442。故“critic校准变准”不是策略必然更安全的充分条件；固定KL阈值还会截断高lambda下本来必要的risk correction。
+- 裁决：`.004`保留为安全优先消融/可选组件，但不作为超过QCPO_refs的主配置，不扫`.003/.005/.006`，也不直接续到1.5M。它通过聚合outage门，却没有满足预注册的reward不退化与跨seed一致性。单看seed1会误判为全面升级，单看seed0又会误判为全面失败；3 seeds×1M+520正是本问题所需的预算。
+- 完整history和训练图：`_runs/wandb_export/dqc_pm3_vs_pm5_targetkl004_multiseed_1m_2026-07-16/`、`_runs/profiles/dqc_pm3_vs_pm5_targetkl004_multiseed_1m_2026-07-16/`；后者新增`eval_multiseed.csv`、`eval_multiseed_summary.json`与`eval_multiseed_comparison.png`（2100×960，可解码验证通过）。
+
+### E64：C-X1慢target actor-query实现、回归与1M预注册（2026-07-16）
+
+- 代码审计发现当前每个inner update的顺序是`update_critic(batch) → update_actor(batch) → soft_update_target()`；首个actor epoch因此用已经看过当前rollout标签一次的online cost critic生成并缓存risk advantage。同批标签可经online critic立刻反馈给同批actor，是simple replay正反馈之外更基础的in-batch leakage。
+- 新增默认`online`的`cost_actor_query_mode`。显式`target`时，只有actor实际动作/行为策略baseline的cost CDF以及对应`constraint_rms`查询Polyak cost target；online critic仍负责QR训练、pre/post holdout、初始CDF、最终评估，经验PID完全不依赖critic。首个actor查询发生在本轮target同步之前，所以当前rollout标签不能先进入查询网络；随后8个PPO epoch继续复用同一个冻结risk weight。
+- 新增`advantage/risk_query_target_online_abs_mean`和summary同名字段，使用完全相同的`s,a,b`测量target与online风险CDF差。online默认返回精确0且不额外forward；target才多做一次无梯度online诊断前向。profiler已纳入该指标。
+- 默认兼容回归使用提交`1240549`与当前代码、CPU sync、相同seed、`2 iterations×2 envs×20=80`环境步：actor、reward/cost critic及两个target、obs normalizer共6个module，lambda tensor、runtime、metrics、config、metadata、8条eval和summary逐tensor/逐值exact；仅新增配置字段和工作树输出路径不同。
+- 数值测试确认online helper返回online模块、target helper返回target模块、初始两者逐tensor相等；故意修改online末层后target查询保持不变，非法mode被ValueError拒绝。target完整80步smoke训练`8.6s`、exit0，summary正确为`target`，末次target-online gap为`1.05e-9`；由于两批均零cost且只有4个critic step，该极小值只证明链路分离，正式run必须观察成熟阶段gap。
+- C-X1正式实验以P-M3失败seed1为压力基线，只改`cost_actor_query_mode=target`；`ppo_target_kl=0`、s0 aux=0、target tau=.05、interval=1、B20/C20/N32/T1/PID和1M预算全部不变。预计独占GPU训练约7～8分钟，140与520评估约5～6分钟，总计12～14分钟，持久化后台运行。
+- 520晋级门沿用压力seed标准：outage `≤0.22`且相对0.3058至少下降0.08，reward `≥0.75`；同时要求成熟阶段target-online gap非零、末20%不形成比baseline更大的周期。通过才扩seed0/2；失败则不扫target tau，转真正的两折cross-fit/双critic ensemble。该路线与target-KL保持正交，不在首轮混合。

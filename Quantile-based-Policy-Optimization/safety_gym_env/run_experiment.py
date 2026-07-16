@@ -173,6 +173,9 @@ def base_args(algo, seed, device, env_key):
         a.quantile_loss_reference_samples = 32
         a.target_tau = 0.05                             # 消除 critic 滞后 (已验证)
         a.target_update_interval = 1
+        # online逐式兼容；target只把actor/constraint-RMS风险查询切到Polyak网络，
+        # 用于隔离同一rollout cost标签经online critic即时反馈给actor的闭环泄漏。
+        a.cost_actor_query_mode = 'online'
         # n-step TD: T=1000 未折扣口径下 1-step 传播太慢 (600 updates 传不满 1000 步链,
         # 实测 cost-critic 在 s0 恒 0 → λ 不动)。n_step=100 → bootstrap 链长 10, 数百
         # updates 即可覆盖; on-policy 每迭代重采, n-step 和 + 截断 mask 均合法。

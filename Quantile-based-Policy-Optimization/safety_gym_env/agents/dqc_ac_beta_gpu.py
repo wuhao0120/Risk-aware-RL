@@ -142,6 +142,13 @@ class DQCACBetaGPU(VecAgentBase):
         self.huber_kappa = getattr(args, 'huber_kappa', 0.1)  # κ (0.1=近纯分位回归, 无偏)
         self.target_tau = getattr(args, 'target_tau', 0.05)   # target 软更新系数
         self.target_update_interval = getattr(args, 'target_update_interval', 1)
+        # C-X1 默认仍由 online cost critic 生成风险优势，逐式兼容全部历史实验。
+        # target 模式让 actor/constraint-RMS 只查询上一个 rollout 已形成的 Polyak
+        # critic，从而隔离“本批标签先训练 online critic、再立刻驱动本批 actor”的泄漏。
+        self.cost_actor_query_mode = str(
+            getattr(args, 'cost_actor_query_mode', 'online')).lower()
+        if self.cost_actor_query_mode not in {'online', 'target'}:
+            raise ValueError("cost_actor_query_mode must be 'online' or 'target'")
         self.n_step = max(1, int(getattr(args, 'n_step', 1)))
         # episodic (未折扣论文口径) 默认由 cost_gamma 推断: γc=1 → episode 末不 bootstrap
         self.episodic = bool(getattr(args, 'episodic', self.cost_gamma >= 1.0 - 1e-9))
@@ -461,6 +468,7 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_cdf_smooth_initial = 0.0                    # sigmoid CDF，仅作 surrogate 诊断
         self.last_pred_cost_mean = 0.0                        # cost-critic 估 E[C|s0]
         self.last_pred_cost_std = 0.0                         # cost-critic 估 std(C|s0)
+        self.last_risk_query_target_online_abs_mean = 0.0     # target/online actor风险CDF差
         # replay 只保存少量 GPU tensor；原始 state 在使用时重新走当前 RMS，不能
         # 缓存旧归一化结果，否则 observation statistics 漂移会污染监督输入。
         self.cost_s0_replay = deque(maxlen=self.cost_s0_replay_batches)
@@ -502,6 +510,7 @@ class DQCACBetaGPU(VecAgentBase):
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
               f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
               f"ppo_target_kl={self.ppo_target_kl:g}, "
+              f"actor_cost_query={self.cost_actor_query_mode}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}"
               f"/target{self.pid_target_prob:g}, "
               f"sum_norm={self.sum_norm}, policy_frozen={self.freeze_policy_updates}, "
@@ -1544,10 +1553,16 @@ class DQCACBetaGPU(VecAgentBase):
             budgets = batch['budgets']
             steps = batch['steps']
             if '_risk_weight' not in batch:
+                actor_cost_critic = self._cost_actor_query_critic()
                 cost_inputs = self._cost_inputs(
                     states, steps, batch.get('cost_feature'))
-                psi_c = self.cost_critic(cost_inputs, batch['actions'])
+                psi_c = actor_cost_critic(cost_inputs, batch['actions'])
                 psi_cdf = self._cost_tail_probability(psi_c, budgets)
+                # target模式额外查询同刻online网络只作诊断，不采样、不参与梯度；
+                # online默认直接返回0，保证历史路径不增加任何critic forward。
+                batch['_risk_query_target_online_abs_mean'] = (
+                    self._cost_actor_query_disagreement(
+                        cost_inputs, batch['actions'], budgets, psi_cdf).detach())
 
                 behavior_mean = batch['actor_mean'].reshape(n * B, self.action_dim)
                 behavior_log_std = batch['actor_log_std'].reshape(n * B, self.action_dim)
@@ -1555,7 +1570,7 @@ class DQCACBetaGPU(VecAgentBase):
                 for _sample_idx in range(self.num_action_samples):
                     baseline_action = self._sample_from_params(
                         behavior_mean, behavior_log_std)
-                    baseline_psi = self.cost_critic(cost_inputs, baseline_action)
+                    baseline_psi = actor_cost_critic(cost_inputs, baseline_action)
                     baseline_cdfs.append(
                         self._cost_tail_probability(baseline_psi, budgets))
                 baseline_cdf = torch.stack(baseline_cdfs, dim=0).mean(dim=0)
@@ -1650,6 +1665,8 @@ class DQCACBetaGPU(VecAgentBase):
             'advantage/risk_adv_abs_mean': float(raw_adv_c.abs().mean().item()),
             'advantage/risk_adv_nonzero_fraction': float(
                 (raw_adv_c.abs() > 1e-6).float().mean().item()),
+            'advantage/risk_query_target_online_abs_mean': float(
+                batch['_risk_query_target_online_abs_mean'].item()),
             'constraint/psi_c_mean': float(psi_cdf.mean().item()),
             'reward_value/loss': float(value_loss.item()),
             'reward_value/explained_variance': float(explained_var.item()),
@@ -1682,8 +1699,13 @@ class DQCACBetaGPU(VecAgentBase):
             # PPO 的行为分母与 advantage 都必须相对同一 rollout 固定；首次 actor epoch
             # 查询 cost critic 后缓存，后续 epochs 不再因 critic 更新而移动 risk target。
             if '_risk_weight' not in batch:
-                psi_c = self.cost_critic(self._aug(s, steps), a)       # [T·B,N]
+                actor_cost_critic = self._cost_actor_query_critic()
+                cost_inputs = self._aug(s, steps)
+                psi_c = actor_cost_critic(cost_inputs, a)             # [T·B,N]
                 psi_cdf = self._cost_tail_probability(psi_c, b)
+                batch['_risk_query_target_online_abs_mean'] = (
+                    self._cost_actor_query_disagreement(
+                        cost_inputs, a, b, psi_cdf).detach())
                 v_m, v_c = self._estimate_baselines(
                     s, b, steps, need_reward=self.reward_actor_mode == 'distributional')
                 raw_adv_c = psi_cdf - v_c
@@ -1778,6 +1800,8 @@ class DQCACBetaGPU(VecAgentBase):
             'advantage/risk_adv_abs_mean': float(raw_adv_c.abs().mean().item()),
             'advantage/risk_adv_nonzero_fraction': float(
                 (raw_adv_c.abs() > 1e-6).float().mean().item()),
+            'advantage/risk_query_target_online_abs_mean': float(
+                batch['_risk_query_target_online_abs_mean'].item()),
             'constraint/psi_c_mean': float(psi_cdf.mean().item()),
             'actor/w_mean': float(combined_weight.mean().item()),
             'actor/w_std': float(combined_weight.std(unbiased=False).item()),
@@ -1992,6 +2016,37 @@ class DQCACBetaGPU(VecAgentBase):
         sf = (steps.float() / self.n).reshape(-1, 1)
         return torch.cat([states, sf], dim=1)
 
+    def _cost_actor_query_critic(self):
+        """
+        返回生成 actor 风险优势的 cost critic，而不改变训练/评估 critic。
+
+        online 是历史路径。target 使用 Polyak 网络；训练循环在首个 actor epoch
+        之后才同步 target，且风险优势随后缓存，所以当前 rollout 的真实 cost
+        标签不会先进入查询网络再反过来更新同一批动作。校准、QR loss与最终评估
+        仍使用 online critic，保证该开关只检验 actor-query feedback。
+        """
+        if self.cost_actor_query_mode == 'target':
+            return self.cost_target_critic
+        return self.cost_critic
+
+    @torch.no_grad()
+    def _cost_actor_query_disagreement(self, inputs, actions, budgets, queried_cdf):
+        """
+        测量target与online对同一(s,a,b)的风险概率差，不改变优化目标。
+
+        online模式返回同device的精确0且不做额外前向。target模式才用online critic
+        复算CDF，并记录平均绝对差；它回答Polyak查询是否真的形成了非零时间隔离，
+        避免把数值上几乎相同的网络误报成有效cross-batch机制。
+        """
+        if self.cost_actor_query_mode != 'target':
+            self.last_risk_query_target_online_abs_mean = 0.0
+            return torch.zeros((), device=queried_cdf.device)
+        online_quantiles = self.cost_critic(inputs, actions)
+        online_cdf = self._cost_tail_probability(online_quantiles, budgets)
+        disagreement = (queried_cdf - online_cdf).abs().mean()
+        self.last_risk_query_target_online_abs_mean = float(disagreement.item())
+        return disagreement
+
     def _estimate_baselines(self, states, budgets, steps=None, need_reward=True,
                             policy_mean=None, policy_log_std=None,
                             cost_features=None):
@@ -2009,6 +2064,7 @@ class DQCACBetaGPU(VecAgentBase):
         cost_aug = (
             s_aug if self.cost_history_mode == 'raw'
             else self._cost_inputs(states, 0 if steps is None else steps, cost_features))
+        actor_cost_critic = self._cost_actor_query_critic()
         q_list, c_list = [], []
         for _ in range(self.num_action_samples):
             if self.recurrent_policy:
@@ -2021,7 +2077,7 @@ class DQCACBetaGPU(VecAgentBase):
                 a = self._sample_actions(states)
             if need_reward:
                 q_list.append(self.reward_critic(s_aug, a).mean(dim=1))          # reward 均值
-            cost_quantiles = self.cost_critic(cost_aug, a)
+            cost_quantiles = actor_cost_critic(cost_aug, a)
             c_list.append(self._cost_tail_probability(cost_quantiles, budgets))
         reward_baseline = torch.stack(q_list, dim=0).mean(dim=0) if need_reward else None
         cost_baseline = torch.stack(c_list, dim=0).mean(dim=0)
@@ -2058,7 +2114,8 @@ class DQCACBetaGPU(VecAgentBase):
             steps = batch['steps']
             cost_features = batch.get('cost_feature')
             cost_inputs = self._cost_inputs(s, steps, cost_features)
-            cost_quantiles = self.cost_critic(cost_inputs, a)
+            actor_cost_critic = self._cost_actor_query_critic()
+            cost_quantiles = actor_cost_critic(cost_inputs, a)
             psi_cdf = self._cost_tail_probability(cost_quantiles, b)
             policy_mean = (
                 batch['actor_mean'].reshape(-1, self.action_dim)
@@ -2157,6 +2214,8 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_critic_time_weighting != 'uniform'),
             'debug/cost_critic_weight_discount': self.cost_critic_weight_discount,
             'debug/cost_critic_weight_floor': self.cost_critic_weight_floor,
+            'debug/cost_actor_query_is_target': float(
+                self.cost_actor_query_mode == 'target'),
             'debug/cost_cdf_is_sigmoid': float(
                 self.cost_cdf_mode == 'sigmoid'),
             'debug/cost_cdf_temperature': self.cost_cdf_temperature,
@@ -2313,6 +2372,9 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_critic_time_weighting': self.cost_critic_time_weighting,
             'cost_critic_weight_discount': self.cost_critic_weight_discount,
             'cost_critic_weight_floor': self.cost_critic_weight_floor,
+            'cost_actor_query_mode': self.cost_actor_query_mode,
+            'risk_query_target_online_abs_mean': (
+                self.last_risk_query_target_online_abs_mean),
             'cost_s0_aux_coef': self.cost_s0_aux_coef,
             'cost_s0_replay_batches': self.cost_s0_replay_batches,
             's0_holdout_pre': dict(self.last_s0_holdout_pre),
