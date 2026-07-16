@@ -1020,3 +1020,15 @@ C-Q3B job `DQCAC_DynamicButton_recur_mc_c20_n64_ref32_chunk2500_100k_s0`（W&B `
 两条持久化集成验证均完成：'dqc_cost_grid_uniform_regression_smoke_20260716' 训练 '8.6s'、exit code 0；'dqc_cost_grid_query_mixture_smoke_20260716' 使用 N32+reference+query-focused，训练 '13.8s'、exit code 0，日志显示 'local19'，JSON 保存全部 grid 配置。两条都覆盖 recurrent rollout、MC cost target、critic/PPO 更新、hard/smooth 评估和进程回收。
 
 下一条 C-Q4A 是 100k reward-only 校准门：完全复用 N32 C20/MC baseline，只打开 query-mixture/query-focused 与 'reference_mean/ref32'。网络参数形状与 RNG 消耗不变，lambda=0，所以 reward/真实 cost 应逐点一致。通过条件为 CDF bias 从 '0.0978' 降到 '≤0.0734'，或 mean-cost relative error 进入 15%，且另一指标不恶化超过 10%。通过后才组合 'query-mixture+sigmoid T2' 做 300k constrained；若 CDF 接近通过但 mean 明显变差，补 C-Q4B importance-prediction；若全面无效，转 C-H1，不扫 local fraction/window。
+
+### 13.20 C-Q4A/B 结果：局部分辨率增加不是主要瓶颈（2026-07-16）
+
+C-Q4A query-focused（W&B 'tvgqpcip'）训练 '58.4s'、exit code 0。它与 uniform N32 baseline 的 reward、真实 cost、PPO 每个记录点一致，终评 truth 都是 reward '0.5527'、outage '0.2286'、mean cost '8.957'。query grid 的 CDF 为 '0.1386'、predicted mean 为 '6.934'，相对 uniform 的 '0.1308/6.974' 只把 CDF bias 从 '0.0978' 降到约 '0.0900'（改善约 8%），mean 反而略差；未达到预设门。
+
+A 还暴露了 prediction objective 的尺度混杂：cost grad norm '14.04'、joint clip fraction '1'，而 uniform N32 不触发 clip。因此按预案补 C-Q4B importance-prediction（W&B 'fw5276fj'）。B 把 cost grad 降到 '9.07'、clip 降为 '0'；终评 CDF '0.1374'、predicted mean '7.099'，CDF bias约 '0.0912'、mean relative error约 20.7%。优化更干净，但仍没有 25% CDF 改善或 15% mean-error。
+
+统一 profile 位于 '_runs/profiles/dqc_local_quantiles_q4ab_100k_2026-07-16/'，完整 history 位于 '_runs/wandb_export/dqc_local_quantiles_q4ab_100k_2026-07-16/'。三条 run 的 matched late reward 都是 '0.4766'，说明单变量隔离成立，无 NaN/Inf。
+
+阶段结论是：查询点局部 quantile 加密在工程和概率语义上可行，能把局部 CDF 步长约缩小 3 倍，也带来约 7～8% 的校准改善；但它没有修复约 20% 的 mean-cost 低估，说明主要误差不只是 hard CDF 分辨率。停止 local fraction/window/N 小网格，不跑 'local+T2,300k'。该实现保留为论文正消融和未来 IQN query-mixture 的权重基础。
+
+下一核心路线按预案转 C-H1：独立 online/target recurrent cost encoder，让 critic 条件变量包含完整 cost/history，而不是 reward actor 的漂移 feature。仍保留的分歧路线包括：C-Q2 adaptive sigmoid bandwidth（只改 actor 查询核）、C-H0.6 直接 actor (h,c)、P-M1 controller safety setpoint、uniform-IQN/query-mixture-IQN、以及 C-E1 checkpoint/eval-only。C-H1 先做 100k lambda0 校准门，通过才与 T2/PI 组合。

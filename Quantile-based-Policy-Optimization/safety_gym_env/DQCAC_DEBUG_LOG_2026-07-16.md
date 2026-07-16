@@ -532,3 +532,12 @@
 - 持久化回归 smoke 'dqc_cost_grid_uniform_regression_smoke_20260716' 训练 '8.6s'、exit 0；query smoke 'dqc_cost_grid_query_mixture_smoke_20260716' 训练 '13.8s'、exit 0，均覆盖 recurrent rollout、QR/PPO、评估和 JSON。
 - C-Q4A 门：N32+C20+MC+lambda0 100k，只打开 query_mixture/query_focused 与 reference/ref32。要求 truth 轨迹与 N32 baseline 一致；CDF bias 从 '0.0978' 降到 '≤0.0734'，或 mean relative error 进入 15%，另一指标不恶化 >10%。
 - 若 A 通过，组合 query grid+smooth T2 做 300k；若 A 接近但 mean 明显失真，跑 C-Q4B importance prediction；若 A 全面无效，优先 C-H1，不继续调 local fraction/window 小网格。
+
+### E29：C-Q4A/B 100k 结果，停止 local-grid 小网格
+
+- C-Q4A query-focused：W&B 'tvgqpcip'，训练 '58.4s'、exit 0；终评 CDF '0.1386'、pred mean '6.934'，truth '0.2286/8.957'。CDF bias '0.0900'，只比 uniform '0.0978' 改善约 8%。
+- A 的 cost grad norm '14.04'、clip fraction '1'，query-focused 同时放大了优化尺度；因此补预设 C-Q4B，而不把 A 的小改善当 local τ 结论。
+- C-Q4B importance-prediction：W&B 'fw5276fj'，终评 CDF '0.1374'、pred mean '7.099'；cost grad '9.07'、clip '0'。CDF bias约 '0.0912'、mean relative error 20.7%，仍未过门。
+- 三条 run 的 reward/真实 cost/PPO 逐点相同；local grid 两种 loss 都只有小幅校准收益。停止 fraction/window/N 小网格，不跑 local+T2 300k。
+- profile：'_runs/profiles/dqc_local_quantiles_q4ab_100k_2026-07-16/'；export：'_runs/wandb_export/dqc_local_quantiles_q4ab_100k_2026-07-16/'。
+- local τ 实现保留为正消融（查询步长更细但校准收益有限）；下一核心路线 C-H1 独立 recurrent cost encoder。C-Q2 adaptive bandwidth、IQN、P-M1 safety setpoint 与 checkpoint/eval-only 仍保留。
