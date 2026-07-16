@@ -1286,3 +1286,12 @@ K16在300–600k有真实的阶段性收益：K4→K16使训练outage `0.237→0
 新增`--critic_calibration_from`提供更干净且便宜的补测：从P-M3 seed1的1M checkpoint只恢复actor和两套归一化统计，critic从同seed重新初始化，actor/dual/RMS显式冻结；模块构造后重置采样RNG，使不同critic候选看到相同轨迹。smoke确认训练后actor与RMS逐tensor exact、actor update数为0、源cost critic没有加载。
 
 正式C-S0B用该成熟高风险策略和独立rollout seed101比较baseline与`coef=.25,replay4`，先各100k。只有训练超限事件至少10个时才允许作负结论；通过条件仍要求最后三批prequential误差改善20%且独立终评CDF或mean误差改善25%。这不是给所有失败组合无条件增加预算，而是在发现原screen缺乏tail事件后，用冻结相关分布恢复检验功效。
+
+
+### 13.46 C-S0B高风险100k：近期批次略有改善，独立评估反而恶化（2026-07-16）
+
+冻结成熟策略后五批outage为`0.20/0.10/0.15/0.25/0.30`，共20/100个超限事件；两条140终评的reward/outage/mean cost精确相同，actor与RMS也逐tensor exact。原实验缺乏tail事件的问题已经消除。
+
+replay4把最后三批pre-CDF error从`0.19010`降到`0.15729`（改善17.3%），pre mean bias改善22.8%，post-CDF error改善21.9%；但pre-Brier只改善5.8%。更关键的是独立终评CDF error从`0.04464`恶化到`0.05603`，mean-cost relative error从13.63%恶化到16.76%。所以它未通过预注册门，不能进入PID闭环。
+
+由于只有100个s0标签且pre-CDF连续同向改善、距20%门很近，增加一次封顶的300k配对功效扩展，预计总墙钟约6分钟；这不是1M晋级。若最后三分之一pre误差和独立终评仍不能同时过门，simple replay路线永久停止，转direct event classifier、ensemble uncertainty或cross-fit。另需单独处理联合reward+cost global grad clip造成的优化器级耦合。

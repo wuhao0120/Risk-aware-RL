@@ -811,3 +811,13 @@
 - C-S0B使用P-M3 seed1的1M final actor（原520条outage `0.3058`）作为相关高风险策略，另用rollout seed101。baseline与`coef=.25,replay4`各跑5×B20×T1000=100k、20 critic updates/rollout、140条配对终评；预计每条纯训练约45～60秒、含评估约1.5～2分钟，持久化后台串行。
 - 统计功效门：100条训练轨迹至少出现10次超限，否则不作负结论，改为增加冻结数据量；在事件充分时，候选须使最后三批prequential CDF error/Brier至少改善20%，且独立终评CDF absolute error或mean-cost relative error至少改善25%。只改善post同批仍判为记忆，不晋级。
 - 若C-S0B仍无pre/final信号，才停止simple replay coef网格并转direct exceedance classifier、bootstrap ensemble/upper-confidence CDF或cross-fit early stopping；若通过，再给冻结critic 300k确认，之后才放回PID闭环。
+
+
+### E57：C-S0B 100k结果与一次性300k功效扩展（2026-07-16）
+
+- baseline/aux的W&B为`rwqj0kch/x5inqzzi`，训练`46.4/45.9s`、exit0。五批outage逐点同为`0.20/0.10/0.15/0.25/0.30`，共`20/100`次超限；140条终评reward/outage/mean cost也exact为`0.8542/0.2643/10.9786`。actor与两套RMS逐tensor exact，统计功效和配对门均通过。
+- 最后三批pre-CDF absolute error从`0.19010→0.15729`，改善`17.3%`，接近但未过20%门；pre-Brier只改善`5.8%`。pre mean-cost absolute bias从`4.0248→3.1092`，改善`22.8%`。post-CDF error改善`21.9%`，更像提高同批/近期拟合。
+- 独立终评给出相反结论：hard CDF `0.21964→0.20826`，truth固定`0.26429`，absolute error从`0.04464`增到`0.05603`（恶化`25.5%`）；mean-cost relative error从约`13.63%`增到`16.76%`（恶化约`23%`）。因此100k未通过原晋级门，不能放回PID。
+- 额外发现：reward critic checkpoint并非exact。两组参数不共享，但当前`update_critic`对reward+cost参数做联合global grad clip；aux改变joint norm后会连带缩放reward critic梯度。这不影响冻结actor的真实策略比较，却说明“只改变cost监督”仍有优化器级耦合，后续应把separate clipping作为独立工程消融。
+- 因只有100个s0标签，且最后三批pre-CDF连续同向改善、仅差2.7个百分点，执行一次明确封顶的300k功效扩展：同source policy/rollout seed重新跑baseline与aux各15批，不改coef或任何其他参数。预计每条训练约2.3分钟、含评估约3分钟，总计约6分钟。
+- 300k终止门：至少约30个超限事件；最后三分之一pre-CDF/Brier须改善20%，独立终评CDF或mean relative error须改善25%。不通过即停止simple replay，不跑1M、不扫coef；通过也只进入一次PID 300k门，不直接宣称有效。
