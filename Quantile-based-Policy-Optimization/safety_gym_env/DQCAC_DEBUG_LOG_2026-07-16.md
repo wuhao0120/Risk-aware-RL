@@ -101,13 +101,23 @@
 
 ### E2：纯奖励门——scalar value + GAE（不启用 PPO）
 
-- 状态：待 on-policy 修正提交后重新启动。
-- 唯一 reward 主干变化：`reward_actor_mode=gae`；PPO clip 暂不开。
-- 隔离设置：`lambda_max=0`，确保 cost critic/dual 不能污染 reward actor 梯度。
-- 沿用 E1 的 `init_std=1.0`、`B=10`、`T=1000`、`warmup_iters=30`、seed 0；critic/value epochs=10，actor epochs=1，保证 GAE 单独消融严格 on-policy。
-- 预算：80 iterations = 80 万 env steps；减少 9 次 actor 前向/反向后，保守预计训练约 6~8 分钟，评估后总计约 8~10 分钟；启动后再按实测 iteration 速度校准。
-- 检查点：60 万步。届时已完成约 30 个 actor rollout；若 reward late mean/斜率均不优于 E1 的 matched-budget 曲线，则停止，不扩大预算。
-- 通过后才运行 E3 `gae_ppo`，从而把 GAE 和 PPO clip 的贡献拆开。
+- 状态：已完成（exit code 0）；通过持久化后台运行。
+- job：`DQCAC_DynamicButton_dbg_e2b_gae_onpolicy_rewardonly_800k_s0`；PID：`43188`。
+- W&B run id：`tayn9ex2`；源码 commit：`b91405b`（未 push）。
+- 设置：`reward_actor_mode=gae`、`lambda_max=0`、`init_std=1.0`、`B=10`、`T=1000`、`warmup_iters=30`、critic/value epochs=10、actor epochs=1。
+- 实际训练耗时 `343.4s`；80 万步完成后评估 130 条轨迹，总 job 约 6 分钟。
+- 60 万步 W&B 门槛：late reward mean `-0.0087`、slope `+0.0616/百万步`，均低于同预算 E1 的 `0.0451`、`+0.1728`。虽在约 73 万步尝试优雅中止，但多进程 rollout 没有及时响应 SIGINT，已接近预算终点，故保留正常完成与终点评估。
+- 80 万步最终 profile：late reward mean `0.00635`、slope `+0.0719/百万步`；E1 分别为 `0.1125`、`+0.2397`，QCPO_refs 为 `1.451`、`+1.606`。
+- GAE 确实把 reward advantage std 从 E1 的 `0.0184` 放大到 `0.0543`，actor grad norm late mean 为 `0.0113`；value explained variance 中段 `0.174`、后段 `0.060`。信号尺度变大但单次 actor step 没转化为有效策略改进。
+- 统一评估：mean reward `-0.00177`、reward std `0.1271`、outage `0`。本配置未通过 reward 门，不扩展预算或 seed。
+- 最终导出：`_runs/wandb_export/final_e2b_dynamicbutton_2026-07-16/`；profile：`_runs/profiles/final_e2b_dynamicbutton_2026-07-16/`。
+
+### E3：纯奖励门——GAE + PPO clip 多 actor epochs
+
+- 状态：待启动；只在 E2 上增加固定行为策略 ratio、PPO clip 与多 actor epochs。
+- 设置：`reward_actor_mode=gae_ppo`、actor epochs=8（对齐 QCPO_refs）、critic/value epochs=10、`ppo_ratio_clip=0.1`；`lambda_max=0`、std、warmup、B/T 与 E2 保持一致。
+- 预算：60 iterations = 60 万 env steps，评估 64 条轨迹；预计训练约 4~5 分钟，含评估约 5~6 分钟。
+- 判据：reward late mean/slope 至少超过同预算 E1；同时 ratio、clip fraction、approx KL 和 actor grad 必须有限。若未通过，再单独测试去掉 reward-only 无意义的 30-iteration warmup，不把两个变量混为一次改动。
 
 ## 4. 分阶段改进路线
 
