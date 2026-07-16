@@ -892,3 +892,35 @@ P-B3 只把 P-B2 的经验窗口从 100 条轨迹缩到 50，其余配置保持�
 - **C-H3（full shared hybrid）**：允许 cost loss 更新共享 actor encoder；样本效率可能更高，但已是新算法，必须与 detach 版本分开报告。
 
 下一条只跑 C-H0.5A reward-only 100k：沿用 C20+MC、actor lr `3e-4`、`lambda=0`，与 raw C20（W&B `059boy42`）一项对照。通过门槛是：CDF 绝对偏差相对 `0.0978` 至少下降 25%，或 mean-cost 相对误差从 22% 降到 15% 内，同时另一校准量不恶化超过 10%、reward/PPO 不异常。未通过就不跑 300k，直接实现 C-H1；通过后才进入 P-B3 控制器下的 300k constrained 门控，并补 C-H0.5B 容量控制。
+
+
+### 13.13 C-H0.5A 100k 结果：共享 actor feature 未通过（2026-07-16）
+
+C-H0.5A job `DQCAC_DynamicButton_recur_mc_c20_ch05_actorfeature_100k_s0`（W&B `ooy3dlxs`）从 commit `6780296` 启动，训练 `58.7s`、exit code 0。它与 raw C20（W&B `059boy42`）只有 `cost_history_mode=actor_feature` 一项差异。
+
+隔离结果非常干净：两条 run 的每个 reward 点、真实 cost/outage、PPO 与 value 指标相同；共同后段 reward 都是 `0.4766/+6.716/M`，70 条终评均为 reward `0.5527`、outage `0.2286`、mean cost `8.957`。因此差异只来自 cost critic 条件表示。
+
+但历史 feature 没有改善校准：
+
+- raw C20：hard CDF `0.1308`，绝对偏差 `0.0978`；pred mean `6.974`，相对真实 mean 低估约 22.1%。
+- actor feature：hard CDF `0.1129`，绝对偏差 `0.1156`；pred mean `6.634`，低估约 25.9%。
+- CDF 偏差恶化约 18%，mean 也变差，明确不通过预设门槛；不扩 300k、不补 seed。
+
+完整 profile 位于 `_runs/profiles/dqc_cost_history_ch05_100k_2026-07-16/`，原始导出位于 `_runs/wandb_export/dqc_cost_history_ch05_100k_2026-07-16/`。
+
+该负结果削弱但没有完全排除 cost-history 假设：当前 `φ=MLP+LSTM output` 不含 LSTM cell state，且它由 reward/PPO 目标训练、跨 iteration 漂移，并不等价于独立 cost recurrent sufficient state。C-H1 独立 online/target cost RNN、直接拼 actor `(h,c)` 的 C-H0.6、MLP-only 容量控制 C-H0.5B 均保留为消融路线；不过在 H0.5A 没有任何正信号后，不应立即做最重的结构改写。
+
+### 13.14 C-Q1 查询点平滑 CDF：优先处理 hard-count 稀疏性（2026-07-16）
+
+raw/actor-feature 的末期 hard-CDF action advantage 标准差仅约 `0.005～0.007`。原因是 N=32 时每个动作的概率只能以 `1/32` 跳变；绝大多数 `(history,budget)` 要么所有 quantiles 都在阈值同一侧，要么 K 个候选动作得到相同计数，导致 risk action advantage 精确为 0。分布 critic 的 mean/CDF 校准只是必要条件，不能保证查询点附近有可用的动作排序信号。
+
+新增默认关闭的 `cost_cdf_mode=hard|sigmoid` 与 `cost_cdf_temperature`：
+
+- hard 逐元素复现 `(1/N)ΣI{z_i≥b}`；手算断言完全相同，历史实验默认不变。
+- sigmoid 使用 `(1/N)Σsigmoid((z_i-b)/T)`，首条路线固定 `T=1 cost unit`。它只用于 actor 实际动作、K-action baseline 及 constraint-RMS 的 risk surrogate。
+- QR target/loss、cost critic hard CDF 校准、empirical outage 和 empirical PI 全部保持 hard/真实口径；日志同时保存 hard/smooth s0 CDF，不能把 smooth surrogate 当作约束已满足。
+- 新增 `risk_adv_abs_mean` 与 `risk_adv_nonzero_fraction`，直接验证平滑是否把查询点附近的动作差异从量化零值中释放出来。
+
+持久化 smoke `dqc_cq1_sigmoid_cdf_smoke_20260716` 训练 `6.3s`、exit code 0，覆盖 MC、chunked critic、smooth actor、hard/smooth eval 与 JSON。下一条 P-S1 逐项复用 P-B3，只设 `cost_cdf_mode=sigmoid,T=1`；300k 训练预计约 `160s`，128 条终评约 `25～45s`。通过门槛是终评 outage `≤0.22` 且 reward 明显高于 E9 seed0 的 `0.658`；若 outage 仍高于 `0.3` 或 reward 前 150k 已明显崩坏，则不再扩 temperature 网格。
+
+分歧路线继续保留：固定温度 `{0.5,1,2}` 只在 T=1 有正信号时展开；C-Q2 用查询附近 quantile spacing 自适应温度；C-Q3 为 N=64/128；C-Q4 为 uniform τ + 查询点局部加密并做 importance weighting；C-Q5 为 uniform-IQN/query-mixture-IQN。C-H1 独立 cost RNN 与 C-B 大 `num_envs` 仍是正交消融，不和首条平滑 run 同时改变。

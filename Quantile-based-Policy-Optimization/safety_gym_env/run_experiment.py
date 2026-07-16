@@ -172,6 +172,10 @@ def base_args(algo, seed, device, env_key):
         # C-H0.5 显式消融：raw 保持历史 Markov critic；actor_feature 复用并 detach
         # recurrent policy 的历史特征，只改变 cost critic 条件变量，不反传到 actor。
         a.cost_history_mode = 'raw'
+        # C-Q1 查询点平滑默认关闭；sigmoid 只替换 actor risk CDF surrogate，
+        # hard 校准/经验 outage/QR critic 均保留，便于无歧义消融。
+        a.cost_cdf_mode = 'hard'
+        a.cost_cdf_temperature = 1.0
         a.num_action_samples = 4
         a.advantage_norm = 'qcpo'                       # EMA 归一化 (反 λ 卷绕, 已验证)
         a.norm_ema_decay = 0.1
@@ -388,6 +392,8 @@ def main():
         }
         if res.get('cost_cdf_initial') is not None:
             eval_log['eval/cost_cdf_initial'] = res['cost_cdf_initial']
+        if res.get('cost_cdf_smooth_initial') is not None:
+            eval_log['eval/cost_cdf_smooth_initial'] = res['cost_cdf_smooth_initial']
         if res.get('pred_cost_mean') is not None:
             eval_log['eval/pred_cost_mean'] = res['pred_cost_mean']
         if res.get('pred_cost_std') is not None:

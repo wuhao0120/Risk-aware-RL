@@ -461,3 +461,21 @@
 - 接口回归：旧四元 actor forward 与 feature 五元接口数值逐元素相同。持久化 smoke `dqc_ch05_actor_feature_smoke_20260716` 与 `dqc_ch05_raw_regression_smoke_20260716` 均约 `6s`、exit code 0。
 - C-H0.5A 的混杂因素是 feature 容量更大且随 actor 漂移。若 100k 有效，补 C-H0.5B（MLP-only feature/容量匹配 raw projection）；若无效，进入 C-H1 独立 online/target recurrent cost encoder。raw+history concat（C-H2）和允许 cost 梯度进 actor 的 full-shared（C-H3）只作为后续独立消融。
 - 100k 门：C20+MC、actor lr3e-4、lambda0，只改 history mode。相对 raw C20 的 CDF bias `0.0978` 至少降 25%，或 mean-cost 相对误差从 22% 进入 15%，且另一校准量不恶化 >10%；否则不扩 300k。
+
+
+### E22：C-H0.5A 100k 负结果
+
+- job `DQCAC_DynamicButton_recur_mc_c20_ch05_actorfeature_100k_s0`，W&B `ooy3dlxs`，commit `6780296`，训练 `58.7s`、exit code 0；与 raw C20 唯一差异是 `cost_history_mode=actor_feature`。
+- 两条 reward/真实 cost/PPO 序列逐点相同；终评都为 reward `0.5527`、outage `0.2286`、mean cost `8.957`，单变量隔离成立。
+- raw 的 CDF/mean 为 `0.1308/6.974`；actor feature 为 `0.1129/6.634`。CDF bias 从 `0.0978` 恶化到 `0.1156`，mean 相对低估从 22.1% 恶化到 25.9%，门控失败，不扩 300k。
+- profile：`_runs/profiles/dqc_cost_history_ch05_100k_2026-07-16/`；export：`_runs/wandb_export/dqc_cost_history_ch05_100k_2026-07-16/`。
+- C-H1 独立 cost RNN、actor `(h,c)` C-H0.6、MLP-only 容量控制仍保留；H0.5A 无正信号后，先处理证据更直接的 hard-CDF 查询稀疏性。
+
+### E23：C-Q1 sigmoid 查询 CDF 实现与 P-S1 门
+
+- 新开关 `cost_cdf_mode=hard|sigmoid`、`cost_cdf_temperature`，默认 `hard/1`。hard 手算逐元素等于旧 quantile count。
+- sigmoid surrogate 为 `(1/N)Σsigmoid((z_i-b)/T)`，只进入 actor actual/baseline risk CDF 与 constraint RMS；QR loss、hard calibration、empirical outage/PID 均不改。
+- 新日志：smooth s0 CDF、risk advantage absolute mean/nonzero fraction、mode/temperature。它们用于判断 N=32 hard count 是否让多数 action difference 精确为 0。
+- 持久化 smoke `dqc_cq1_sigmoid_cdf_smoke_20260716`：训练 `6.3s`、exit code 0，hard/smooth eval 和 JSON 全链路通过。
+- P-S1 只在 P-B3 上打开 `sigmoid,T=1`；预计训练约 160s、总计约 3～3.5min。门：outage `≤0.22` 且 reward `>0.658`；outage>0.3 或前半段 reward 明显崩坏则停止 temperature 网格。
+- 备选消融：T=.5/2、自适应 local spacing、N=64/128、local-τ importance weighting、uniform/query-mixture IQN；C-H1 与大 B 不在 P-S1 同时打开。

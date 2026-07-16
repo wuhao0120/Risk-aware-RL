@@ -52,6 +52,15 @@ class DQCACBetaGPU(VecAgentBase):
         self.beta = getattr(args, 'beta', 0.95)               # Abel 风险折扣 β (仅 cost 约束项)
         self.outer_interval = max(1, int(getattr(args, 'outer_interval', 1)))
         self.num_quantiles = getattr(args, 'num_quantiles', 32)
+        # hard 完全复现历史 quantile count；sigmoid 只平滑 actor 查询点的
+        # indicator，不改变 QR target/loss、经验 outage 或 hard-CDF 校准指标。
+        self.cost_cdf_mode = str(getattr(args, 'cost_cdf_mode', 'hard')).lower()
+        if self.cost_cdf_mode not in {'hard', 'sigmoid'}:
+            raise ValueError("cost_cdf_mode must be 'hard' or 'sigmoid'")
+        self.cost_cdf_temperature = float(
+            getattr(args, 'cost_cdf_temperature', 1.0))
+        if self.cost_cdf_temperature <= 0.0:
+            raise ValueError("cost_cdf_temperature must be positive")
         self.huber_kappa = getattr(args, 'huber_kappa', 0.1)  # κ (0.1=近纯分位回归, 无偏)
         self.target_tau = getattr(args, 'target_tau', 0.05)   # target 软更新系数
         self.target_update_interval = getattr(args, 'target_update_interval', 1)
@@ -249,7 +258,8 @@ class DQCACBetaGPU(VecAgentBase):
         # -------------------- 运行时统计 (诊断量) --------------------
         self.learning_steps = 0
         self.last_dual_prob = 0.0                             # dual 用的 cost-critic P(C≥d)
-        self.last_cdf_initial = 0.0                           # cost-critic 估计 P(C≥d) (校准诊断)
+        self.last_cdf_initial = 0.0                           # hard cost-CDF，供真实校准
+        self.last_cdf_smooth_initial = 0.0                    # sigmoid CDF，仅作 surrogate 诊断
         self.last_pred_cost_mean = 0.0                        # cost-critic 估 E[C|s0]
         self.last_pred_cost_std = 0.0                         # cost-critic 估 std(C|s0)
         self.empirical_cost_window = deque(maxlen=self.pid_window_episodes)
@@ -275,6 +285,7 @@ class DQCACBetaGPU(VecAgentBase):
               f"d(cost_limit)={self.cost_limit}, cost_gamma={self.cost_gamma}, episodic={self.episodic}, "
               f"step_feature={self.critic_step_feature}, N={self.num_quantiles}, B={self.num_envs}, T={self.n}, "
               f"cost_target={self.cost_target_mode}, cost_history={self.cost_history_mode}, "
+              f"cost_cdf={self.cost_cdf_mode}/T{self.cost_cdf_temperature:g}, "
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
               f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}, "
@@ -836,7 +847,7 @@ class DQCACBetaGPU(VecAgentBase):
                 cost_inputs = self._cost_inputs(
                     states, steps, batch.get('actor_feature'))
                 psi_c = self.cost_critic(cost_inputs, batch['actions'])
-                psi_cdf = (psi_c >= budgets.unsqueeze(1)).float().mean(dim=1)
+                psi_cdf = self._cost_tail_probability(psi_c, budgets)
 
                 behavior_mean = batch['actor_mean'].reshape(n * B, self.action_dim)
                 behavior_log_std = batch['actor_log_std'].reshape(n * B, self.action_dim)
@@ -846,7 +857,7 @@ class DQCACBetaGPU(VecAgentBase):
                         behavior_mean, behavior_log_std)
                     baseline_psi = self.cost_critic(cost_inputs, baseline_action)
                     baseline_cdfs.append(
-                        (baseline_psi >= budgets.unsqueeze(1)).float().mean(dim=1))
+                        self._cost_tail_probability(baseline_psi, budgets))
                 baseline_cdf = torch.stack(baseline_cdfs, dim=0).mean(dim=0)
                 raw_adv_c = psi_cdf - baseline_cdf
 
@@ -926,6 +937,9 @@ class DQCACBetaGPU(VecAgentBase):
             'advantage/mean_adv_std': float(
                 batch['_reward_advantage_raw'].std(unbiased=False).item()),
             'advantage/risk_adv_std': float(raw_adv_c.std(unbiased=False).item()),
+            'advantage/risk_adv_abs_mean': float(raw_adv_c.abs().mean().item()),
+            'advantage/risk_adv_nonzero_fraction': float(
+                (raw_adv_c.abs() > 1e-6).float().mean().item()),
             'constraint/psi_c_mean': float(psi_cdf.mean().item()),
             'reward_value/loss': float(value_loss.item()),
             'reward_value/explained_variance': float(explained_var.item()),
@@ -957,7 +971,7 @@ class DQCACBetaGPU(VecAgentBase):
             # 查询 cost critic 后缓存，后续 epochs 不再因 critic 更新而移动 risk target。
             if '_risk_weight' not in batch:
                 psi_c = self.cost_critic(self._aug(s, steps), a)       # [T·B,N]
-                psi_cdf = (psi_c >= b.unsqueeze(1)).float().mean(dim=1)
+                psi_cdf = self._cost_tail_probability(psi_c, b)
                 v_m, v_c = self._estimate_baselines(
                     s, b, steps, need_reward=self.reward_actor_mode == 'distributional')
                 raw_adv_c = psi_cdf - v_c
@@ -1037,6 +1051,9 @@ class DQCACBetaGPU(VecAgentBase):
             'actor/risk_coefficient': float(risk_coef.item()),
             'advantage/mean_adv_std': float(raw_adv_m.std(unbiased=False).item()),
             'advantage/risk_adv_std': float(raw_adv_c.std(unbiased=False).item()),
+            'advantage/risk_adv_abs_mean': float(raw_adv_c.abs().mean().item()),
+            'advantage/risk_adv_nonzero_fraction': float(
+                (raw_adv_c.abs() > 1e-6).float().mean().item()),
             'constraint/psi_c_mean': float(psi_cdf.mean().item()),
             'actor/w_mean': float(combined_weight.mean().item()),
             'actor/w_std': float(combined_weight.std(unbiased=False).item()),
@@ -1157,6 +1174,31 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_dual_prob = window_prob
 
     # ============================================================ 辅助 (与模板同语义) ============================================================
+    def _cost_tail_probability(self, quantiles, budgets, mode=None):
+        """
+        在查询 budget 处把 cost quantiles 转成上尾概率 surrogate。
+
+        hard 是历史 `(1/N) sum I{z_i>=b}`，分辨率受 N 限制；sigmoid 用
+        `(1/N) sum sigmoid((z_i-b)/temperature)` 给查询点邻域连续权重。平滑只在
+        actor risk advantage/其 baseline/尺度统计中启用；日志与 empirical PID
+        仍显式调用 hard，避免把 surrogate bias 误报为真实约束满足。
+        """
+        selected_mode = self.cost_cdf_mode if mode is None else str(mode).lower()
+        if torch.is_tensor(budgets):
+            budget_values = budgets.to(
+                device=quantiles.device, dtype=quantiles.dtype)
+            if budget_values.ndim == quantiles.ndim - 1:
+                budget_values = budget_values.unsqueeze(-1)
+        else:
+            budget_values = float(budgets)
+        if selected_mode == 'hard':
+            return (quantiles >= budget_values).float().mean(dim=-1)
+        if selected_mode != 'sigmoid':
+            raise ValueError(f"unknown cost CDF mode: {selected_mode!r}")
+        scaled_margin = (
+            (quantiles - budget_values) / self.cost_cdf_temperature)
+        return torch.sigmoid(scaled_margin).mean(dim=-1)
+
     def _cost_inputs(self, states, steps, actor_features=None):
         """
         构造 cost distribution critic 的条件输入。
@@ -1198,7 +1240,6 @@ class DQCACBetaGPU(VecAgentBase):
         GAE actor 已由独立 V_r(s) 提供 reward baseline；跳过无用的 reward critic K 次前向
         不改变 cost advantage 数值，可显著减少长 rollout 的 GPU 计算。
         """
-        b_col = budgets.unsqueeze(1)
         # 所有 critic 前向都必须与 actor 共享 observation 统计；steps=None 仅表示
         # 不追加 t/T，不能跳过归一化，否则该兼容分支会混用两套输入尺度。
         s_aug = self._aug(states, steps) if steps is not None else self._normalize_states(states)
@@ -1219,7 +1260,8 @@ class DQCACBetaGPU(VecAgentBase):
                 a = self._sample_actions(states)
             if need_reward:
                 q_list.append(self.reward_critic(s_aug, a).mean(dim=1))          # reward 均值
-            c_list.append((self.cost_critic(cost_aug, a) >= b_col).float().mean(dim=1))
+            cost_quantiles = self.cost_critic(cost_aug, a)
+            c_list.append(self._cost_tail_probability(cost_quantiles, budgets))
         reward_baseline = torch.stack(q_list, dim=0).mean(dim=0) if need_reward else None
         cost_baseline = torch.stack(c_list, dim=0).mean(dim=0)
         return reward_baseline, cost_baseline
@@ -1255,7 +1297,8 @@ class DQCACBetaGPU(VecAgentBase):
             steps = batch['steps']
             cost_features = batch.get('actor_feature')
             cost_inputs = self._cost_inputs(s, steps, cost_features)
-            psi_cdf = (self.cost_critic(cost_inputs, a) >= b.unsqueeze(1)).float().mean(dim=1)
+            cost_quantiles = self.cost_critic(cost_inputs, a)
+            psi_cdf = self._cost_tail_probability(cost_quantiles, b)
             policy_mean = (
                 batch['actor_mean'].reshape(-1, self.action_dim)
                 if self.recurrent_policy else None)
@@ -1286,7 +1329,11 @@ class DQCACBetaGPU(VecAgentBase):
             cost_input0 = self._cost_inputs(s0, 0, feature0)
             psi = self.cost_critic(cost_input0, a0)           # [B, N]
             self.last_cdf_initial = float(
-                (psi >= self.cost_limit).float().mean(dim=1).mean())      # 上尾
+                self._cost_tail_probability(
+                    psi, self.cost_limit, mode='hard').mean().item())
+            self.last_cdf_smooth_initial = float(
+                self._cost_tail_probability(
+                    psi, self.cost_limit, mode='sigmoid').mean().item())
             self.last_pred_cost_mean = float(psi.mean().item())
             self.last_pred_cost_std = float(psi.std(dim=1).mean().item())
         return self.last_cdf_initial
@@ -1304,6 +1351,7 @@ class DQCACBetaGPU(VecAgentBase):
         extra = {
             'constraint/cdf_estimate_initial': ghat,          # Ĝ ≈ P(Z≤q|s0) (与 empirical 同口径)
             'constraint/cdf_calibration_error': abs(ghat - empirical_prob),
+            'constraint/cdf_estimate_smooth_initial': self.last_cdf_smooth_initial,
             'critic/pred_cost_mean': self.last_pred_cost_mean,
             'critic/pred_cost_std': self.last_pred_cost_std,
             'constraint/dual_prob': self.last_dual_prob,
@@ -1330,6 +1378,9 @@ class DQCACBetaGPU(VecAgentBase):
             'dual/sum_norm_enabled': float(self.sum_norm),
             'debug/cost_history_actor_feature': float(
                 self.cost_history_mode == 'actor_feature'),
+            'debug/cost_cdf_is_sigmoid': float(
+                self.cost_cdf_mode == 'sigmoid'),
+            'debug/cost_cdf_temperature': self.cost_cdf_temperature,
             'budget/min': float(np.min(budgets_np)),
             'budget/max': float(np.max(budgets_np)),
             'budget/mean': float(np.mean(budgets_np)),
@@ -1407,7 +1458,11 @@ class DQCACBetaGPU(VecAgentBase):
             cost_input0 = self._cost_inputs(s0, 0, feature0)
             psi0 = self.cost_critic(cost_input0, a0)
             cost_cdf_initial = float(
-                (psi0 >= float(cost_limit)).float().mean(dim=1).mean().item())
+                self._cost_tail_probability(
+                    psi0, float(cost_limit), mode='hard').mean().item())
+            cost_cdf_smooth_initial = float(
+                self._cost_tail_probability(
+                    psi0, float(cost_limit), mode='sigmoid').mean().item())
             pred_cost_mean = float(psi0.mean().item())
             pred_cost_std = float(psi0.std(dim=1).mean().item())
 
@@ -1431,6 +1486,7 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_quantile': float(np.percentile(cost_np, (1.0 - omega) * 100)),
             'num_episodes': int(reward_np.shape[0]),
             'cost_cdf_initial': cost_cdf_initial,
+            'cost_cdf_smooth_initial': cost_cdf_smooth_initial,
             'pred_cost_mean': pred_cost_mean,
             'pred_cost_std': pred_cost_std,
         }
@@ -1453,6 +1509,8 @@ class DQCACBetaGPU(VecAgentBase):
             'reward_actor_mode': self.reward_actor_mode,
             'policy_arch': self.policy_arch,
             'cost_history_mode': self.cost_history_mode,
+            'cost_cdf_mode': self.cost_cdf_mode,
+            'cost_cdf_temperature': self.cost_cdf_temperature,
             'actor_updates_per_episode': self.actor_updates_per_episode,
             'num_envs': self.num_envs,
             'num_iterations': self.num_iterations,
