@@ -41,6 +41,64 @@ from .vec_base import VecAgentBase
 from .common import DistributionalCritic, ScalarValueCritic, lr_lambda, indicator_ge
 
 
+def _build_cost_quantile_grid(num_quantiles, mode, query_tau, half_width,
+                              local_fraction, device):
+    """
+    构造 cost-only quantile grid 与 uniform-τ 积分的 importance 权重。
+
+    uniform 返回标准 midpoint grid 和 1/N 权重。query_mixture 把 τ 看作来自
+    (1-r)Uniform(0,1)+r Uniform(low,high)：先对 mixture CDF 的等距 midpoint
+    做解析反演，再用 1/g(τ) 归一化权重近似 uniform-τ 积分。这样局部输出头更密，
+    但 CDF/分布矩仍保持概率质量之和为 1，不会把重复查询点误当成更多概率。
+    """
+    count = int(num_quantiles)
+    if count <= 0:
+        raise ValueError("num_quantiles must be positive")
+    selected_mode = str(mode).lower()
+    if selected_mode not in {'uniform', 'query_mixture'}:
+        raise ValueError("cost_quantile_grid_mode must be 'uniform' or 'query_mixture'")
+
+    # u_i 是 sampling distribution 下每个等质量分层的 midpoint；无随机采样，
+    # 所以相同配置跨 run 完全可复现，也不会扰动 policy action 的 RNG 流。
+    u = (torch.arange(count, dtype=torch.float64, device=device) + 0.5) / count
+    if selected_mode == 'uniform':
+        density = torch.ones_like(u)
+        weights = torch.full_like(u, 1.0 / count)
+        return u.float(), weights.float(), density.float()
+
+    center = float(query_tau)
+    radius = float(half_width)
+    mixture = float(local_fraction)
+    low, high = center - radius, center + radius
+    if not 0.0 < low < high < 1.0:
+        raise ValueError("query_tau +/- cost_quantile_local_half_width must lie in (0,1)")
+    if not 0.0 < mixture < 1.0:
+        raise ValueError("cost_quantile_local_fraction must lie in (0,1)")
+
+    # mixture CDF 的三个线性区间：
+    # outside density=(1-r)，inside density=(1-r)+r/(high-low)。
+    base_density = 1.0 - mixture
+    local_density = base_density + mixture / (high - low)
+    cdf_low = base_density * low
+    cdf_high = base_density * high + mixture
+    taus = torch.empty_like(u)
+    below = u < cdf_low
+    inside = (u >= cdf_low) & (u <= cdf_high)
+    above = u > cdf_high
+    taus[below] = u[below] / base_density
+    taus[inside] = (
+        u[inside] + mixture * low / (high - low)) / local_density
+    taus[above] = (u[above] - mixture) / base_density
+
+    # Deterministic importance sampling：E_uniform[f(τ)] =
+    # E_mixture[f(τ)/g(τ)]。有限分层下重新归一化，保证权重严格和为 1。
+    density = torch.where(inside, torch.full_like(u, local_density),
+                          torch.full_like(u, base_density))
+    inverse_density = density.reciprocal()
+    weights = inverse_density / inverse_density.sum()
+    return taus.float(), weights.float(), density.float()
+
+
 class DQCACBetaGPU(VecAgentBase):
     """DQC-AC-β CMDP 版 (reward+cost 双分布式 critic; budget/critic-dual 在 cost 上; 上尾约束)。"""
 
@@ -52,6 +110,26 @@ class DQCACBetaGPU(VecAgentBase):
         self.beta = getattr(args, 'beta', 0.95)               # Abel 风险折扣 β (仅 cost 约束项)
         self.outer_interval = max(1, int(getattr(args, 'outer_interval', 1)))
         self.num_quantiles = getattr(args, 'num_quantiles', 32)
+
+        # C-Q4 只改变 cost critic 的 τ grid；reward critic 始终保留 uniform midpoint。
+        # query_mixture 默认中心为 τ*=1-alpha，即上尾机会约束的决策边界。
+        self.cost_quantile_grid_mode = str(
+            getattr(args, 'cost_quantile_grid_mode', 'uniform')).lower()
+        _query_tau = getattr(args, 'cost_quantile_query_tau', None)
+        self.cost_quantile_query_tau = (
+            1.0 - float(self.q_alpha) if _query_tau is None else float(_query_tau))
+        self.cost_quantile_local_half_width = float(
+            getattr(args, 'cost_quantile_local_half_width', 0.1))
+        self.cost_quantile_local_fraction = float(
+            getattr(args, 'cost_quantile_local_fraction', 0.5))
+        # query_focused 对每个非均匀 prediction head 等权，主动加强查询区训练；
+        # importance 则按 1/g(τ) 加权，近似保留全局 uniform-τ W1 目标。
+        self.cost_quantile_prediction_weighting = str(
+            getattr(args, 'cost_quantile_prediction_weighting', 'query_focused')).lower()
+        if self.cost_quantile_prediction_weighting not in {'query_focused', 'importance'}:
+            raise ValueError(
+                "cost_quantile_prediction_weighting must be 'query_focused' or 'importance'")
+
         # hard 完全复现历史 quantile count；sigmoid 只平滑 actor 查询点的
         # indicator，不改变 QR target/loss、经验 outage 或 hard-CDF 校准指标。
         self.cost_cdf_mode = str(getattr(args, 'cost_cdf_mode', 'hard')).lower()
@@ -209,10 +287,24 @@ class DQCACBetaGPU(VecAgentBase):
         self.return_rms = RunningMeanStd(decay=self.norm_ema_decay)       # σ_R (reward 回报)
         self.constraint_rms = RunningMeanStd(decay=self.norm_ema_decay)   # σ_c (cost 约束优势)
 
-        # 分位数水平 τ_i=(i+0.5)/N
+        # reward critic 始终使用 τ_i=(i+0.5)/N；self.taus 名称保留给旧代码/测试。
         self.taus = torch.tensor(
             [(i + 0.5) / self.num_quantiles for i in range(self.num_quantiles)],
             dtype=torch.float32, device=self.device)
+        # cost critic 可用同一 uniform grid，或对 τ≈1-alpha 做 deterministic mixture 加密。
+        # cost_cdf_weights 同时用于 CDF、分布矩与 target distribution 积分。
+        self.cost_taus, self.cost_cdf_weights, self.cost_tau_density = (
+            _build_cost_quantile_grid(
+                self.num_quantiles,
+                self.cost_quantile_grid_mode,
+                self.cost_quantile_query_tau,
+                self.cost_quantile_local_half_width,
+                self.cost_quantile_local_fraction,
+                self.device))
+        local_low = self.cost_quantile_query_tau - self.cost_quantile_local_half_width
+        local_high = self.cost_quantile_query_tau + self.cost_quantile_local_half_width
+        self.cost_quantile_local_count = int(
+            ((self.cost_taus >= local_low) & (self.cost_taus <= local_high)).sum().item())
 
         # -------------------- actor 两时间尺度优化器 (Adam, 与模板一致) --------------------
         self.actor_optimizer = Adam(self.actor.parameters(), 1.0, eps=1e-5)
@@ -300,6 +392,8 @@ class DQCACBetaGPU(VecAgentBase):
               f"step_feature={self.critic_step_feature}, N={self.num_quantiles}, B={self.num_envs}, T={self.n}, "
               f"cost_target={self.cost_target_mode}, cost_history={self.cost_history_mode}, "
               f"cost_cdf={self.cost_cdf_mode}/T{self.cost_cdf_temperature:g}, "
+              f"cost_grid={self.cost_quantile_grid_mode}/{self.cost_quantile_prediction_weighting}"
+              f"/local{self.cost_quantile_local_count}, "
               f"qr_target={self.quantile_target_reduction}/ref{self.quantile_loss_reference_samples}, "
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
               f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
@@ -677,7 +771,7 @@ class DQCACBetaGPU(VecAgentBase):
             reward_pred = self.reward_critic(reward_state_inputs, actions)
             cost_pred = self.cost_critic(cost_state_inputs, actions)
             reward_loss = self._quantile_huber_loss(reward_pred, reward_target)
-            cost_loss = self._quantile_huber_loss(cost_pred, cost_target)
+            cost_loss = self._cost_quantile_huber_loss(cost_pred, cost_target)
             (reward_loss + cost_loss).backward()
             reward_loss_value = float(reward_loss.item())
             cost_loss_value = float(cost_loss.item())
@@ -693,7 +787,7 @@ class DQCACBetaGPU(VecAgentBase):
                     cost_state_inputs[begin:finish], actions[begin:finish])
                 reward_loss_chunk = self._quantile_huber_loss(
                     reward_pred, reward_target[begin:finish])
-                cost_loss_chunk = self._quantile_huber_loss(
+                cost_loss_chunk = self._cost_quantile_huber_loss(
                     cost_pred, cost_target[begin:finish])
                 (weight * (reward_loss_chunk + cost_loss_chunk)).backward()
                 reward_loss_value += weight * float(reward_loss_chunk.item())
@@ -722,7 +816,8 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/reward_qr_loss': reward_loss_value,
             'critic/cost_qr_loss': cost_loss_value,
             'critic/chunked_update': float(use_chunks),
-            'critic/cost_target_mean': float(cost_target.mean().item()),
+            'critic/cost_target_mean': float(
+                self._cost_quantile_moments(cost_target)[0].mean().item()),
             'critic/cost_target_is_mc': float(self.cost_target_mode == 'mc'),
             # 当前固定-N critic 的 target count 等于 num_quantiles；显式记录有效
             # loss scale，后续 profile 能区分 N 本身与优化尺度变化。
@@ -750,29 +845,69 @@ class DQCACBetaGPU(VecAgentBase):
             return 1.0
         return float(self.quantile_loss_reference_samples) / float(num_target_samples)
 
-    def _quantile_huber_loss(self, psi, y):
+    def _cost_quantile_huber_loss(self, psi, y):
+        """
+        用 cost-only τ/importance 配置计算 QR loss。
+
+        target quantiles 表示随机变量分布积分，所以 query grid 时始终用 1/g 权重；
+        prediction heads 是否加权由 query_focused/importance 消融决定。MC target
+        虽然每列相同，也走同一接口，确保切回 n-step 时不会悄悄改变概率语义。
+        """
+        prediction_weights = (
+            self.cost_cdf_weights
+            if self.cost_quantile_prediction_weighting == 'importance' else None)
+        target_weights = (
+            self.cost_cdf_weights
+            if self.cost_quantile_grid_mode == 'query_mixture' else None)
+        return self._quantile_huber_loss(
+            psi, y, taus=self.cost_taus,
+            prediction_weights=prediction_weights,
+            target_weights=target_weights)
+
+    def _quantile_huber_loss(self, psi, y, taus=None,
+                              prediction_weights=None, target_weights=None):
         """
         计算 pairwise Quantile Huber Loss ρ^κ_τ(u)。
 
-        psi 的形状为 [M,N_pred]，y 为 [M,N_target]；先构造 [M,N_pred,N_target]
-        的全部 TD error，再对 target samples 求和。可选 reference_mean 只在该
-        求和后乘 N_ref/N_target，prediction quantile 与 transition 仍照常取均值。
+        psi 为 [M,N_pred]，y 为 [M,N_target]。默认参数严格复现历史
+        sum(target)→mean(prediction)→mean(batch)；非均匀 cost grid 可分别对
+        target distribution 和 prediction objective 提供归一化到和为 1 的权重。
         """
+        selected_taus = self.taus if taus is None else taus
+        if selected_taus.numel() != psi.shape[-1]:
+            raise ValueError("taus length must match prediction quantile count")
         u = y.unsqueeze(1) - psi.unsqueeze(2)                 # [M,N_pred,N_target]
         abs_u = u.abs()                                       # Huber 分段判断使用 |u|
         huber = torch.where(
             abs_u <= self.huber_kappa,
             0.5 * u.pow(2),
             self.huber_kappa * (abs_u - 0.5 * self.huber_kappa))
-        taus = self.taus.view(1, -1, 1)                       # [1,N_pred,1]
-        weight = (taus - (u.detach() < 0).float()).abs()      # 不对 indicator 求导
+        tau_view = selected_taus.view(1, -1, 1)               # [1,N_pred,1]
+        weight = (tau_view - (u.detach() < 0).float()).abs()  # 不对 indicator 求导
         pairwise_loss = weight * huber / self.huber_kappa    # [M,N_pred,N_target]
 
-        # 默认分支保留旧 sum→mean→mean 的运算顺序；reference_mean 才额外缩放。
-        target_sum = pairwise_loss.sum(dim=2)                 # [M,N_pred]
+        # target_weights 估计 uniform-τ 下的 target distribution expectation；
+        # 乘 N_target 后继续使用既有 N_ref/N_target 尺度开关。
+        if target_weights is None:
+            target_sum = pairwise_loss.sum(dim=2)             # 历史 exact 分支
+        else:
+            if target_weights.numel() != y.shape[-1]:
+                raise ValueError("target_weights length must match target quantile count")
+            target_sum = (
+                pairwise_loss * target_weights.view(1, 1, -1)).sum(dim=2)
+            target_sum = target_sum * float(y.shape[-1])
         if self.quantile_target_reduction == 'reference_mean':
             target_sum = target_sum * self._quantile_target_scale(y.shape[-1])
-        return target_sum.mean(dim=1).mean()                  # prediction 与 batch 取均值
+
+        # query_focused 继续对局部加密 prediction heads 等权；importance route
+        # 则恢复 uniform-τ 积分。默认 None 保留旧 mean 的运算顺序。
+        if prediction_weights is None:
+            return target_sum.mean(dim=1).mean()
+        if prediction_weights.numel() != psi.shape[-1]:
+            raise ValueError("prediction_weights length must match prediction quantile count")
+        per_transition = (
+            target_sum * prediction_weights.view(1, -1)).sum(dim=1)
+        return per_transition.mean()
 
     # ============================================================ 可选 reward V+GAE ============================================================
     def _prepare_reward_gae(self, batch):
@@ -1172,7 +1307,9 @@ class DQCACBetaGPU(VecAgentBase):
                     s0, return_features=True)
                 cost_input0 = self._cost_inputs(s0, 0, feature0)
                 psi0 = self.cost_critic(cost_input0, a0)       # [B,N]
-                p = float((psi0 >= self.cost_limit).float().mean(dim=1).mean().item())
+                p = float(
+                    self._cost_tail_probability(
+                        psi0, self.cost_limit, mode='hard').mean().item())
             self.last_dual_prob = p
             self.last_dual_prob_gap = p - self.q_alpha
             self.last_dual_control_error = self.last_dual_prob_gap
@@ -1238,12 +1375,36 @@ class DQCACBetaGPU(VecAgentBase):
         else:
             budget_values = float(budgets)
         if selected_mode == 'hard':
-            return (quantiles >= budget_values).float().mean(dim=-1)
-        if selected_mode != 'sigmoid':
+            tail_values = (quantiles >= budget_values).float()
+        elif selected_mode == 'sigmoid':
+            scaled_margin = (
+                (quantiles - budget_values) / self.cost_cdf_temperature)
+            tail_values = torch.sigmoid(scaled_margin)
+        else:
             raise ValueError(f"unknown cost CDF mode: {selected_mode!r}")
-        scaled_margin = (
-            (quantiles - budget_values) / self.cost_cdf_temperature)
-        return torch.sigmoid(scaled_margin).mean(dim=-1)
+
+        # uniform 默认路径继续直接 mean，保持历史 floating-point 运算顺序。
+        if self.cost_quantile_grid_mode == 'uniform':
+            return tail_values.mean(dim=-1)
+        weights = self.cost_cdf_weights.to(
+            device=quantiles.device, dtype=quantiles.dtype)
+        return (tail_values * weights).sum(dim=-1)
+
+    def _cost_quantile_moments(self, quantiles):
+        """
+        返回每行 cost distribution 的加权 mean/std。
+
+        uniform 分支保留旧 mean 与 torch.std(unbiased=True)；query_mixture 用
+        CDF quadrature 权重计算概率矩，避免局部密集 heads 把 mean/std 拉向查询区。
+        """
+        if self.cost_quantile_grid_mode == 'uniform':
+            return quantiles.mean(dim=-1), quantiles.std(dim=-1)
+        weights = self.cost_cdf_weights.to(
+            device=quantiles.device, dtype=quantiles.dtype)
+        mean = (quantiles * weights).sum(dim=-1)
+        variance = (
+            (quantiles - mean.unsqueeze(-1)).pow(2) * weights).sum(dim=-1)
+        return mean, variance.clamp_min(0.0).sqrt()
 
     def _cost_inputs(self, states, steps, actor_features=None):
         """
@@ -1380,8 +1541,9 @@ class DQCACBetaGPU(VecAgentBase):
             self.last_cdf_smooth_initial = float(
                 self._cost_tail_probability(
                     psi, self.cost_limit, mode='sigmoid').mean().item())
-            self.last_pred_cost_mean = float(psi.mean().item())
-            self.last_pred_cost_std = float(psi.std(dim=1).mean().item())
+            pred_mean, pred_std = self._cost_quantile_moments(psi)
+            self.last_pred_cost_mean = float(pred_mean.mean().item())
+            self.last_pred_cost_std = float(pred_std.mean().item())
         return self.last_cdf_initial
 
     # ============================================================ 日志 ============================================================
@@ -1427,6 +1589,15 @@ class DQCACBetaGPU(VecAgentBase):
             'debug/cost_cdf_is_sigmoid': float(
                 self.cost_cdf_mode == 'sigmoid'),
             'debug/cost_cdf_temperature': self.cost_cdf_temperature,
+            'debug/cost_quantile_grid_is_query': float(
+                self.cost_quantile_grid_mode == 'query_mixture'),
+            'debug/cost_quantile_prediction_is_importance': float(
+                self.cost_quantile_prediction_weighting == 'importance'),
+            'debug/cost_quantile_local_count': float(self.cost_quantile_local_count),
+            'debug/cost_quantile_weight_min': float(
+                self.cost_cdf_weights.min().item()),
+            'debug/cost_quantile_weight_max': float(
+                self.cost_cdf_weights.max().item()),
             'budget/min': float(np.min(budgets_np)),
             'budget/max': float(np.max(budgets_np)),
             'budget/mean': float(np.mean(budgets_np)),
@@ -1509,8 +1680,9 @@ class DQCACBetaGPU(VecAgentBase):
             cost_cdf_smooth_initial = float(
                 self._cost_tail_probability(
                     psi0, float(cost_limit), mode='sigmoid').mean().item())
-            pred_cost_mean = float(psi0.mean().item())
-            pred_cost_std = float(psi0.std(dim=1).mean().item())
+            pred_mean0, pred_std0 = self._cost_quantile_moments(psi0)
+            pred_cost_mean = float(pred_mean0.mean().item())
+            pred_cost_std = float(pred_std0.mean().item())
 
         reward_np = torch.cat(rewards_all).cpu().numpy().astype(np.float64)
         cost_np = torch.cat(costs_all).cpu().numpy().astype(np.float64)
@@ -1557,6 +1729,12 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_history_mode': self.cost_history_mode,
             'cost_cdf_mode': self.cost_cdf_mode,
             'cost_cdf_temperature': self.cost_cdf_temperature,
+            'cost_quantile_grid_mode': self.cost_quantile_grid_mode,
+            'cost_quantile_query_tau': self.cost_quantile_query_tau,
+            'cost_quantile_local_half_width': self.cost_quantile_local_half_width,
+            'cost_quantile_local_fraction': self.cost_quantile_local_fraction,
+            'cost_quantile_prediction_weighting': self.cost_quantile_prediction_weighting,
+            'cost_quantile_local_count': self.cost_quantile_local_count,
             'quantile_target_reduction': self.quantile_target_reduction,
             'quantile_loss_reference_samples': self.quantile_loss_reference_samples,
             'actor_updates_per_episode': self.actor_updates_per_episode,

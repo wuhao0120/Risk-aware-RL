@@ -522,3 +522,13 @@
 - profile：`_runs/profiles/dqc_quantile_resolution_n32_n64_100k_2026-07-16/`；export：`_runs/wandb_export/dqc_quantile_resolution_n32_n64_100k_2026-07-16/`。
 - 下一主线 C-Q4A：只对 cost critic 使用 query-mixture τ，中心 `1-alpha=0.8`、窗口 `[0.7,0.9]`、local fraction `0.5`；CDF 用 importance/quadrature weight，prediction loss 先用 query-focused 均值。
 - 分歧保留：C-Q4B 对 prediction loss 也做 importance weighting 以保持全局 W1；C-Q2 adaptive sigmoid bandwidth；C-H1 独立 cost RNN；N128；uniform-IQN 与 query-mixture-IQN。任何 local grid 都不能用未加权 quantile count 冒充 CDF。
+
+### E28：C-Q4 cost-only query-mixture τ 实现
+
+- 新开关 'cost_quantile_grid_mode=uniform|query_mixture'，默认 uniform；query center 默认 '1-alpha'，另有 half-width/local-fraction。reward critic 始终使用原 uniform τ。
+- mixture 用解析 inverse CDF 的 deterministic stratified grid，不消耗随机数；N32、center .8、half-width .1、fraction .5 时 [.7,.9] 有 19 个 heads，uniform 只有 7 个。
+- CDF/分布 mean/std/critic dual/评估和 n-step target sample 均使用归一化 '1/g(τ)' weight；prediction loss 独立支持 'query_focused|importance'。
+- 合成检验：weights sum=1，min/max '0.01031/0.06186'；在 q_i=τ_i 的可解析例子，τ=.8 上尾加权值 '0.2165'，未加权会错误为 '0.34375'。默认 uniform loss/CDF/mean/std 与旧公式逐元素 exact。
+- 持久化回归 smoke 'dqc_cost_grid_uniform_regression_smoke_20260716' 训练 '8.6s'、exit 0；query smoke 'dqc_cost_grid_query_mixture_smoke_20260716' 训练 '13.8s'、exit 0，均覆盖 recurrent rollout、QR/PPO、评估和 JSON。
+- C-Q4A 门：N32+C20+MC+lambda0 100k，只打开 query_mixture/query_focused 与 reference/ref32。要求 truth 轨迹与 N32 baseline 一致；CDF bias 从 '0.0978' 降到 '≤0.0734'，或 mean relative error 进入 15%，另一指标不恶化 >10%。
+- 若 A 通过，组合 query grid+smooth T2 做 300k；若 A 接近但 mean 明显失真，跑 C-Q4B importance prediction；若 A 全面无效，优先 C-H1，不继续调 local fraction/window 小网格。

@@ -1003,3 +1003,20 @@ C-Q3B job `DQCAC_DynamicButton_recur_mc_c20_n64_ref32_chunk2500_100k_s0`（W&B `
 3. **target sample 权重独立处理**：cost target quantiles 代表分布积分，必须做 importance weighting；当前 MC target 每列相同，但实现仍需对 n-step 路径保持正确，不能依赖这个巧合。
 
 若 C-Q4A 的 100k CDF bias 未至少降低 25%，不跑 300k；转 C-Q4B 或 C-H1。C-Q2 adaptive sigmoid bandwidth、N128、uniform-IQN、query-mixture-IQN、P-M1 controller safety setpoint 与 C-E1 checkpoint/eval-only 都继续保留为正交路线。
+
+### 13.19 C-Q4 实现：cost-only query-mixture τ 与无偏 CDF 权重（2026-07-16）
+
+代码已实现默认关闭的 'cost_quantile_grid_mode=uniform|query_mixture'。query-mixture 的默认中心是 'τ*=1-alpha'，当前 alpha=0.2 时为 0.8；half-width=0.1、local fraction=0.5。它对 mixture CDF 的等质量 midpoints 做解析反演，完全 deterministic，不消耗 Torch RNG。N=32 时 [.7,.9] 获得 19 个 prediction heads，uniform grid 只有 7 个；局部代表权重约从 '1/32=0.03125' 降到 '0.01031'。
+
+实现刻意把 reward/cost 两条分开：
+
+- reward critic 和 'self.taus' 继续使用 uniform midpoint，不改变 reward QR 诊断或未来 distributional reward 路径。
+- cost critic 使用独立 'cost_taus'。hard/sigmoid CDF、initial calibration、critic-dual、评估、predicted mean/std 都使用同一组归一化 '1/g(τ)' quadrature weights。
+- cost target sample 维始终做 importance weighting；MC target 每列相同但 n-step target 不同，因此不能省略。加权 expectation 再乘 N_target，随后沿用 ref/N target-scale，保持既有 critic LR 尺度。
+- prediction 维有两条明确消融：C-Q4A 'query_focused' 对局部密集 heads 等权，主动把优化容量放在 τ≈0.8；C-Q4B 'importance' 对 prediction heads 也乘 '1/g'，近似保持全局 uniform-τ W1 objective。
+
+合成验证覆盖了关键不变量：uniform grid/weights 逐元素等于旧 midpoint/1/N；query grid 严格递增、weights 和为 1；N32 局部 head 数为 19。在可解析的 'q_i=τ_i' 例子中，τ=0.8 的加权 tail 为 '0.2165'，而错误的未加权 count 是 '0.34375'，直接说明“不加权局部 quantiles”会严重伪造 outage。默认 uniform 的 legacy QR loss、hard CDF、mean/std 与旧公式逐元素 exact；query loss/gradient 有限。
+
+两条持久化集成验证均完成：'dqc_cost_grid_uniform_regression_smoke_20260716' 训练 '8.6s'、exit code 0；'dqc_cost_grid_query_mixture_smoke_20260716' 使用 N32+reference+query-focused，训练 '13.8s'、exit code 0，日志显示 'local19'，JSON 保存全部 grid 配置。两条都覆盖 recurrent rollout、MC cost target、critic/PPO 更新、hard/smooth 评估和进程回收。
+
+下一条 C-Q4A 是 100k reward-only 校准门：完全复用 N32 C20/MC baseline，只打开 query-mixture/query-focused 与 'reference_mean/ref32'。网络参数形状与 RNG 消耗不变，lambda=0，所以 reward/真实 cost 应逐点一致。通过条件为 CDF bias 从 '0.0978' 降到 '≤0.0734'，或 mean-cost relative error 进入 15%，且另一指标不恶化超过 10%。通过后才组合 'query-mixture+sigmoid T2' 做 300k constrained；若 CDF 接近通过但 mean 明显变差，补 C-Q4B importance-prediction；若全面无效，转 C-H1，不扫 local fraction/window。

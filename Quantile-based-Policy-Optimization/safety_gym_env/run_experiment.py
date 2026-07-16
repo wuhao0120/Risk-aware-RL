@@ -181,6 +181,14 @@ def base_args(algo, seed, device, env_key):
         # hard 校准/经验 outage/QR critic 均保留，便于无歧义消融。
         a.cost_cdf_mode = 'hard'
         a.cost_cdf_temperature = 1.0
+        # C-Q4 cost-only τ grid；uniform 默认完全复现历史。query_mixture 围绕
+        # τ*=1-alpha 加密，CDF/target 用 importance weight，prediction loss
+        # 可选择 query-focused（局部优化）或 importance（全局 W1 保持）。
+        a.cost_quantile_grid_mode = 'uniform'
+        a.cost_quantile_query_tau = None
+        a.cost_quantile_local_half_width = 0.1
+        a.cost_quantile_local_fraction = 0.5
+        a.cost_quantile_prediction_weighting = 'query_focused'
         a.num_action_samples = 4
         a.advantage_norm = 'qcpo'                       # EMA 归一化 (反 λ 卷绕, 已验证)
         a.norm_ema_decay = 0.1
