@@ -97,6 +97,20 @@ class DQCACBetaGPU(VecAgentBase):
         self.critic_minibatch_size = max(
             0, int(getattr(args, 'critic_minibatch_size', 0)))
 
+        # QR-DQN 原实现对 target sample 维求和，因此 target quantile 数 N 翻倍时，
+        # loss 与裁剪前梯度也约翻倍。legacy_sum 是逐式兼容的默认路径；
+        # reference_mean 乘 reference/N_target，使不同 N 共用 N=32 的优化尺度。
+        self.quantile_target_reduction = str(
+            getattr(args, 'quantile_target_reduction', 'legacy_sum')).lower()
+        valid_target_reductions = {'legacy_sum', 'reference_mean'}
+        if self.quantile_target_reduction not in valid_target_reductions:
+            raise ValueError(
+                "quantile_target_reduction must be 'legacy_sum' or 'reference_mean'")
+        self.quantile_loss_reference_samples = int(
+            getattr(args, 'quantile_loss_reference_samples', 32))
+        if self.quantile_loss_reference_samples <= 0:
+            raise ValueError("quantile_loss_reference_samples must be positive")
+
         # reward actor 主干做成显式消融开关，默认 distributional 完全复现旧实现。
         # - distributional: Q_r(s,a)-E_a Q_r(s,a)，即排查前 DQCACBeta；
         # - gae:            标量 V_r(s)+GAE，但仍用单次 logπ policy-gradient；
@@ -286,6 +300,7 @@ class DQCACBetaGPU(VecAgentBase):
               f"step_feature={self.critic_step_feature}, N={self.num_quantiles}, B={self.num_envs}, T={self.n}, "
               f"cost_target={self.cost_target_mode}, cost_history={self.cost_history_mode}, "
               f"cost_cdf={self.cost_cdf_mode}/T{self.cost_cdf_temperature:g}, "
+              f"qr_target={self.quantile_target_reduction}/ref{self.quantile_loss_reference_samples}, "
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
               f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}, "
@@ -709,6 +724,12 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/chunked_update': float(use_chunks),
             'critic/cost_target_mean': float(cost_target.mean().item()),
             'critic/cost_target_is_mc': float(self.cost_target_mode == 'mc'),
+            # 当前固定-N critic 的 target count 等于 num_quantiles；显式记录有效
+            # loss scale，后续 profile 能区分 N 本身与优化尺度变化。
+            'critic/quantile_target_scale': self._quantile_target_scale(
+                self.num_quantiles),
+            'critic/quantile_target_reference': float(
+                self.quantile_loss_reference_samples),
             'critic/reward_grad_norm': float(reward_grad_norm.item()),
             'critic/cost_grad_norm': float(cost_grad_norm.item()),
             'critic/joint_grad_norm': float(joint_grad_norm.item()),
@@ -717,16 +738,41 @@ class DQCACBetaGPU(VecAgentBase):
                 if self.critic_grad_clip and self.critic_grad_clip > 0 else 0.0),
         }
 
+    def _quantile_target_scale(self, num_target_samples):
+        """
+        返回 QR target-sample 求和后的兼容缩放系数。
+
+        输入 num_target_samples 是 y 的最后一维 N_target。legacy_sum 返回 1，
+        因而默认路径与历史代码逐式相同；reference_mean 返回 N_ref/N_target，
+        使 target Monte-Carlo 样本数只改变积分分辨率，不隐式改变 critic 梯度尺度。
+        """
+        if self.quantile_target_reduction == 'legacy_sum':
+            return 1.0
+        return float(self.quantile_loss_reference_samples) / float(num_target_samples)
+
     def _quantile_huber_loss(self, psi, y):
-        """Quantile Huber Loss ρ^κ_τ(u) (QR-DQN 核心, 与模板一致)。"""
-        u = y.unsqueeze(1) - psi.unsqueeze(2)                 # [*,N,N] 配对 TD error
-        abs_u = u.abs()
-        huber = torch.where(abs_u <= self.huber_kappa,
-                            0.5 * u.pow(2),
-                            self.huber_kappa * (abs_u - 0.5 * self.huber_kappa))
-        taus = self.taus.view(1, -1, 1)
-        weight = (taus - (u.detach() < 0).float()).abs()
-        return (weight * huber / self.huber_kappa).sum(dim=2).mean(dim=1).mean()
+        """
+        计算 pairwise Quantile Huber Loss ρ^κ_τ(u)。
+
+        psi 的形状为 [M,N_pred]，y 为 [M,N_target]；先构造 [M,N_pred,N_target]
+        的全部 TD error，再对 target samples 求和。可选 reference_mean 只在该
+        求和后乘 N_ref/N_target，prediction quantile 与 transition 仍照常取均值。
+        """
+        u = y.unsqueeze(1) - psi.unsqueeze(2)                 # [M,N_pred,N_target]
+        abs_u = u.abs()                                       # Huber 分段判断使用 |u|
+        huber = torch.where(
+            abs_u <= self.huber_kappa,
+            0.5 * u.pow(2),
+            self.huber_kappa * (abs_u - 0.5 * self.huber_kappa))
+        taus = self.taus.view(1, -1, 1)                       # [1,N_pred,1]
+        weight = (taus - (u.detach() < 0).float()).abs()      # 不对 indicator 求导
+        pairwise_loss = weight * huber / self.huber_kappa    # [M,N_pred,N_target]
+
+        # 默认分支保留旧 sum→mean→mean 的运算顺序；reference_mean 才额外缩放。
+        target_sum = pairwise_loss.sum(dim=2)                 # [M,N_pred]
+        if self.quantile_target_reduction == 'reference_mean':
+            target_sum = target_sum * self._quantile_target_scale(y.shape[-1])
+        return target_sum.mean(dim=1).mean()                  # prediction 与 batch 取均值
 
     # ============================================================ 可选 reward V+GAE ============================================================
     def _prepare_reward_gae(self, batch):
@@ -1511,6 +1557,8 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_history_mode': self.cost_history_mode,
             'cost_cdf_mode': self.cost_cdf_mode,
             'cost_cdf_temperature': self.cost_cdf_temperature,
+            'quantile_target_reduction': self.quantile_target_reduction,
+            'quantile_loss_reference_samples': self.quantile_loss_reference_samples,
             'actor_updates_per_episode': self.actor_updates_per_episode,
             'num_envs': self.num_envs,
             'num_iterations': self.num_iterations,

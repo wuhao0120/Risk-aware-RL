@@ -76,6 +76,8 @@ KEY_METRICS: Tuple[str, ...] = (
     "critic/cost_qr_loss",
     "critic/cost_target_mean",
     "critic/cost_target_is_mc",
+    "critic/quantile_target_scale",
+    "critic/quantile_target_reference",
     "critic/reward_grad_norm",
     "critic/cost_grad_norm",
     "critic/joint_grad_norm",

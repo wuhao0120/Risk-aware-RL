@@ -960,3 +960,26 @@ P-S2 job `DQCAC_DynamicButton_recur_mc_c20_pi_kp1_w50_smoothT2_300k_s0`（W&B `a
 3. **评估工程路线 C-E1**：当前训练入口没有保存 checkpoint，导致 P-S2 结束后不能低成本把评估扩到 512/1024 条。后续增加 opt-in final checkpoint 与 eval-only 恢复；最终候选必须报告更大评估样本和多 seed，而不是只看 130 条。该工程改动独立验证，不与算法变量混写。
 
 统一 300k profile 位于 `_runs/profiles/dqc_smooth_cdf_ps12_300k_2026-07-16/`，同时包含 hard/T1/T2/E9/QCPO_refs；完整 history 导出位于 `_runs/wandb_export/dqc_smooth_cdf_ps12_300k_2026-07-16/`。T=0.5、T=4、自适应 spacing、N=128、uniform+local τ、uniform-IQN/query-mixture-IQN 与 C-H1 均保留为轻量验证或论文消融候选。
+
+### 13.17 C-Q3A：直接增加 N 被 QR loss 尺度混杂（2026-07-16）
+
+C-Q3A-legacy job `DQCAC_DynamicButton_recur_mc_c20_n64_chunk2500_100k_s0`（W&B `wqjcropf`）把 C20/MC 校准基线的 N 从 32 增到 64，并设 `critic_minibatch_size=2500`。后者让 `2500×64²=10000×32²`，因此 pairwise TD tensor 的理论主规模与旧整批路径相当。实测训练 `60.9s`，只比 N32 的 `59.4s` 多约 1.5 秒，说明当前硬件完全 afford N64，计算时间不是拒绝该路线的原因。
+
+原始结果没有通过校准门。70 条终评的真实 reward/outage/mean cost 为 `0.5527/0.2286/8.957`；N64 predicted CDF/mean 为 `0.1223/6.808`，CDF bias `-0.1063`、mean relative error 24.0%。N32 C20 分别为 `0.1308/6.974`、bias `-0.0978`、relative error 22.1%，所以“直接 N64”略差，不应扩到 300k。
+
+不过代码审查发现该负结果包含一个关键优化混杂。当前 quantile Huber loss 为：
+
+`pairwise_loss.sum(dim=target_quantile).mean(dim=prediction_quantile).mean(dim=batch)`
+
+即 target sample 数 N 增大时，loss 和裁剪前梯度线性放大。N64 末点 cost grad norm 达 `17.03`、joint grad clip fraction 为 `1`；此前 N32 C20 的 joint norm 约 `1.37～7.86`，没有触发 clip。Adam 对纯尺度大体不敏感，但 hard grad clipping 会改变更新方向/有效步长，所以这不是一个只改变分布分辨率的公平实验。
+
+代码新增默认兼容的两条路线：
+
+- `legacy_sum`：默认值，保留旧 `sum(target samples)`，手算 loss 与 gradient 逐元素 exact；所有历史 run 可复现。
+- `reference_mean`：target sum 后乘 `N_ref/N_target`，默认 `N_ref=32`。N64 的 loss/gradient 正好乘 0.5，N32 仍保持参考尺度；它等价于对 target samples 取平均后再乘固定 32，从而不需要同时重调既有 critic LR。
+
+启动日志、W&B 和最终 JSON 都记录 reduction、scale 与 reference；profile 工具也加入相应键。合成对拍验证 N64 reference loss/gradient 是 legacy 的 0.5。持久化 `dqc_n64_reference_qr_smoke_20260716` 使用 N64+chunk2500+reference，训练 `14.4s`、exit code 0，覆盖真实 rollout、20 critic/8 PPO 更新、评估和 JSON。
+
+下一条 C-Q3B 复跑同形 N64 100k，只把 `legacy_sum→reference_mean`。由于两条 N64 run 的网络形状和随机数消耗相同，真实 reward/cost 应逐点一致；若不一致先按实现问题处理。通过条件除原校准门外，再要求 grad clip 显著消失。通过后才组合 `N64+smooth T2,300k`。
+
+另一个独立分歧必须记录：跨 N32/N64 时，critic 输出层参数数不同，会消耗不同数量的全局 Torch RNG，后续 stochastic action sampling 的随机流可能错位。因此跨结构单 seed 不是严格 paired trajectory。C-RNG1 可在 agent 完成初始化后统一 reseed；C-RNG2 为 policy action、critic 初始化、minibatch 各用独立 Generator。当前 C-Q3A/B 通过同形网络规避该混杂；RNG 解耦保留为工程复现消融，不与 QR scale 同时改。

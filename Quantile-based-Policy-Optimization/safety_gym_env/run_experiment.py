@@ -159,6 +159,11 @@ def base_args(algo, seed, device, env_key):
         a.critic_hidden = [256, 256]
         a.critic_lr = 1e-3
         a.critic_minibatch_size = 0                     # 0=历史整批；大 B/N 时显式设 chunk
+        # 历史 QR loss 对 target quantile 求和，梯度随 N 线性放大。默认 legacy_sum
+        # 保持所有旧 run 可复现；reference_mean 用 reference/N 缩放，供 N=64/128
+        # 做公平分辨率消融，避免“quantile 更多”被隐式改成“critic 梯度更大”。
+        a.quantile_target_reduction = 'legacy_sum'
+        a.quantile_loss_reference_samples = 32
         a.target_tau = 0.05                             # 消除 critic 滞后 (已验证)
         a.target_update_interval = 1
         # n-step TD: T=1000 未折扣口径下 1-step 传播太慢 (600 updates 传不满 1000 步链,

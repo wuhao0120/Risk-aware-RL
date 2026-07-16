@@ -501,3 +501,14 @@
 - C-Q3A 通过门：CDF bias 相对 N32 的 `0.0978` 至少下降 25%，或 mean relative error 进入 15%，且另一指标不恶化超过 10%、reward 轨迹正常。通过后才做 `N64+T2,300k`；失败则转 C-Q2 自适应 spacing/local-τ 或 C-H1。
 - 工程路线 C-E1：增加 opt-in final checkpoint + eval-only 恢复，候选策略用 512/1024 episodes 复评；当前入口没有 checkpoint，P-S2 无法事后无训练复评。该缺口记录但不与 C-Q3A 同时改算法。
 - 对齐 profile：`_runs/profiles/dqc_smooth_cdf_ps12_300k_2026-07-16/`；完整导出：`_runs/wandb_export/dqc_smooth_cdf_ps12_300k_2026-07-16/`。
+
+### E26：C-Q3A N=64 直接扩展失败，定位 QR loss 尺度混杂
+
+- C-Q3A-legacy：job `DQCAC_DynamicButton_recur_mc_c20_n64_chunk2500_100k_s0`，W&B `wqjcropf`，训练 `60.9s`、exit code 0。N=64 并未明显拖慢当前 A100：相对 N32 的 `59.4s` 仅增加约 1.5s。
+- 终评 truth 与 N32 都为 reward `0.5527`、outage `0.2286`、mean cost `8.957`；N64 critic CDF/mean 为 `0.1223/6.808`，比 N32 的 `0.1308/6.974` 略差。CDF bias `0.1063`、mean relative error 24.0%，原 C-Q3A 门失败，不扩 300k。
+- 根因混杂：QR loss 使用 `.sum(dim=target_quantile)`，所以 N=64 的 loss/梯度约为 N=32 的 2 倍。末点 cost grad norm `17.03`、joint clip fraction `1`；N32 C20 的 joint norm 约 `1.37～7.86` 且不触发 clip。直接扩大 N 同时改变了分辨率和优化尺度，负结果不能归因于 quantile 数。
+- 新增 `quantile_target_reduction=legacy_sum|reference_mean` 与 `quantile_loss_reference_samples=32`。默认 legacy_sum 的 loss/gradient 与旧公式逐元素相同；reference_mean 乘 `32/N_target`，使 N64 scale 为 0.5、N32 保持参考尺度。
+- 日志/profile 新增 target scale/reference；最终 JSON 保存 reduction 配置。手算对拍验证 legacy loss/gradient exact、N64 reference loss/gradient 精确为 legacy 的 0.5。
+- 持久化 smoke `dqc_n64_reference_qr_smoke_20260716`：N64+chunk2500+reference，训练 `14.4s`、exit code 0，rollout/critic/PPO/eval/JSON 全链路通过。
+- 下一门 C-Q3B：同一个 N64 100k run 只切 reference_mean。与 C-Q3A-legacy 网络形状相同，随机初始化/采样流应一致；要求真实 reward/cost 逐点相同，且 grad clip 消失、校准达到原门，才组合 N64+T2。
+- 公平性分歧 C-RNG1：N32/N64 初始化会消耗不同数量的全局 RNG，跨网络宽度单 seed 的轨迹不保证配对。可选路线是 agent 初始化后统一 reseed 或分离 policy-action/critic RNG；当前先用同形 C-Q3A/B 配对，不把 RNG 修正混入本轮。
