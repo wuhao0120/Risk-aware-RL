@@ -167,9 +167,20 @@
 
 ### E7：只提高 Abel risk discount 到 β=0.99
 
-- 状态：待启动；完全复用 E6，只把 `beta=0.95` 改为 `0.99`。
+- 状态：已完成（exit code 0）；完全复用 E6，只把 `beta=0.95` 改为 `0.99`。
+- job：`DQCAC_DynamicButton_dbg_e7_beta099_empiricalpid_300k_s0`；W&B run id：`6xm1k6n3`；启动 commit：`bb25576`。
 - 算法依据：β 是无限期 Abel 可和性带来的偏差—方差旋钮，β→1 恢复精确约束梯度；本实验是有限 T=1000，`0.99` 将 90% 累计权重覆盖从前 45 步扩到前 229 步，同时比直接 `β=1` 更保守。
-- 预算 30 万步、约 3 分钟；150k 检查 outage 是否较 E6 同点下降。若改善，再决定是否测 `β=1`；若无改善，转向 CDF 平滑/局部 quantile 精度而非继续加 λ。
+- 实际训练耗时 `147.4s`；评估 reward `1.025`、outage `0.400`、λ `0.375`，cost critic CDF `0.261`，偏差 `-0.139`。
+- 30 万步 profile：late reward `1.182`、slope `+5.005/百万步`、outage `0.433`；相比 E6 的 `1.499/+6.450/0.550`，约束明显改善但付出 reward 代价。QCPO_refs 同预算为 `1.355/+5.431/0.517`。
+- 数值健康：late PPO clip `0.0582`、reward value explained variance `0.721`，无 NaN/Inf；终点训练批 outage 已到 `0.2`，但独立 70 轨迹评估仍为 `0.4`。
+- 结论：β 是有效且此前过度短视的风险—收益旋钮；`0.99` 已优于 `0.95` 的约束控制，但短预算尚未可行。
+- 最终导出：`_runs/wandb_export/final_e7_dynamicbutton_2026-07-16/`；profile：`_runs/profiles/final_e7_dynamicbutton_2026-07-16/`。
+
+### E8：有限时域 β=1.0 诊断
+
+- 状态：待启动；只把 E7 的 `beta=0.99` 改为 `1.0`。
+- 目的：在有限 T=1000 下去掉 Abel 偏差，测试现有 risk advantage 的控制上限；这不是建议无限时域使用 β=1。
+- 判据：若 outage 接近 0.2 且 reward 可接受，后续在 `0.99~1.0` 细调；若仍明显违规，则停止调 β，转向平滑 CDF/局部 quantile 或 IQN。
 
 ## 4. 分阶段改进路线
 
