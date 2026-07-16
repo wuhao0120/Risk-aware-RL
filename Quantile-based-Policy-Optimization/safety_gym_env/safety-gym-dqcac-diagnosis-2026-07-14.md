@@ -831,3 +831,12 @@ D-R0 已先后完成 100k 门控和独立 300k 扩展，均由持久化 launcher
 代码新增默认关闭的 `cost_target_mode=nstep|mc`。默认 `nstep` 完全保持旧行为；`mc` 只允许完整 episodic rollout，反向计算 `G^c_t=c_t+gamma_c G^c_{t+1}`，不改变 reward critic、GAE、PPO 或 actor。持久化 recurrent+chunked smoke `DQCAC_DynamicButton_smoke_recur_mc_cost_s0` 训练 `5.8s`、exit code 0。
 
 C-T1 100k（W&B `wmlzu8la`）与 n-step 对照的 reward 序列逐点相同。MC 将终评 predicted mean cost 从 `1.49` 提到 `4.02`（真实 `8.96`），将 s0 CDF 从 `0.00045` 提到 `0.0384`（真实 outage `0.2286`）。所以 bootstrap 传播是原因之一，但不是全部原因；MC 不直接扩 300k。完整 profile 在 `_runs/profiles/dqc_cost_target_mc_100k_2026-07-16/`。下一条 C-O1 只把 critic epochs 从 10 提到 20，并记录 reward/cost/joint 裁剪前梯度；若仍低估，再进入 C-H1。最终形成 `nstep/MC × Markov/recurrent-cost` 的 2×2 消融，而不是只汇报胜者。
+
+
+### 13.8 Cost critic 优化与 leaky-I 控制路线（2026-07-16）
+
+MC target 后，主要剩余误差首先来自 critic 优化不足。把 critic epochs 从 10 增至 20、保持 `lr=1e-3`，终评 predicted mean cost 从 `4.02` 提到 `6.97`（truth `8.96`），CDF 从 `0.0384` 提到 `0.1308`（truth `0.2286`）；wall time 只从 `56.9s` 增到 `59.4s`。相反，保持 10 epochs、把 critic LR 提到 `2e-3` 只得到 mean/CDF `5.91/0.0987`，所以保留 C20。C20 的 joint grad norm 全程 `1.37～7.86<10`，不是 gradient clipping 造成的低估。profile 位于 `_runs/profiles/dqc_cost_optimizer_c20_100k_2026-07-16/`。
+
+PID 分歧也显式保留。当前 QCPO_refs 配置所谓 PID 实际 `Kp=Kd=0`，只有 bounded I；E10 的失败更接近窗口滞后和 lambda 不衰减，而非隐藏积分状态超过上限。代码因此新增默认关闭的 bounded leaky-I：leak、deadband、每次最大 delta，以及按新增 episode 数缩放的 reference。默认 `leak=1,deadband=0,delta_max=inf,reference=0` 与旧结果逐式相同；开启 episode scaling 时用几何积分和，保证常值误差下一次 B=20 等价于两次 B=10。手算断言与持久化 smoke 均通过。
+
+首条 P-B1 constrained 门控固定 C20+MC/recurrent reward 主干，使用 `beta=.995,sum_norm=true,outage error,Ki=.1,leak=.97,deadband=.02,delta_max=.05,reference=10`。它与 E9 legacy-I 分开命名；若控制偏弱，保留 leak=.98/Ki=.15 路线，若过保守则保留 leak=.95/更大 deadband。recurrent cost critic C-H1 继续保留，但不与 PID 同一 run 同时引入。

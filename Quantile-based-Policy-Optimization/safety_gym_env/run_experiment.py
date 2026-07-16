@@ -203,6 +203,11 @@ def base_args(algo, seed, device, env_key):
         a.pid_Ki = 0.1                                  # QCPO_refs 默认仅启用积分项
         a.pid_window_episodes = 100                     # 最近完整轨迹窗口
         a.pid_cost_scale = 10.0                         # quantile PID 与 QCPO_refs 相同 cost 缩放
+        # 以下四项默认精确退化为旧 bounded-I；P-B 实验才显式打开 leak/deadband。
+        a.pid_integral_leak = 1.0                       # rho=1：不泄漏，兼容历史结果
+        a.pid_deadband = 0.0                            # probability/quantile error 死区
+        a.pid_delta_max = float('inf')                  # 每 reference batch 的最大 |Delta lambda|
+        a.pid_reference_episodes = 0.0                  # 0=每 iteration 一次；正数按 episode 缩放
         a.sum_norm = False                              # 实验开启：(J_r+λJ_c)/(1+λ)
     elif algo == 'QCPO_REF':
         # NIPS'22 QCPO 移植版 (config_qcpo.py / launch_qcpo.py 论文缺省超参)。

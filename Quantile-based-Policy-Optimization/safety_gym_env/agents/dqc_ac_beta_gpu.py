@@ -150,6 +150,20 @@ class DQCACBetaGPU(VecAgentBase):
         self.pid_Ki = float(getattr(args, 'pid_Ki', 0.1))
         self.pid_window_episodes = max(1, int(getattr(args, 'pid_window_episodes', 100)))
         self.pid_cost_scale = float(getattr(args, 'pid_cost_scale', 10.0))
+        # 默认 rho=1/deadband=0/delta_max=inf/reference=0 逐式复现旧 I 控制器。
+        # 新实验显式打开 leak/deadband，并按新增 episode 数缩放控制器时间轴。
+        self.pid_integral_leak = float(getattr(args, 'pid_integral_leak', 1.0))
+        self.pid_deadband = float(getattr(args, 'pid_deadband', 0.0))
+        self.pid_delta_max = float(getattr(args, 'pid_delta_max', float('inf')))
+        self.pid_reference_episodes = float(getattr(args, 'pid_reference_episodes', 0.0))
+        if not 0.0 < self.pid_integral_leak <= 1.0:
+            raise ValueError("pid_integral_leak must be in (0, 1]")
+        if self.pid_deadband < 0.0:
+            raise ValueError("pid_deadband must be non-negative")
+        if self.pid_delta_max <= 0.0:
+            raise ValueError("pid_delta_max must be positive")
+        if self.pid_reference_episodes < 0.0:
+            raise ValueError("pid_reference_episodes must be non-negative")
         self.sum_norm = bool(getattr(args, 'sum_norm', False))
 
         # qcpo 归一化配方: σ_R (reward 回报尺度) / σ_c (cost 约束优势尺度) + warmup
@@ -222,7 +236,12 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_dual_cost_quantile = float(self.cost_limit)  # 窗口 Q_(1-ω)(C)
         self.last_dual_prob_gap = 0.0                          # window outage - ω
         self.last_dual_quantile_gap = 0.0                      # Q_(1-ω)(C) - d
-        self.last_dual_control_error = 0.0                     # 实际送入 I 控制器的误差
+        self.last_dual_control_error = 0.0                     # deadband 前的原始控制误差
+        self.last_dual_filtered_error = 0.0                    # deadband 后实际积分误差
+        self.last_pid_episode_scale = 1.0                      # 本次新增 episode / reference
+        self.last_pid_effective_leak = 1.0                     # rho ** episode_scale
+        self.last_pid_delta = 0.0                              # clip 后积分增量（不含 leak）
+        self.last_pid_actual_delta = 0.0                       # 最终 lambda_new-lambda_old
 
     # ============================================================ 主训练循环 (与模板一致) ============================================================
     def train(self):
@@ -981,6 +1000,43 @@ class DQCACBetaGPU(VecAgentBase):
         return actor_info
 
     # ============================================================ Dual 更新 (cost-critic P(C≥d) 驱动) ============================================================
+    def _update_pid_integral(self, control_error, new_episodes):
+        """执行默认兼容的 bounded leaky-I，并把 num_envs 映射到 episode 时间轴。
+
+        reference_episodes=0 时 episode_scale 固定为 1，配合默认 leak=1、
+        deadband=0、delta_max=inf，结果严格退化为旧式
+        `pid_i <- clip(pid_i + Ki * error)`。正 reference 则令同样数量的新轨迹
+        产生相同累计 leak/积分量，避免 B 改变后每 env-step 的 dual 增益漂移。
+        """
+        old_pid = float(self.pid_i)
+        if self.pid_reference_episodes > 0.0:
+            episode_scale = float(new_episodes) / self.pid_reference_episodes
+        else:
+            episode_scale = 1.0
+
+        # 连续 deadband：阈值内为 0，阈值外减去边界，避免刚越界时控制量跳变。
+        error = float(control_error)
+        error_magnitude = max(0.0, abs(error) - self.pid_deadband)
+        filtered_error = float(np.copysign(error_magnitude, error)) if error_magnitude else 0.0
+        effective_leak = self.pid_integral_leak ** episode_scale
+        # 对 leak<1 使用几何和，使一次 B=20 update 与两次 B=10 update 在
+        # 常值误差下严格等价；rho=1 时连续极限就是 episode_scale。
+        if self.pid_integral_leak < 1.0:
+            integral_scale = (1.0 - effective_leak) / (1.0 - self.pid_integral_leak)
+        else:
+            integral_scale = episode_scale
+        raw_delta = self.pid_Ki * filtered_error * integral_scale
+        effective_delta_max = self.pid_delta_max * episode_scale
+        bounded_delta = min(effective_delta_max, max(-effective_delta_max, raw_delta))
+
+        proposal = effective_leak * old_pid + bounded_delta
+        self.pid_i = min(self.lambda_max, max(self.lambda_min, proposal))
+        self.last_dual_filtered_error = filtered_error
+        self.last_pid_episode_scale = episode_scale
+        self.last_pid_effective_leak = effective_leak
+        self.last_pid_delta = bounded_delta
+        self.last_pid_actual_delta = self.pid_i - old_pid
+
     def update_dual(self, batch):
         """
         按 dual_update_mode 更新 λ：旧 critic Adam，或 QCPO_refs 风格的经验积分控制器。
@@ -1032,9 +1088,9 @@ class DQCACBetaGPU(VecAgentBase):
             control_error = self.last_dual_quantile_gap / self.pid_cost_scale
         self.last_dual_control_error = float(control_error)
 
-        # QCPO_refs 的默认所谓 PID 实际 Kp=Kd=0，仅 I 项：I←clip(I+Ki·error)。
-        self.pid_i = min(
-            self.lambda_max, max(self.lambda_min, self.pid_i + self.pid_Ki * control_error))
+        # QCPO_refs 默认 Kp=Kd=0；这里的默认参数精确复现其 bounded I，
+        # 显式参数可打开 leaky/deadband/episode-scaled 版本抑制窗口滞后。
+        self._update_pid_integral(control_error, new_episodes=len(costs))
         with torch.no_grad():
             self.lambda_dual.fill_(self.pid_i)
         self.last_dual_prob = window_prob
@@ -1168,6 +1224,11 @@ class DQCACBetaGPU(VecAgentBase):
             'dual/prob_gap': self.last_dual_prob_gap,
             'dual/quantile_gap': self.last_dual_quantile_gap,
             'dual/control_error': self.last_dual_control_error,
+            'dual/filtered_error': self.last_dual_filtered_error,
+            'dual/pid_episode_scale': self.last_pid_episode_scale,
+            'dual/pid_effective_leak': self.last_pid_effective_leak,
+            'dual/pid_delta': self.last_pid_delta,
+            'dual/pid_actual_delta': self.last_pid_actual_delta,
             'dual/pid_i': self.pid_i,
             'dual/window_size': float(len(self.empirical_cost_window)),
             'dual/sum_norm_enabled': float(self.sum_norm),

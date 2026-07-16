@@ -410,3 +410,15 @@
 - 终评 predicted mean cost 从 n-step 的 `1.49` 提到 `4.02`，真实值 `8.96`；CDF 从 `0.00045` 提到 `0.0384`，真实 outage `0.2286`。MC 明确缓解传播低估，但 mean 仍低估 55%、CDF 仍低估 0.190，不扩 300k。profile：`_runs/profiles/dqc_cost_target_mc_100k_2026-07-16/`。
 - 新增 C-O1 优化诊断：记录 reward/cost/joint 裁剪前 gradient norm 和 clip indicator；profile 工具同步纳入 cost target/gradient 指标。持久化 recurrent+chunk smoke `DQCAC_DynamicButton_smoke_mc_grad_diag_s0` 训练 `4.6s`、exit code 0。
 - 下一门 C-O1：保持 MC 与 actor epochs=8，只把 critic epochs `10→20`。若校准仍无实质改善，再进入 C-H1；最终保留 `nstep/MC × Markov/recurrent-cost` 的 2×2 消融。
+
+
+### E17：MC cost critic 优化与 bounded leaky-I
+
+- C-O1 `critic epochs=20, lr=1e-3`：job `DQCAC_DynamicButton_recur_mc_cost_c20_lr3e4_100k_s0`，W&B `059boy42`，训练 `59.4s`。终评 predicted mean cost `6.97` 对 truth `8.96`（低估 22%），CDF `0.1308` 对 outage `0.2286`（bias `-0.0978`）；训练末 s0 prediction `8.24` 对当批 cost mean `10.0`。
+- C-LR2 `critic epochs=10, lr=2e-3`：job `DQCAC_DynamicButton_recur_mc_cost_clr2e3_lr3e4_100k_s0`，W&B `73yevpqm`，训练 `58.2s`。终评 mean/CDF 只有 `5.91/0.0987`，低于 C-O1；故选择 C20，不用高 LR 替代。
+- C20 的 joint grad norm 为 `1.37～7.86`，始终低于 clip=10；cost grad 大于 reward grad，但两 critic 参数独立且没有触发联合裁剪，排除“grad clip 导致追不上”。
+- C10/C20/C-LR2 的 reward/PPO 逐点相同；cost 优化没有污染 lambda=0 的 actor 结论。C20 比 C10 只多约 `2.5s` wall time，当前 A100 采样中峰值实测约 `1.3GB`、GPU 利用率低，说明后续 B/N 有充足余量。
+- profiles：`_runs/profiles/dqc_cost_optimizer_c20_100k_2026-07-16/`；C-LR2 作为日志/W&B 负消融保留。
+- 新增默认兼容的 bounded leaky-I：`pid_integral_leak`、`pid_deadband`、`pid_delta_max`、`pid_reference_episodes`。默认 `1/0/inf/0` 精确复现旧 `lambda<-clip(lambda+Ki*error)`。
+- episode scaling 使用几何积分和：常值误差下，一次 B=20 update 与两次 B=10 update 数值相同；手算断言覆盖 legacy exact、episode-scale exact 和 deadband。持久化 smoke `DQCAC_DynamicButton_smoke_leaky_pid_s0` 训练 `6.0s`、exit code 0。
+- 首条 constrained 门控采用 C20+MC、recurrent actor、`beta=.995,sum_norm=true,outage PID`，并设 `Ki=.1,leak=.97,deadband=.02,delta_max=.05,reference=10`。这是 P-B1，不覆盖 E9 legacy-I；若 outage 偏高，路线是 leak=.98/Ki=.15；若过保守，路线是 leak=.95 或更大 deadband。
