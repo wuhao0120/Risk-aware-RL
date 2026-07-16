@@ -11,7 +11,8 @@ QCPOGPU (safety_gym_env · CMDP 版) —— 用户 QCPO 迁移到 safety-gym out
                · 无 γ^t/β^t 折扣、无 baseline (与 qcpo.py 逐式一致)
     Dual:      λ ← [λ + ε_k·(P̂(C≥d) - ω)]_+           (本批经验 outage 违反率驱动)
 
-与原版仅有的差异: 一条 rollout 现在算【两个】回报 (R 目标 / C 约束); indicator 用 indicator_ge。
+默认 qcpo_reward_mode=mc 时，与原版仅有的任务适配是一条 rollout 同时计算 reward/cost
+两种回报并使用上尾 indicator；可选 gae 模式是明确标注的 reward-credit hybrid 消融。
 """
 import numpy as np
 import torch
@@ -20,11 +21,11 @@ from torch.optim.lr_scheduler import LambdaLR                 # lr = a/(b+k)^c
 
 from utils import RunningMeanStd                              # EMA 回报归一化器 (QCPO 配方)
 from .vec_base import VecAgentBase                            # 共享: env/策略/rollout(含cost)/日志
-from .common import lr_lambda                                 # lr 衰减 (共享件)
+from .common import ScalarValueCritic, lr_lambda              # 可选 V_r(s)+GAE / lr 衰减
 
 
 class QCPOGPU(VecAgentBase):
-    """QCPO CMDP 版 (MC 轨迹级; 经验 outage 驱动 dual; 算法与 portfolio 版逐式一致)。"""
+    """QCPO CMDP：默认 MC 轨迹级；可选 reward V+GAE hybrid；constraint 始终轨迹级。"""
 
     # ============================================================ 初始化 ============================================================
     def __init__(self, args, env):
@@ -51,6 +52,30 @@ class QCPOGPU(VecAgentBase):
 
         # return_rms: EMA 奖励回报归一化 (decay=0.01 ≈ 最近 100 条轨迹, QCPO 配方)
         self.return_rms = RunningMeanStd(decay=float(getattr(args, 'norm_ema_decay', 0.01)))
+
+        # reward credit assignment 做成显式消融：mc 保持原始轨迹级 QCPO；gae 是
+        # scalar V_r(s,t)+GAE hybrid，constraint 仍保持轨迹级 indicator，不改变其语义。
+        self.reward_mode = str(getattr(args, 'qcpo_reward_mode', 'mc')).lower()
+        if self.reward_mode not in {'mc', 'gae'}:
+            raise ValueError("qcpo_reward_mode must be 'mc' or 'gae'")
+        self.gae_lambda = float(getattr(args, 'gae_lambda', 0.97))
+        self.reward_advantage_norm = bool(getattr(args, 'reward_advantage_norm', False))
+        self.value_step_feature = bool(getattr(args, 'reward_value_step_feature', True))
+        self.reward_value_lr = float(getattr(args, 'reward_value_lr', 3e-4))
+        self.reward_value_grad_clip = float(getattr(args, 'reward_value_grad_clip', 10.0))
+
+        # GAE 模式维护独立 V_r(s,t)。有限期界 DynamicButton 的价值依赖剩余时间，
+        # 因而默认追加 t/T；网络宽度与 actor MLP 相同，减少容量这个混杂变量。
+        self.reward_value = None
+        self.reward_value_optimizer = None
+        if self.reward_mode == 'gae':
+            value_hidden = getattr(args, 'actor_hidden', [256, 256])
+            if isinstance(value_hidden, str):
+                value_hidden = [int(x) for x in value_hidden.split(',') if x.strip()]
+            value_dim = self.state_dim + (1 if self.value_step_feature else 0)
+            self.reward_value = ScalarValueCritic(value_dim, hidden=value_hidden).to(self.device)
+            self.reward_value_optimizer = Adam(
+                self.reward_value.parameters(), self.reward_value_lr, eps=1e-5)
 
         # -------------------- 优化器: θ 两时间尺度 + λ --------------------
         # θ 优化器: 默认 SGD (对齐 QCPOGPU 模板 + Robbins-Monro SA); safety-gym 观测信息量足,
@@ -81,7 +106,8 @@ class QCPOGPU(VecAgentBase):
         print(f"QCPOGPU[CMDP]: env={self.env_name}, omega={self.q_alpha}, d(cost_limit)={self.cost_limit}, "
               f"B={self.num_envs}, T={self.n}, iters={self.num_iterations}, "
               f"updates/iter={self.updates_per_iteration}, actor_mode={self.actor_update_mode}, "
-              f"obs_norm={self.normalize_observation}, opt={self.theta_optimizer_name}, device={self.device}")
+              f"reward_mode={self.reward_mode}, obs_norm={self.normalize_observation}, "
+              f"opt={self.theta_optimizer_name}, device={self.device}")
 
         # ===== return/observation RMS 预热 (只采样和刷统计，不更新策略) =====
         for _ in range(self.warmup_rms_iters):
@@ -103,14 +129,19 @@ class QCPOGPU(VecAgentBase):
             if old_log_probs is not None:
                 old_log_probs = old_log_probs.reshape(n * B).detach()  # 全 epoch 固定行为分母
 
-            # ===== 2. 刷新 return_rms (奖励回报, 逐条) =====
+            # ===== 2. 刷新 return_rms；GAE target 每个 rollout 只计算并冻结一次 =====
             self._update_rms(R)
+            gae_batch = self._prepare_reward_gae(roll) if self.reward_mode == 'gae' else None
 
-            # ===== 3. 内层策略更新 (复用本批) =====
-            actor_info = {}
+            # ===== 3. 内层更新：actor/PPO 与可选 reward value 复用同一批固定 target =====
+            actor_info, value_info = {}, {}
             for _ in range(self.updates_per_iteration):
+                if gae_batch is not None:
+                    value_info = self._update_reward_value(gae_batch)
                 actor_info = self._update_actor(
-                    states, actions, R.detach(), C.detach(), old_log_probs=old_log_probs)
+                    states, actions, R.detach(), C.detach(),
+                    old_log_probs=old_log_probs,
+                    reward_advantages=None if gae_batch is None else gae_batch['advantages'])
 
             # ===== 4. 外层 λ 更新 (经验 outage 驱动) =====
             if it % self.outer_interval == 0:
@@ -141,22 +172,33 @@ class QCPOGPU(VecAgentBase):
                     'obs_norm/std_median': float(obs_std.median().item()),
                     'obs_norm/std_max': float(obs_std.max().item()),
                 })
+            extra.update(value_info)
             extra.update(actor_info)
             self._log_core(it, R_np, Zc_np, Cu_np, extra=extra)
             self.scheduler.step()
             self.lambda_scheduler.step()
 
-    # ============================================================ 策略更新 (与模板逐式一致, 约束换 cost 上尾) ============================================================
-    def _update_actor(self, states, actions, R, C, old_log_probs=None):
+    # ============================================================ Actor 更新 (MC/GAE reward + 轨迹级 cost) ============================================================
+    def _update_actor(self, states, actions, R, C, old_log_probs=None,
+                      reward_advantages=None):
         """
-        weight(τ) = (R-μ_R)/σ_R  -  λ·𝟙{C≥d}   (每条轨迹标量, 广播到全部 n 个 timestep)
-        loss = -E[logπ·weight]
+        reward 权重可选轨迹 MC 或 per-step GAE；risk 始终是轨迹 outage indicator。
+        PPO 时分别对 reward 用 pessimistic min、risk 用 conservative max，避免先把
+        两者相减再 clip 导致约束项在混合符号 advantage 下失去保守性。
         """
         n, B = self.n, self.num_envs
         ind = (C >= self.cost_limit).float()                  # [B] 𝟙{C≥d} 上尾 (outage)
-        R_norm = (R - self.return_rms.mean) / self.return_rms.std   # [B] EMA 归一化奖励回报
-        weight = R_norm - self.lambda_dual.detach() * ind     # [B] 复合权重
-        weight_full = weight.unsqueeze(0).expand(n, B).reshape(n * B)   # [n·B]
+        risk_weight = ind.unsqueeze(0).expand(n, B).reshape(n * B)
+
+        if self.reward_mode == 'mc':
+            R_norm = (R - self.return_rms.mean) / self.return_rms.std
+            reward_weight = R_norm.unsqueeze(0).expand(n, B).reshape(n * B)
+        else:
+            if reward_advantages is None:
+                raise RuntimeError("GAE actor update requires frozen reward_advantages")
+            reward_weight = reward_advantages
+        lagrange = self.lambda_dual.detach()
+        combined_weight = reward_weight - lagrange * risk_weight
 
         log_probs = self._compute_log_probs(states, actions)  # [n·B]
         ppo_info = {}
@@ -169,9 +211,11 @@ class QCPOGPU(VecAgentBase):
             ratio = torch.exp(log_ratio)
             clipped_ratio = torch.clamp(
                 ratio, 1.0 - self.ppo_ratio_clip, 1.0 + self.ppo_ratio_clip)
-            surrogate = torch.minimum(
-                ratio * weight_full.detach(), clipped_ratio * weight_full.detach())
-            actor_loss = -surrogate.mean()
+            reward_surr = torch.minimum(
+                ratio * reward_weight.detach(), clipped_ratio * reward_weight.detach())
+            risk_surr = torch.maximum(
+                ratio * risk_weight.detach(), clipped_ratio * risk_weight.detach())
+            actor_loss = -reward_surr.mean() + lagrange * risk_surr.mean()
             ppo_info = {
                 'ppo/ratio_mean': float(ratio.detach().mean().item()),
                 'ppo/ratio_std': float(ratio.detach().std(unbiased=False).item()),
@@ -181,7 +225,7 @@ class QCPOGPU(VecAgentBase):
                     ((ratio.detach() - 1.0) - log_ratio.detach()).mean().item()),
             }
         else:
-            actor_loss = -(log_probs * weight_full.detach()).mean()
+            actor_loss = -(log_probs * combined_weight.detach()).mean()
 
         self.optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -197,13 +241,97 @@ class QCPOGPU(VecAgentBase):
             self.actor.log_std.clamp_(min=self.log_std_min, max=self.log_std_max)
         info = {
             'actor/loss': float(actor_loss.item()),
-            'actor/weight_mean': float(weight.mean().item()),
-            'actor/weight_std': float(weight.std(unbiased=False).item()),
+            'actor/weight_mean': float(combined_weight.mean().item()),
+            'actor/weight_std': float(combined_weight.std(unbiased=False).item()),
+            'actor/reward_weight_std': float(reward_weight.std(unbiased=False).item()),
+            'actor/risk_weight_std': float(risk_weight.std(unbiased=False).item()),
             'actor/grad_norm': float(grad_norm.item()),
             'actor/log_std_mean': float(self.actor.log_std.detach().mean().item()),
+            'debug/reward_mode_is_gae': float(self.reward_mode == 'gae'),
         }
         info.update(ppo_info)
         return info
+
+    # ============================================================ 可选 scalar V_r(s,t)+GAE ============================================================
+    def _value_inputs(self, states, steps):
+        """共享 observation RMS，并按需追加 t/T，输出 [T·B,state_dim(+1)]。"""
+        value_states = self._normalize_states(states)
+        if not self.value_step_feature:
+            return value_states
+        step_feature = (steps.float() / self.n).reshape(-1, 1)
+        return torch.cat([value_states, step_feature], dim=1)
+
+    def _prepare_reward_gae(self, roll):
+        """
+        用 rollout 时的 V_r 计算冻结 GAE advantage 与 λ-return。
+
+        每段 T=1000 是完整 episode，最后一步 next_value=0；中间位置取同轨迹下一时刻
+        value。advantages/targets 在所有 PPO/value epochs 间不重算，避免移动监督目标。
+        """
+        if self.reward_value is None:
+            raise RuntimeError("reward GAE requested while qcpo_reward_mode=mc")
+
+        n, B = self.n, self.num_envs
+        states = roll['S'].reshape(n * B, -1)
+        rewards = roll['R']                                    # [T,B]
+        steps = torch.arange(n, device=self.device).unsqueeze(1).expand(n, B).reshape(n * B)
+        value_inputs = self._value_inputs(states, steps)
+
+        with torch.no_grad():
+            values_old = self.reward_value(value_inputs).reshape(n, B)
+            next_values = torch.cat(
+                [values_old[1:], torch.zeros_like(values_old[:1])], dim=0)
+            deltas = rewards + self.gamma * next_values - values_old
+
+            gae = torch.zeros(B, dtype=torch.float32, device=self.device)
+            advantages = torch.empty_like(deltas)
+            for t in range(n - 1, -1, -1):
+                gae = deltas[t] + self.gamma * self.gae_lambda * gae
+                advantages[t] = gae
+            targets = advantages + values_old
+
+            raw_advantages = advantages.reshape(n * B)
+            actor_advantages = raw_advantages
+            if self.reward_advantage_norm:
+                adv_mean = raw_advantages.mean()
+                adv_std = raw_advantages.std(unbiased=False).clamp_min(1e-8)
+                actor_advantages = (raw_advantages - adv_mean) / adv_std
+
+        return {
+            'value_inputs': value_inputs.detach(),
+            'targets': targets.reshape(n * B).detach(),
+            'advantages': actor_advantages.detach(),
+            'raw_advantages': raw_advantages.detach(),
+        }
+
+    def _update_reward_value(self, gae_batch):
+        """拟合本 rollout 冻结的 GAE λ-return，并报告 value 拟合健康度。"""
+        value_pred = self.reward_value(gae_batch['value_inputs'])
+        value_targets = gae_batch['targets']
+        value_error = value_pred - value_targets
+        value_loss = 0.5 * value_error.pow(2).mean()
+
+        self.reward_value_optimizer.zero_grad(set_to_none=True)
+        value_loss.backward()
+        if self.reward_value_grad_clip > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.reward_value.parameters(), self.reward_value_grad_clip)
+        else:
+            grad_norm = torch.zeros((), device=self.device)
+        self.reward_value_optimizer.step()
+
+        target_var = value_targets.var(unbiased=False)
+        explained_var = torch.where(
+            target_var > 1e-8,
+            1.0 - value_error.detach().var(unbiased=False) / target_var,
+            torch.zeros_like(target_var))
+        return {
+            'reward_value/loss': float(value_loss.item()),
+            'reward_value/explained_variance': float(explained_var.item()),
+            'reward_value/grad_norm': float(grad_norm.item()),
+            'advantage/mean_adv_std': float(
+                gae_batch['raw_advantages'].std(unbiased=False).item()),
+        }
 
     # ============================================================ Dual 更新 (经验 outage 驱动) ============================================================
     def _update_dual(self, C):

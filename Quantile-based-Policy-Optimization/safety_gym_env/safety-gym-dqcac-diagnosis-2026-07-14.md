@@ -711,3 +711,24 @@ DQCAC 理论上可能超过 QCPO_refs 的理由是：它用每个 transition 学
 - wall time、GPU memory 和参数量透明报告。
 
 长期主线推荐：`公平 recurrent backbone → 稳定 dual → B=32 独立轨迹 → chunked large-N/smooth CDF → local τ/IQN/non-crossing → 多环境多 seed`。其中每一箭头都保留上一阶段的 MLP/简单 critic 作为消融与回退点。
+
+## 13. 2026-07-16 QCPO 校准实证更新
+
+### 13.1 修复是否让 QCPO 恢复正常学习
+
+是，但只恢复到“稳定上升”，还没有达到 QCPO_refs/DQCAC E5 的样本效率。
+
+- 旧 QCPO 的两个确定性错误已经修复：同 rollout 多次 actor 更新不再缺少 IS/PPO；observation RMS 现在真实更新，并在采样/actor epochs 内冻结。
+- 100k 消融中，raw-observation 单次 on-policy 后段 reward 为 `-0.0419`；obs RMS + learnable sigma 单次 on-policy 为 `-0.0151`；再加 fixed-old PPO 8 epochs 后为 `0.0385`、趋势 `+0.649/百万步`。
+- Q-A2 独立 300k 终评 reward `0.3496`；训练后段 `0.2297`、趋势 `+1.248/百万步`。它显著超过旧 QCPO 同预算的 `-0.1139/-0.345`，证明 bug 修复有效。
+- 同 300k，DQCAC E5 为 `1.662/+6.816`，QCPO_refs 为 `1.355/+5.431`。因此 QCPO 的剩余差距主要是整条轨迹 MC reward 信号的高方差/差 credit assignment，而不是继续归咎于 IS 或 normalization。
+
+原始完整 history 与图在 `_runs/profiles/qcpo_qa012_100k_2026-07-16/` 和 `_runs/profiles/qcpo_a2_vs_key_300k_2026-07-16/`。
+
+### 13.2 下一条最小路线：Q-B reward GAE hybrid
+
+已加入 `qcpo_reward_mode=gae`：reward 使用独立 scalar `V_r(s,t)`、GAE 和 PPO；constraint 仍使用 QCPO 的轨迹级 outage indicator。该路线不再称为纯原始 QCPO，而用于隔离“reward credit assignment”与“constraint credit assignment”。
+
+实现保持四个不变量：observation RMS 共享；有限期界 value 输入追加 `t/T`；GAE/target 在一个 rollout 的所有 epochs 中冻结；行为 `old_log_prob` 始终固定。risk/reward PPO surrogate 也已拆开，分别使用 conservative max 与 pessimistic min。后台 smoke 已以 exit code 0 完成。
+
+决策门仍是：先 100k、seed 0；只有后段 reward 明显超过 Q-A2 且 value explained variance、KL、clip fraction 有限，才扩 300k。Q-B 通过后才开始统一 MLP+LSTM，避免把 recurrence 与 reward baseline 的收益混在一起。

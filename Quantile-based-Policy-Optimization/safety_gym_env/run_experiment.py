@@ -129,6 +129,12 @@ def base_args(algo, seed, device, env_key):
         a.learn_std = False                             # Q-A1 起用 σ=1 + learnable 作独立消融
         a.log_std_min = -5.0
         a.log_std_max = 2.0
+        a.qcpo_reward_mode = 'mc'                      # 'gae' = V_r+GAE reward / MC constraint hybrid
+        a.gae_lambda = 0.97
+        a.reward_advantage_norm = False
+        a.reward_value_step_feature = True
+        a.reward_value_lr = 3e-4
+        a.reward_value_grad_clip = 10.0
     elif algo == 'DQCAC':
         # per-transition 双 critic 版 (继承 portfolio DQCACBetaGPU 已验证配方)。
         a.beta = 0.95

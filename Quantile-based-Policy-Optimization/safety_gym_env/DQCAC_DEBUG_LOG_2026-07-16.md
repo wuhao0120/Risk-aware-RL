@@ -280,3 +280,26 @@
   - Q-A1：单次 on-policy + obs norm + σ=1/learnable，先跑 100k。
   - Q-A2：Q-A1 + 固定-old PPO 8 epochs，先跑 100k。
   - 100k 仅用于排除明显不学习配置；胜者扩到独立 300k run，不从 100k checkpoint 续跑，保证比较协议一致。
+
+#### E11 Q-A0/Q-A1/Q-A2 结果
+
+- 三个 100k run 均为 `B=10,T=1000,seed=0,lambda_max=0`，通过持久化后台完成并 exit code 0：
+  - Q-A0 raw observation、固定 sigma=0.5、单次 on-policy：W&B `57t0ijye`，训练 `55.7s`，终评 reward `-0.0204`。
+  - Q-A1 obs RMS、sigma=1/learnable、单次 on-policy：W&B `x3fwd2ao`，训练 `56.1s`，终评 reward `0.0275`。
+  - Q-A2 Q-A1 + fixed-old PPO 8 epochs：W&B `gq2mukc4`，训练 `57.9s`，终评 reward `0.0209`。
+- 共同 100k 后 20%：Q-A0/Q-A1/Q-A2 reward 分别为 `-0.0419/-0.0151/0.0385`，趋势分别为 `-0.400/+0.029/+0.649` 每百万步。完整导出与 profile：
+  - `_runs/wandb_export/qcpo_qa012_100k_2026-07-16/`
+  - `_runs/profiles/qcpo_qa012_100k_2026-07-16/`
+- 只有 Q-A2 形成方向一致的正趋势，因此独立扩到 300k：W&B `6xp94twc`，训练 `146.0s`，130 条终评 reward `0.3496`、outage `0.1692`；lambda 固定为 0，所以 outage 只描述自然策略，不能归因于约束控制。
+- 共同 300k 后 20%：Q-A2 reward `0.2297`、趋势 `+1.248/百万步`，相对旧 QCPO 的 `-0.1139/-0.345` 已完成定性修复；但仍明显低于 DQCAC E5 的 `1.662/+6.816` 和 QCPO_refs 的 `1.355/+5.431`。对齐 profile：
+  - `_runs/wandb_export/qcpo_a2_vs_key_300k_2026-07-16/`
+  - `_runs/profiles/qcpo_a2_vs_key_300k_2026-07-16/`
+- 结论：observation RMS、sigma=1/learnable 与正确 PPO reuse 让 QCPO 从“不学习”恢复为稳定上升，但轨迹级 MC reward credit assignment 仍是剩余主瓶颈。
+
+#### Q-B：QCPO-GAE/PPO hybrid 实现
+
+- 新增 `qcpo_reward_mode=mc|gae`。`mc` 保持原始轨迹级 QCPO；`gae` 只将 reward 分支改成 scalar `V_r(s,t)` + 冻结 GAE lambda-return，constraint 仍是轨迹级 `I{C>=d}`，因此明确标为 hybrid。
+- `V_r` 与 actor 使用相同 MLP 宽度、共享 observation RMS，并默认追加 `t/T`；GAE advantage/value target 每个 rollout 只计算一次，在 8 个 value/PPO epochs 中保持冻结。
+- PPO surrogate 将 reward 和 risk 分开：reward 用 clipped minimum，risk 用 conservative maximum；这修正了“先组合正负权重再 clip”在 lambda>0 时可能不保守的问题。
+- 持久化 smoke `QCPO_DynamicButton_smoke_gaeppo_obsnorm_s0`：`B=2,T=32,iters=2`，训练 `7.1s`，exit code 0；覆盖 obs RMS、V、GAE、固定 old-prob PPO 和终评。
+- 下一实验：Q-B reward-only 100k；若明显超过 Q-A2 的 `0.0385` 后段均值并保持 PPO/value 数值健康，再扩独立 300k。
