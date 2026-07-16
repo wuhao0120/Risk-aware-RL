@@ -386,3 +386,24 @@
 - 合成 uneven chunk 对拍 `M=11,N=7,chunk=4`：loss 误差 `4.33e-8`、prediction gradient 最大误差 `0.0`。
 - 持久化集成 smoke `DQCAC_DynamicButton_smoke_chunked_qr_s0`：`T·B=64,N=16,chunk=17`，训练 `4.4s`、exit code 0。
 - 用途：先解除 B=32 与 N=64/128 的峰值显存限制；性能、wall time 和 peak memory 后续作为独立实验报告。
+
+### E15：D-R0 actor LR / shared value coefficient 轻量消融
+
+- 公平口径：全部 `DynamicButton/seed0/B=10/T=1000/100k/lambda=0`，其余沿用 D-R0 的 LSTM512、GAE+PPO8、N=32。完整 profile：`_runs/profiles/dqc_recurrent_actor_ablation_100k_2026-07-16/`。
+- 基线 `lr=2e-4,value_coef=1`：W&B `j57xp70k`，后段 reward `0.4278`、趋势 `+6.164/M`。
+- 提高 actor LR 到 `3e-4`：job `DQCAC_DynamicButton_recur_dr0_lr3e4_100k_s0`，W&B `tmckgcax`，训练 `56.7s`；后段 `0.4766/+6.716/M`，终评 reward `0.5527`。后段 KL `0.00310`、clip fraction `0.178`，未出现更新过猛；该路线保留为新的 reward-only recurrent 候选。
+- 仅把 shared value coefficient 降到 `0.5`：job `DQCAC_DynamicButton_recur_dr0_vcoef05_100k_s0`，W&B `x37vpl83`，训练 `59.8s`；后段 `0.3755/+5.797/M`，低于基线，故不扩 300k。它保留为负消融，说明当前证据不支持“value 梯度压制 policy”这个解释。
+- 同预算 QCPO_refs 为 `0.4776/+7.008/M`，MLP Q-B 为 `0.5574/+6.950/M`。`lr=3e-4` 已追平 refs 前段，但单 seed/100k 不能宣称稳定胜出。
+- 100k 的 cost critic 仍严重低估：lr 路线后段 predicted mean cost `1.13`，rollout cost mean `7.40`；终评 critic CDF `0.00045` 对 empirical outage `0.229`。因此停止 reward 小网格，转向 cost target/历史表示诊断。
+
+### E16：cost distribution target 的分歧路线与 MC 实现
+
+- **C-T0（保留基线）**：`cost_target_mode=nstep`，100-step QR-TD + target critic；默认值不变，历史实验可复现。
+- **C-T1（当前轻量验证）**：`cost_target_mode=mc`，对完整 episodic rollout 反向计算 `G^c_t=c_t+gamma_c G^c_{t+1}`，用真实 return-to-go 直接监督 N 个 quantiles。只替换 cost target，不改变 reward critic/GAE/PPO。
+- **C-T2（候选）**：若 MC 校准明显改善但方差大，做 n-step/MC anchor mixture 或 cost lambda-return；单列为消融，不能与 C-T1 混写。
+- **C-H1（候选）**：独立 recurrent cost encoder + action-conditioned quantile head，显式处理 online/target history；用于检验部分可观测性。
+- **C-H0.5（轻量候选）**：复用冻结 actor-history feature 接 cost quantile head；工程风险低但表示受 reward actor 漂移影响，必须与独立 encoder 分开报告。
+- **C-Q（后续）**：N=64/128、smooth CDF、局部 tau/IQN；只有 mean/return target 已校准后才进入，避免用更多 quantile 掩盖整体传播偏差。
+- 实现保护：MC 只允许 `episodic=True`，continuing 截断 rollout 会直接报错；scalar MC sample 重复为 N 列以保持现有 QR target-sample 求和的 loss/梯度尺度，避免同时重调 critic LR。
+- 验证：语法与手算 discounted return 通过；持久化 smoke `DQCAC_DynamicButton_smoke_recur_mc_cost_s0` 使用 recurrent+chunked QR，训练 `5.8s`、exit code 0，JSON/评估全链路通过。
+- 下一门：用 E15 胜出的 `lr=3e-4,value_coef=1` 跑 C-T1 100k。主判据不是 reward，而是 `pred_cost_mean / true cost mean`、s0 CDF calibration 与 cost QR loss；若低估不明显改善，不扩 300k，转 C-H1。

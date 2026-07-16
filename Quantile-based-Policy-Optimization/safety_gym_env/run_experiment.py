@@ -165,6 +165,10 @@ def base_args(algo, seed, device, env_key):
         # 实测 cost-critic 在 s0 恒 0 → λ 不动)。n_step=100 → bootstrap 链长 10, 数百
         # updates 即可覆盖; on-policy 每迭代重采, n-step 和 + 截断 mask 均合法。
         a.n_step = 100
+        # cost distribution target 消融：nstep 完整保留历史 QR-TD；mc 使用本次完整
+        # T=1000 episode 的真实 return-to-go，专门诊断 s0 cost/CDF 低估是否来自
+        # bootstrap 传播。默认绝不改变已有实验，只有显式 --set cost_target_mode=mc 才启用。
+        a.cost_target_mode = 'nstep'
         a.num_action_samples = 4
         a.advantage_norm = 'qcpo'                       # EMA 归一化 (反 λ 卷绕, 已验证)
         a.norm_ema_decay = 0.1

@@ -815,3 +815,17 @@ D-R0 已先后完成 100k 门控和独立 300k 扩展，均由持久化 launcher
 因此块数不会放大学习率或 optimizer step 数。合成 `M=11,N=7,chunk=4` 的 uneven-chunk 对拍中，full/chunk loss 绝对误差 `4.33e-8`，quantile prediction 梯度最大绝对误差 `0.0`。持久化集成 smoke `DQCAC_DynamicButton_smoke_chunked_qr_s0` 使用 `T·B=64,N=16,chunk=17`，训练 `4.4s`、exit code 0，并通过 actor/critic/eval 全链路。
 
 这只是显存基础设施，不宣称性能提升。后续先做 B=10/20/32 的 wall-time/peak-memory benchmark，再用 chunking 比较 N=32/64/128；所有大 N 实验同时报告吞吐，避免以数倍计算换来不可比的微小变化。
+
+### 13.7 Recurrent actor 优化与 cost-target 分支（2026-07-16）
+
+100k 单变量消融表明，提高 actor LR 有效，降低共享 value loss 权重无效。`lr=3e-4,value_coef=1` 的后段 reward 为 `0.4766`、趋势 `+6.716/M`，相对 D-R0 的 `0.4278/+6.164/M` 改善，并几乎等于 QCPO_refs 同预算的 `0.4776/+7.008/M`；PPO KL `0.00310`、clip fraction `0.178` 仍健康。相反，`lr=2e-4,value_coef=0.5` 只有 `0.3755/+5.797/M`，不扩长预算。W&B 分别为 `tmckgcax` 与 `x37vpl83`，完整对齐数据在 `_runs/profiles/dqc_recurrent_actor_ablation_100k_2026-07-16/`。
+
+这没有解决 constrained DQC 的核心问题。100k lr 路线的 cost critic 后段只预测平均 cost `1.13`，rollout 实际平均为 `7.40`；终评 CDF `0.00045` 对 empirical outage `0.229`。因此后续路线按可归因性排序并全部保留：
+
+1. **C-T1 MC target**：用完整 episodic cost return-to-go 直接监督 quantiles，先判断低估是否来自 n-step bootstrap 传播；
+2. **C-T2 mixed/lambda target**：只在 MC 校准好但方差过大时尝试；
+3. **C-H1 independent recurrent cost critic**：MC 仍低估时检验历史信息缺失；
+4. **C-H0.5 shared history feature**：作为更轻但表示漂移风险更高的对照；
+5. **C-Q large-N/smooth/local tau/IQN**：整体 cost mean/return 先校准后再做查询点精度优化。
+
+代码新增默认关闭的 `cost_target_mode=nstep|mc`。默认 `nstep` 完全保持旧行为；`mc` 只允许完整 episodic rollout，反向计算 `G^c_t=c_t+gamma_c G^c_{t+1}`，不改变 reward critic、GAE、PPO 或 actor。持久化 recurrent+chunked smoke `DQCAC_DynamicButton_smoke_recur_mc_cost_s0` 训练 `5.8s`、exit code 0。下一条 100k 使用 `lr=3e-4,value_coef=1,lambda=0`；通过条件是 cost mean/CDF calibration 有实质改善，而不是只看 reward 末点。

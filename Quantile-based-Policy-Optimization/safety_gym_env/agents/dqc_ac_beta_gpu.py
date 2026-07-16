@@ -58,6 +58,15 @@ class DQCACBetaGPU(VecAgentBase):
         self.n_step = max(1, int(getattr(args, 'n_step', 1)))
         # episodic (未折扣论文口径) 默认由 cost_gamma 推断: γc=1 → episode 末不 bootstrap
         self.episodic = bool(getattr(args, 'episodic', self.cost_gamma >= 1.0 - 1e-9))
+        # nstep 是历史默认；mc 用完整 finite-horizon cost return 直接监督每个 quantile。
+        # 后者只作为传播偏差消融，不会把 reward actor 或 reward critic 偷换成 MC。
+        self.cost_target_mode = str(getattr(args, 'cost_target_mode', 'nstep')).lower()
+        if self.cost_target_mode not in {'nstep', 'mc'}:
+            raise ValueError("cost_target_mode must be 'nstep' or 'mc'")
+        if self.cost_target_mode == 'mc' and not self.episodic:
+            raise ValueError(
+                "cost_target_mode='mc' requires episodic=True because a truncated "
+                "continuing rollout is not a complete cost return")
         # step feature 默认跟随 episodic: 有限期界下剩余 cost 分布依赖剩余步数 (已验证配方)
         _csf = getattr(args, 'critic_step_feature', None)
         self.critic_step_feature = bool(_csf) if _csf is not None else self.episodic
@@ -221,6 +230,7 @@ class DQCACBetaGPU(VecAgentBase):
         print(f"DQCACBetaGPU[CMDP]: env={self.env_name}, beta={self.beta}, omega={self.q_alpha}, "
               f"d(cost_limit)={self.cost_limit}, cost_gamma={self.cost_gamma}, episodic={self.episodic}, "
               f"step_feature={self.critic_step_feature}, N={self.num_quantiles}, B={self.num_envs}, T={self.n}, "
+              f"cost_target={self.cost_target_mode}, "
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
               f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}, "
@@ -458,6 +468,16 @@ class DQCACBetaGPU(VecAgentBase):
         for k in range(Ns):
             nstep_rew[:n - k] += dr * Rmat[k:]; dr *= self.gamma
             nstep_cost[:n - k] += dc * Cmat[k:]; dc *= self.cost_gamma
+
+        # 完整 episode 的 cost return-to-go：G^c_t=c_t+gamma_c*G^c_{t+1}。
+        # 只在 mc 消融中构造，避免默认 nstep 路径额外占用一个 [T,B] 张量。
+        mc_cost = None
+        if self.cost_target_mode == 'mc':
+            mc_cost = torch.empty_like(Cmat)
+            running_cost = torch.zeros(B, dtype=torch.float32, device=self.device)
+            for t in range(n - 1, -1, -1):
+                running_cost = Cmat[t] + self.cost_gamma * running_cost
+                mc_cost[t] = running_cost
         t_ar = torch.arange(n, device=self.device)
         boot_idx = torch.clamp(t_ar + Ns, max=n)              # bootstrap 态索引 (可达 s_T=n)
         boot_states = S_ext[boot_idx].reshape(n * B, -1)
@@ -495,6 +515,8 @@ class DQCACBetaGPU(VecAgentBase):
         }
         if keep_logp:
             batch['old_log_probs'] = roll['logp'].reshape(n * B).detach()  # rollout 固定行为策略
+        if mc_cost is not None:
+            batch['mc_cost'] = mc_cost.reshape(n * B).detach()
         if self.recurrent_policy:
             # 保留时间主序张量；actor update 再按 recurrent_seq_len 切块，保证每个
             # chunk 的初始 (h,c) 正是行为策略采样时进入该位置的状态。
@@ -538,11 +560,18 @@ class DQCACBetaGPU(VecAgentBase):
                 batch['nstep_reward'].unsqueeze(1)
                 + (self.gamma ** self.n_step)
                 * boot_mask.unsqueeze(1) * reward_next)
-            cost_next = self.cost_target_critic(boot_inputs, boot_actions)
-            cost_target = (
-                batch['nstep_cost'].unsqueeze(1)
-                + (self.cost_gamma ** self.n_step)
-                * boot_mask.unsqueeze(1) * cost_next)
+            if self.cost_target_mode == 'nstep':
+                cost_next = self.cost_target_critic(boot_inputs, boot_actions)
+                cost_target = (
+                    batch['nstep_cost'].unsqueeze(1)
+                    + (self.cost_gamma ** self.n_step)
+                    * boot_mask.unsqueeze(1) * cost_next)
+            else:
+                # 每个 transition 只有一个真实 MC realization；重复到 N 列保持
+                # _quantile_huber_loss 对 target-sample 求和的历史 loss/梯度尺度不变。
+                # 重复列不制造新信息，只让本消融无需同时重调 critic_lr/grad clip。
+                cost_target = batch['mc_cost'].unsqueeze(1).expand(
+                    -1, self.num_quantiles)
 
         state_inputs = self._aug(states, steps)
         total_size = int(states.shape[0])
@@ -586,6 +615,8 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/reward_qr_loss': reward_loss_value,
             'critic/cost_qr_loss': cost_loss_value,
             'critic/chunked_update': float(use_chunks),
+            'critic/cost_target_mean': float(cost_target.mean().item()),
+            'critic/cost_target_is_mc': float(self.cost_target_mode == 'mc'),
         }
 
     def _quantile_huber_loss(self, psi, y):
