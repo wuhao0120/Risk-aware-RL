@@ -983,3 +983,23 @@ C-Q3A-legacy job `DQCAC_DynamicButton_recur_mc_c20_n64_chunk2500_100k_s0`（W&B 
 下一条 C-Q3B 复跑同形 N64 100k，只把 `legacy_sum→reference_mean`。由于两条 N64 run 的网络形状和随机数消耗相同，真实 reward/cost 应逐点一致；若不一致先按实现问题处理。通过条件除原校准门外，再要求 grad clip 显著消失。通过后才组合 `N64+smooth T2,300k`。
 
 另一个独立分歧必须记录：跨 N32/N64 时，critic 输出层参数数不同，会消耗不同数量的全局 Torch RNG，后续 stochastic action sampling 的随机流可能错位。因此跨结构单 seed 不是严格 paired trajectory。C-RNG1 可在 agent 完成初始化后统一 reseed；C-RNG2 为 policy action、critic 初始化、minibatch 各用独立 Generator。当前 C-Q3A/B 通过同形网络规避该混杂；RNG 解耦保留为工程复现消融，不与 QR scale 同时改。
+
+### 13.18 C-Q3B：修正梯度尺度后，uniform N64 仍未提高查询校准（2026-07-16）
+
+C-Q3B job `DQCAC_DynamicButton_recur_mc_c20_n64_ref32_chunk2500_100k_s0`（W&B `61s441ku`）从 commit `f44bac6` 启动，训练 `59.9s`、exit code 0。它与 N64 legacy 只有 `quantile_target_reduction=reference_mean,ref=32` 一项差异。
+
+配对验证成立：两条 N64 run 每个 reward/empirical cost 点一致，终评都为 reward `0.5527`、outage `0.2286`、mean cost `8.957`。尺度修正把末点 cost grad norm 从 `17.03` 降到 `7.67`，joint grad clip fraction 从 `1` 降到 `0`；CDF 从 `0.1223` 提到 `0.1268`，predicted mean 从 `6.808` 提到 `6.994`。因此 reference normalization 的工程作用明确，后续 N64/128 必须使用它。
+
+然而校准门仍失败。N64-reference 的 CDF bias 为 `0.2286-0.1268=0.1018`，比 N32 C20 的 `0.0978` 略差；mean-cost relative error 约 21.9%，与 N32 的 22.1% 基本相同，远未进入 15%。这说明把 uniform grid 从 32 均匀加到 64 主要增加全局输出分辨率，没有解决预算查询处的有限容量、MC 回归偏差或 history/action 外推误差。停止 `N64+T2,300k`，N128 只保留为论文分辨率消融，不作为当前主线。
+
+对齐 profile 位于 `_runs/profiles/dqc_quantile_resolution_n32_n64_100k_2026-07-16/`，完整 history 位于 `_runs/wandb_export/dqc_quantile_resolution_n32_n64_100k_2026-07-16/`。
+
+下一主线改为 cost-only 查询点局部加密 C-Q4。机会约束 `P(C≥d)=alpha=0.2` 的边界对应 quantile function 约 `τ*=1-alpha=0.8`。C-Q4A 保持 N=32，但从 mixture density 生成非均匀 τ，使约一半采样质量来自 `[0.7,0.9]`；该区间实际约获得 60% 输出头，局部 τ 间距约缩小到 uniform 的 1/3。reward critic 仍使用 uniform τ，避免污染 GAE 之外的 reward 分布诊断。
+
+非均匀 τ 有两个不能混淆的权重问题：
+
+1. **CDF quadrature 必须校正**：不能继续对 local points 做简单 `1/N` count，否则会把人为加密误报为更大 outage。C-Q4 用 mixture density 的 `1/g(τ)` importance weight并归一化，hard/sigmoid CDF、critic dual 与评估共用这一概率口径。
+2. **prediction quantile loss 有两条合法路线**：C-Q4A 对非均匀 prediction heads 等权，刻意把 critic 容量/梯度聚焦到 τ≈0.8；C-Q4B 对 prediction heads 也乘 importance weight，近似保持全局 uniform-τ W1 目标，只增加局部分辨率。A 是当前“只需查询点准确”的主假设，B 保留为分布保持消融。
+3. **target sample 权重独立处理**：cost target quantiles 代表分布积分，必须做 importance weighting；当前 MC target 每列相同，但实现仍需对 n-step 路径保持正确，不能依赖这个巧合。
+
+若 C-Q4A 的 100k CDF bias 未至少降低 25%，不跑 300k；转 C-Q4B 或 C-H1。C-Q2 adaptive sigmoid bandwidth、N128、uniform-IQN、query-mixture-IQN、P-M1 controller safety setpoint 与 C-E1 checkpoint/eval-only 都继续保留为正交路线。

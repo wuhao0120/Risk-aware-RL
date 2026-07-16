@@ -512,3 +512,13 @@
 - 持久化 smoke `dqc_n64_reference_qr_smoke_20260716`：N64+chunk2500+reference，训练 `14.4s`、exit code 0，rollout/critic/PPO/eval/JSON 全链路通过。
 - 下一门 C-Q3B：同一个 N64 100k run 只切 reference_mean。与 C-Q3A-legacy 网络形状相同，随机初始化/采样流应一致；要求真实 reward/cost 逐点相同，且 grad clip 消失、校准达到原门，才组合 N64+T2。
 - 公平性分歧 C-RNG1：N32/N64 初始化会消耗不同数量的全局 RNG，跨网络宽度单 seed 的轨迹不保证配对。可选路线是 agent 初始化后统一 reseed 或分离 policy-action/critic RNG；当前先用同形 C-Q3A/B 配对，不把 RNG 修正混入本轮。
+
+### E27：C-Q3B 尺度修正有效，但 uniform N64 仍无校准收益
+
+- C-Q3B：job `DQCAC_DynamicButton_recur_mc_c20_n64_ref32_chunk2500_100k_s0`，W&B `61s441ku`，commit `f44bac6`，训练 `59.9s`、exit code 0。
+- 与 N64 legacy 的 reward/empirical cost/终评 truth 逐点相同：reward `0.5527`、outage `0.2286`、mean cost `8.957`；单变量配对成立。
+- reference scale 把末点 cost grad norm `17.03→7.67`、clip fraction `1→0`，CDF `0.1223→0.1268`、pred mean `6.808→6.994`，证明优化尺度修正正确。
+- 但相对 N32 C20 的 CDF `0.1308`、pred mean `6.974` 没有实质提升；N64-ref 的 CDF bias `0.1018`、mean relative error 21.9%，未达到 25%/15% 门。停止 N64+T2 300k，N128 降为后续分辨率消融。
+- profile：`_runs/profiles/dqc_quantile_resolution_n32_n64_100k_2026-07-16/`；export：`_runs/wandb_export/dqc_quantile_resolution_n32_n64_100k_2026-07-16/`。
+- 下一主线 C-Q4A：只对 cost critic 使用 query-mixture τ，中心 `1-alpha=0.8`、窗口 `[0.7,0.9]`、local fraction `0.5`；CDF 用 importance/quadrature weight，prediction loss 先用 query-focused 均值。
+- 分歧保留：C-Q4B 对 prediction loss 也做 importance weighting 以保持全局 W1；C-Q2 adaptive sigmoid bandwidth；C-H1 独立 cost RNN；N128；uniform-IQN 与 query-mixture-IQN。任何 local grid 都不能用未加权 quantile count 冒充 CDF。
