@@ -930,3 +930,14 @@
 - 测试还暴露后台launcher复用同名stale job时会暂时保留旧`exit_code`，使轮询器提前误判。本轮在新启动前仅删除该job旧的`worker_started_at/finished_at/exit_code`，不触碰日志与实验产物；`bash -n`和新job完整退出均通过。
 - 冻结机制门使用C-S0B完全相同的P-M3 seed1成熟actor、独立rollout seed101和`15×B20×T1000=300k`数据；唯一算法变量是`online→crossfit`。模块构造和policy-only恢复后重置RNG，故真实轨迹应与既有baseline逐批一致。既有520 baseline truth/CDF/mean为outage `146/520=0.28077`、CDF `0.19964`、mean cost truth/pred `11.0173/9.4186`。
 - crossfit每个critic只看约150条轨迹，检验的是out-of-fold泛化而非增加标签量。进入live 1M的门为：520条truth与baseline配对一致；ensemble CDF或mean-cost error至少改善25%，另一项不得恶化；primary/peer disagreement不持续扩大，最后五批prequential OOF误差无发散。若不过门，直接停止C-X2，不用短live策略曲线作结论；若通过，再在P-M3 seed1完整跑1M+520，之后仍需seed0/2复现。预计纯训练约2～3分钟、128内置评估约1分钟、520复评约4分钟，总墙钟约7～9分钟，全部持久化后台运行。
+
+### E68：C-X2冻结300k结果——隔离成立，但半数据critic方差使其不过live门（2026-07-16）
+
+- 正式job `DQCAC_DynamicButton_frozen_s1policy_seed101_cx2_crossfit_300k`、W&B `mnwyg6io`正常exit 0；300k训练`125.3s`，与单critic baseline `121.0s`接近，因为两个模型各处理半批、总QR样本量不翻倍。15批reward、cost、outage与baseline逐值exact，总超限事件同为`89/300`；因此差异只来自critic路由与数据拆分。
+- 全15批/末5批prequential OOF CDF error为crossfit `0.17104/0.14656`，baseline `0.16917/0.14344`，crossfit分别略差`1.1%/2.2%`；末5批Brier `0.23812 vs 0.24462`只改善`2.7%`。post同批CDF/Brier也从baseline `0.11844/0.20034`恶化到`0.13188/0.23072`。没有“末段仍快速改善、应因短跑继续”的证据。
+- 140条内置评估truth exact为outage `0.26429`、mean cost `10.79286`。baseline→crossfit ensemble CDF为`0.19799→0.20324`，absolute error只改善约`7.9%`；pred mean为`9.40770→9.39550`，反而略差。primary/peer CDF为`0.11228/0.29420`，平均绝对分歧`0.19442`，表明ensemble平均掩盖了很大的模型方差。
+- 同协议fresh 520 truth逐值exact：reward `0.8349376`、outage `146/520=0.2807692`、mean cost `11.0173077`。baseline→crossfit CDF error `0.0811298→0.0761118`，仅改善`6.19%`；mean-cost error `1.5986857→1.4516167`，仅改善`9.20%`，两项都远低于预注册25%门。primary/peer为`0.120072/0.289243`，误差`0.160697/0.008474`，分歧仍达`0.186358`。
+- 裁决：不启动C-X2 live 1M，也不把300k直接续成600k来移动门槛。300k固定策略已有89个tail事件、两项独立520误差和无改善末段趋势，足以回答局部机制；它不证明任何live策略在100k后永远不会变好，而是证明当前“两个模型各看一半数据”的隔离收益不足以抵消数据碎片方差。
+- 路线保留为消融：① 600k使每个critic获得约300条轨迹，可单独回答样本量问题，但环境预算翻倍，不是主算法公平提升；② 标准K-fold complement让每个holdout模型看`(K-1)/K`数据，K=5约80%，代价约4倍cost-critic计算；③ 两模型max/UCB在本520上恰为peer `0.28924`、非常接近truth，但这是同一评估后观察，不能据此调参，而且actor若使用包含自身标签的in-fold模型会重新泄漏。
+- 下一优先路线C-X3是不分裂数据的pre-update online cache：在本批任何QR step前，用已吸收全部历史批次的online critic计算并冻结risk advantage，再执行critic和8个PPO epoch。它提供当前样本隔离、保留全部历史数据，又避免C-X1的Polyak长期滞后；先做默认exact回归与顺序/缓存断言，再给seed1完整1M而非100k裁决。
+- 正式history/profile/图在`_runs/wandb_export/dqc_frozen_baseline_vs_cx2_crossfit_300k_2026-07-16/`和`_runs/profiles/dqc_frozen_baseline_vs_cx2_crossfit_300k_2026-07-16/`；后者含`eval520_comparison.csv/json/png`，PNG为`1961×801`且PIL解码通过。

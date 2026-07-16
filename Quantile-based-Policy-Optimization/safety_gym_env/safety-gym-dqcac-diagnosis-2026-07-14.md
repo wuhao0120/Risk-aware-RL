@@ -1394,3 +1394,13 @@ C-X2已实现两个独立cost distributional critics，并按环境轨迹而非t
 首版有意只支持偶数B、MC、raw observation、full-batch和无recent-s0辅助。这些限制不是最终算法主张，而是保证第一条消融只回答cross-fit本身。默认online路径与改前提交在80环境步上6个module、lambda/runtime、41项summary和评估逐值exact；机制测试又证明两折路由正确、两个critic都更新、checkpoint/eval-only包含peer。后台launcher同时修复了同名stale job旧退出码可能污染轮询的问题。
 
 下一步不是用100k live reward裁决。先固定P-M3 seed1成熟高风险策略，以seed101采集与既有C-S0B完全配对的300k轨迹；每个critic约看150条，最终在独立520条初始布局上比较ensemble。既有单critic baseline的truth/CDF为0.28077/0.19964，mean cost truth/pred为11.0173/9.4186。只有CDF或mean error至少改善25%、另一项不恶化且peer分歧不发散，才值得投入seed1的完整1M闭环；否则停止该路线。即使冻结门通过，仍需1M看actor–PID周期、再用3 seeds×520排除初始化偶然性。
+
+### 13.57 C-X2结果：out-of-fold本身不是问题，低数据效率才是（2026-07-16）
+
+冻结成熟策略300k给出了严格配对的负结果。baseline与C-X2的15批reward/cost/outage逐值一致，共89/300个tail事件；C-X2训练125.3秒。最后五批prequential CDF error为0.14656，反而略高于baseline 0.14344；Brier只改善2.7%，post拟合更差。说明它没有呈现“再多跑一点就会越过门”的末段趋势。
+
+fresh 520条truth仍精确相同：outage 0.280769、mean cost 11.01731。单critic→两折ensemble的CDF error只从0.08113降到0.07611，mean error只从1.59869降到1.45162，改善6.2%/9.2%，未达到25%门。primary/peer CDF却是0.12007/0.28924，二者相差0.18636；一个严重低估、一个接近truth。隔离当前标签没有造成系统性错误，真正失败的是每个critic只获得150条独立轨迹，模型方差远大于隔离收益。
+
+因此停止当前C-X2的live 1M，而不是因为100k曲线不好。继续到600k会让每个critic拿到与baseline 300k相当的300条轨迹，却同时把环境预算翻倍；可以作为样本效率消融，但不能包装成公平主配置。K=5 complement cross-fit能让每个holdout模型看80%数据，但cost-critic计算约增至4倍。max/UCB在本数据上会选到0.28924并很准，但这是评估后观察，且actor若读取含自身标签的模型就重新引入泄漏，不能直接采用。
+
+优先级更高的是pre-update online cache：本批rollout完成后、任何current-batch QR更新前，先用吸收了全部历史数据的online critic计算并冻结risk advantage；随后再训练critic和执行PPO。它和C-X2一样切断当前标签即时回灌，却不拆数据；又比C-X1的tau=.05 target更新鲜。这个组件必须在完整1M live闭环检验，因为冻结critic实验无法评价策略时序，100k同样可能误杀慢启动reward。
