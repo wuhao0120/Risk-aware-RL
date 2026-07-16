@@ -303,3 +303,15 @@
 - PPO surrogate 将 reward 和 risk 分开：reward 用 clipped minimum，risk 用 conservative maximum；这修正了“先组合正负权重再 clip”在 lambda>0 时可能不保守的问题。
 - 持久化 smoke `QCPO_DynamicButton_smoke_gaeppo_obsnorm_s0`：`B=2,T=32,iters=2`，训练 `7.1s`，exit code 0；覆盖 obs RMS、V、GAE、固定 old-prob PPO 和终评。
 - 下一实验：Q-B reward-only 100k；若明显超过 Q-A2 的 `0.0385` 后段均值并保持 PPO/value 数值健康，再扩独立 300k。
+
+### E12：统一 MLP+LSTM 骨干（实现阶段）
+
+- 已在 `utils/model.py` 新增可复用 `RecurrentActorValue`，严格采用 QCPO_refs 输入协议：
+  - MLP 输入 `[raw_observation, previous_cost]`；
+  - LSTM 输入 `[MLP feature, previous_action, previous_reward]`；
+  - 默认 `[512,512] tanh + LSTM512`，并使用 `MLP feature + LSTM output` 残差；
+  - 输出 tanh Gaussian mean、可学习 log-std、scalar reward value 和下一 recurrent state。
+- augmented observation（含 previous cost）使用独立 Chan RMS 并 clip 到 `[-10,10]`，与 QCPO_refs 一致。
+- 为保持 DQCAC 算法语义，通用骨干没有复制 QCPO_refs 的 state-value cost head；DQCAC 后续仍使用 action-conditioned `Z_c(history,a)` critic。网络公平性对齐 policy/reward-V backbone，constraint head 按各算法必要输出区分。
+- 数值对拍：将 `QcpoRefModel(constraint=False)` 的同名权重和 RMS buffer 加载到新适配器，在随机 `T=13,B=4` 序列及非零初始 hidden state 上，mu/log_std/reward value/h/c/obs mean/var 的最大绝对误差全部为 `0.0`。
+- 当前状态：适配器已验证但尚未接入训练 rollout/BPTT；下一步先接 Q-B，复现 MLP Q-B 的 100k/300k 结果，再复用同一 rollout adapter 接 DQCAC。

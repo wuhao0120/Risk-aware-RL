@@ -118,3 +118,121 @@ class Actor(nn.Module):
     def forward(self, x):
         """前向: x [*, state_dim] → 动作均值 μ(s)=tanh(net(x)) ∈(-1,1), [*, action_dim]。"""
         return self.model(x)
+
+class RecurrentActorValue(nn.Module):
+    """
+    与 QCPO_refs policy/reward-value 主干逐层同构的 MLP+LSTM 适配器。
+
+    输入协议严格保留参考实现：
+        augmented_observation_t = concat(raw_observation_t, previous_cost_t)
+        lstm_input_t = concat(MLP(augmented_observation_t), previous_action_t,
+                              previous_reward_t)
+
+    输出协议：
+        mean_t = tanh(policy_head(feature_t))
+        value_t = reward_value_head(feature_t)
+        log_std 是可学习的逐动作全局参数
+        feature_t = MLP_feature_t + LSTM_output_t（lstm_skip=True 时）
+
+    cost distribution 不放进本类：DQCAC 仍需 action-conditioned Z_c(history,a)，不能用
+    QCPO_refs 的 state-value cost head 偷换算法语义。两个算法会共享这里的 policy/V 骨干，
+    各自的 constraint critic 作为独立 head/网络接入。
+    """
+
+    def __init__(self, observation_dim, action_dim, hidden=None, lstm_size=512,
+                 lstm_skip=True, init_std=1.0, learn_std=True,
+                 normalize_observation=True, var_clip=1e-6,
+                 hidden_nonlinearity='tanh'):
+        """
+        Args:
+            observation_dim: 已追加 previous_cost 后的维度，即 raw_state_dim+1。
+            action_dim:      连续动作维度；DynamicButton 为 2。
+            hidden:          MLP 隐层；公平对比默认 [512,512]。
+            lstm_size:       recurrent hidden size；公平对比默认 512。
+            lstm_skip:       True 时使用 MLP feature + LSTM output 残差。
+            init_std:        初始高斯探索标准差；QCPO_refs 为 1。
+            learn_std:       是否训练 log_std；公平对比应为 True。
+        """
+        super().__init__()
+        hidden = [512, 512] if hidden is None else list(hidden)
+        nonlinearities = {'tanh': nn.Tanh, 'relu': nn.ReLU}
+        if hidden_nonlinearity not in nonlinearities:
+            raise ValueError("hidden_nonlinearity must be 'tanh' or 'relu'")
+        nonlinearity = nonlinearities[hidden_nonlinearity]
+
+        # MLP body 与 QcpoRefModel._mlp_body 相同：每层 Linear 后接相同激活，
+        # 不调用本文件的正交初始化，保留参考实现的 PyTorch 默认初始化。
+        layers = []
+        last_size = int(observation_dim)
+        for width in hidden:
+            layers.append(nn.Linear(last_size, int(width)))
+            layers.append(nonlinearity())
+            last_size = int(width)
+        self.body = nn.Sequential(*layers)
+
+        # LSTM 输入额外拼 previous_action 与 previous_reward；previous_cost 已在 observation 中。
+        self.lstm_size = int(lstm_size)
+        lstm_input_size = last_size + int(action_dim) + 1
+        self.lstm = nn.LSTM(lstm_input_size, self.lstm_size)
+        self.lstm_skip = bool(lstm_skip)
+        if self.lstm_skip and last_size != self.lstm_size:
+            raise ValueError("lstm_skip requires last MLP width == lstm_size")
+
+        # policy/value 两头与 QCPO_refs 同形状；均值用 tanh，value 保持无界标量。
+        self.mu = nn.Sequential(nn.Linear(self.lstm_size, int(action_dim)), nn.Tanh())
+        self.value = nn.Linear(self.lstm_size, 1)
+        self.log_std = nn.Parameter(
+            torch.full((int(action_dim),), float(np.log(init_std))))
+        self.log_std.requires_grad = bool(learn_std)
+
+        # RMS 直接覆盖 augmented observation（含 previous_cost），与参考实现输入完全一致。
+        self.normalize_observation = bool(normalize_observation)
+        self.obs_rms = ObservationNormalizer(
+            int(observation_dim), var_clip=float(var_clip), value_clip=10.0)
+
+    def initial_state(self, batch_size, device=None):
+        """返回零初始化 (h,c)，形状均为 [1,B,H]。"""
+        device = self.log_std.device if device is None else device
+        h = torch.zeros(1, int(batch_size), self.lstm_size, device=device)
+        c = torch.zeros(1, int(batch_size), self.lstm_size, device=device)
+        return h, c
+
+    def forward(self, observation, prev_action, prev_reward, init_rnn_state=None):
+        """
+        前向调用。
+
+        输入:
+            observation: [T,B,raw_state_dim+1]，最后一维是 previous_cost。
+            prev_action: [T,B,action_dim]。
+            prev_reward: [T,B]。
+            init_rnn_state: (h,c)，各 [1,B,H]；None 表示零状态。
+
+        返回:
+            mean [T,B,A]、log_std [T,B,A]、value [T,B]、(h_n,c_n)。
+        """
+        T, B = observation.shape[:2]
+        policy_observation = self.obs_rms(observation)             if self.normalize_observation else observation
+
+        # MLP 先在 [T*B,D] 上计算，再恢复时间主序供 LSTM 处理。
+        mlp_feature = self.body(policy_observation.reshape(T * B, -1))
+        recurrent_input = torch.cat([
+            mlp_feature.view(T, B, -1),
+            prev_action.reshape(T, B, -1),
+            prev_reward.reshape(T, B, 1),
+        ], dim=2)
+
+        # nn.LSTM 返回所有时刻输出与末状态；显式 tuple 保证兼容参考实现 namedtuple 状态。
+        recurrent_output, final_state = self.lstm(recurrent_input, init_rnn_state)
+        recurrent_flat = recurrent_output.reshape(T * B, self.lstm_size)
+        feature = mlp_feature + recurrent_flat if self.lstm_skip else recurrent_flat
+
+        mean = self.mu(feature).view(T, B, -1)
+        log_std = self.log_std.repeat(T * B, 1).view(T, B, -1)
+        value = self.value(feature).squeeze(-1).view(T, B)
+        return mean, log_std, value, final_state
+
+    @torch.no_grad()
+    def update_obs_rms(self, augmented_observation):
+        """在 rollout 边界批量合并 augmented observation moments。"""
+        if self.normalize_observation:
+            self.obs_rms.update(augmented_observation)
