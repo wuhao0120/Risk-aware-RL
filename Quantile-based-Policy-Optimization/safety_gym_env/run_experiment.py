@@ -160,6 +160,12 @@ def base_args(algo, seed, device, env_key):
         a.ppo_ratio_clip = 0.1
         a.reward_value_lr = 3e-4
         a.reward_value_grad_clip = 10.0
+        a.dual_update_mode = 'critic_adam'              # 旧 cost-critic CDF + Adam dual（兼容默认）
+        a.dual_pid_signal = 'outage'                    # empirical_pid 可选 outage / cost_quantile
+        a.pid_Ki = 0.1                                  # QCPO_refs 默认仅启用积分项
+        a.pid_window_episodes = 100                     # 最近完整轨迹窗口
+        a.pid_cost_scale = 10.0                         # quantile PID 与 QCPO_refs 相同 cost 缩放
+        a.sum_norm = False                              # 实验开启：(J_r+λJ_c)/(1+λ)
     elif algo == 'QCPO_REF':
         # NIPS'22 QCPO 移植版 (config_qcpo.py / launch_qcpo.py 论文缺省超参)。
         a.ref_lr = 1e-4

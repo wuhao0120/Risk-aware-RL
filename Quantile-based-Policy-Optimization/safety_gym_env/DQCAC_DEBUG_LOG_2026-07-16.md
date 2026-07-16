@@ -151,10 +151,12 @@
 
 ### E6：恢复经验 PID dual 与 sum normalization
 
-- 状态：设计审计中；只恢复约束，不改 E5 的 reward 主干、网络、观测归一化或 std。
+- 状态：实现与验证已完成，待启动短预算训练；只恢复约束，不改 E5 的 reward 主干、网络、观测归一化或 std。
 - 必修一致性：同一 rollout 的 cost advantage 必须在 PPO epochs 之前冻结；不能一边更新 cost critic，一边让 8 个 actor epoch 使用不断移动的 risk advantage。
 - dual 输入优先使用 rollout/最近窗口的经验 outage 或 `(1-ω)` cost quantile；当前 cost critic CDF 仍有 `-0.101` 偏差，只作为校准指标，不直接全权驱动 λ。
 - 采用 QCPO_refs 风格积分 PID 与 `(J_r+λJ_c)/(1+λ)`；分别记录经验 gap、cost quantile gap、积分状态、effective reward/risk coefficient 与 CDF calibration error。
+- 实现保持旧 `critic_adam`/无 sum-norm 为默认；实验开关使用最近 100 条轨迹 outage。risk advantage 在首个 actor epoch 计算后缓存，后续 7 个 epoch 不再随 critic 移动。
+- 验证：outage/quantile 两种 PID 确定性单测均与手算完全一致；持久化后台烟测 exit 0，强制正误差时 λ 按 `0→0.08→0.16` 增长，并覆盖 observation warmup、两轮 PPO 和 sum normalization；另一次旧 `critic_adam + distributional` 默认路径回归烟测也 exit 0。
 - 预算先 30 万步，预计约 3 分钟；若前 150k reward 已坍塌且 outage 没有向 0.2 收敛，则早停调 Ki/尺度，不浪费全量预算。
 
 ## 4. 分阶段改进路线

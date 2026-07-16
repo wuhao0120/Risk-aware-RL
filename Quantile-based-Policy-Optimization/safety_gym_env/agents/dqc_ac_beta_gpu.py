@@ -12,7 +12,9 @@ DQCACBetaGPU (safety_gym_env · CMDP 版) —— 用户 DQC-AC-β 迁移到 safe
                可选 gae: scalar V_r(s,t)+冻结 GAE λ-return，替换低信噪比 reward Q 优势
                可选 gae_ppo: 在 GAE 上再使用 old-logπ ratio 与 PPO clip 多 epoch 更新
                cost budget 始终递推 b_0=d, b_{t+1}=(b_t-c_t)/γc
-    Dual:      λ ← [λ + ε_k·(Ĝ - ω)]_+,  Ĝ = cost_critic 在 (s0,a0) 估计的 P(C≥d) (上尾, 同源信号)
+    Dual:      默认保留 cost-critic CDF + Adam；可选 empirical_pid 由最近完整轨迹的
+               outage 或 Q_(1-ω)(C)-d 驱动积分项，并可用 sum normalization 防止 λ 吞没 reward。
+    PPO 一致性: old log-prob 与 reward/cost advantage 在同一 rollout 的多个 actor epoch 中固定。
     归一化:    advantage_norm='qcpo' → 跨迭代 EMA σ_R (reward 回报) / σ_c (cost 约束优势)
 
 与 portfolio 单-critic 版的差异 (数学同构):
@@ -27,6 +29,7 @@ DQCACBetaGPU (safety_gym_env · CMDP 版) —— 用户 DQC-AC-β 迁移到 safe
     - 折扣口径 (cost_gamma=0.99): episodic=False → 截断恒 bootstrap (continuing 处理,
       γc^1000≈4e-5, episode 末残差可忽略), critic_step_feature=False。
 """
+from collections import deque
 import numpy as np
 import torch
 import torch.nn as nn
@@ -92,6 +95,18 @@ class DQCACBetaGPU(VecAgentBase):
         self.reward_value_lr = float(getattr(args, 'reward_value_lr', 3e-4))
         self.reward_value_grad_clip = float(getattr(args, 'reward_value_grad_clip', 10.0))
 
+        # dual 消融：旧 critic_adam 保持可复现；empirical_pid 用真实完成轨迹控制 λ。
+        self.dual_update_mode = str(getattr(args, 'dual_update_mode', 'critic_adam')).lower()
+        if self.dual_update_mode not in {'critic_adam', 'empirical_pid'}:
+            raise ValueError("dual_update_mode must be 'critic_adam' or 'empirical_pid'")
+        self.dual_pid_signal = str(getattr(args, 'dual_pid_signal', 'outage')).lower()
+        if self.dual_pid_signal not in {'outage', 'cost_quantile'}:
+            raise ValueError("dual_pid_signal must be 'outage' or 'cost_quantile'")
+        self.pid_Ki = float(getattr(args, 'pid_Ki', 0.1))
+        self.pid_window_episodes = max(1, int(getattr(args, 'pid_window_episodes', 100)))
+        self.pid_cost_scale = float(getattr(args, 'pid_cost_scale', 10.0))
+        self.sum_norm = bool(getattr(args, 'sum_norm', False))
+
         # qcpo 归一化配方: σ_R (reward 回报尺度) / σ_c (cost 约束优势尺度) + warmup
         self.norm_ema_decay = float(getattr(args, 'norm_ema_decay', 0.1))
         _wi = getattr(args, 'warmup_iters', None)
@@ -155,6 +170,14 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_cdf_initial = 0.0                           # cost-critic 估计 P(C≥d) (校准诊断)
         self.last_pred_cost_mean = 0.0                        # cost-critic 估 E[C|s0]
         self.last_pred_cost_std = 0.0                         # cost-critic 估 std(C|s0)
+        self.empirical_cost_window = deque(maxlen=self.pid_window_episodes)
+        self.pid_i = float(self.lambda_min)                    # QCPO_refs 默认 Kp=Kd=0，仅积分项
+        self.last_dual_raw_prob = 0.0                          # 当前 rollout 的经验 outage
+        self.last_dual_window_prob = 0.0                       # 最近窗口经验 outage
+        self.last_dual_cost_quantile = float(self.cost_limit)  # 窗口 Q_(1-ω)(C)
+        self.last_dual_prob_gap = 0.0                          # window outage - ω
+        self.last_dual_quantile_gap = 0.0                      # Q_(1-ω)(C) - d
+        self.last_dual_control_error = 0.0                     # 实际送入 I 控制器的误差
 
     # ============================================================ 主训练循环 (与模板一致) ============================================================
     def train(self):
@@ -164,6 +187,7 @@ class DQCACBetaGPU(VecAgentBase):
               f"step_feature={self.critic_step_feature}, N={self.num_quantiles}, B={self.num_envs}, T={self.n}, "
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
               f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
+              f"dual={self.dual_update_mode}/{self.dual_pid_signal}, sum_norm={self.sum_norm}, "
               f"device={self.device}")
 
         for it in range(self.num_iterations):
@@ -179,6 +203,13 @@ class DQCACBetaGPU(VecAgentBase):
             # obs norm 首批只建立 moments；随后 PPO ratio 才比较同一批的 old/current policy。
             norm_warmup = self.obs_norm_warmup_iters if self.normalize_observation else 0
             in_warmup = it < max(self.warmup_iters, norm_warmup)
+
+            # 经验 PID 不依赖尚未校准的 critic，并在 actor epochs 前更新，逐位对齐 QCPO_refs 时序。
+            dual_updated = False
+            if (not in_warmup and self.dual_update_mode == 'empirical_pid'
+                    and it % self.outer_interval == 0):
+                self.update_dual(batch)
+                dual_updated = True
 
             # ===== 2. 内层更新 (双 critic + actor) =====
             critic_info, actor_info = {}, {}
@@ -196,9 +227,9 @@ class DQCACBetaGPU(VecAgentBase):
                     self._soft_update_target()
                 self.learning_steps += 1
 
-            # ===== 3. 外层 λ 更新 (cost-critic 在 (s0,a0) 估 P(C≥d) 驱动) =====
-            dual_updated = False
-            if not in_warmup and it % self.outer_interval == 0:
+            # 旧 critic_adam 路径保留 actor 后更新时序，保证历史实验可复现。
+            if (not in_warmup and self.dual_update_mode == 'critic_adam'
+                    and it % self.outer_interval == 0):
                 self.update_dual(batch)
                 dual_updated = True                            # warmup 时不推进 λ 的学习率时间轴
 
@@ -206,7 +237,7 @@ class DQCACBetaGPU(VecAgentBase):
             self._log(it, batch, critic_info, actor_info)
             if actor_updated:
                 self.actor_scheduler.step()                    # 每个有 actor update 的 rollout 推进一步
-            if dual_updated:
+            if dual_updated and self.dual_update_mode == 'critic_adam':
                 self.lambda_scheduler.step()                   # 严格位于 lambda_optimizer.step() 之后
 
     # ============================================================ 采样 + 后处理 (对齐模板, budget 换 cost) ============================================================
@@ -417,17 +448,27 @@ class DQCACBetaGPU(VecAgentBase):
         steps = batch['steps']
 
         with torch.no_grad():
-            # cost 优势在三种 reward 模式下完全相同，仍查询 distributional cost critic。
-            psi_c = self.cost_critic(self._aug(s, steps), a)           # [T·B,N]
-            psi_cdf = (psi_c >= b.unsqueeze(1)).float().mean(dim=1)    # Ψ̂(s,a,b) 上尾 CDF
-            v_m, v_c = self._estimate_baselines(
-                s, b, steps, need_reward=self.reward_actor_mode == 'distributional')
-            raw_adv_c = psi_cdf - v_c
-            if self.advantage_norm == 'qcpo':
-                a_c = raw_adv_c / self.constraint_rms.std              # EMA σ_c 归一化
+            # PPO 的行为分母与 advantage 都必须相对同一 rollout 固定；首次 actor epoch
+            # 查询 cost critic 后缓存，后续 epochs 不再因 critic 更新而移动 risk target。
+            if '_risk_weight' not in batch:
+                psi_c = self.cost_critic(self._aug(s, steps), a)       # [T·B,N]
+                psi_cdf = (psi_c >= b.unsqueeze(1)).float().mean(dim=1)
+                v_m, v_c = self._estimate_baselines(
+                    s, b, steps, need_reward=self.reward_actor_mode == 'distributional')
+                raw_adv_c = psi_cdf - v_c
+                if self.advantage_norm == 'qcpo':
+                    a_c = raw_adv_c / self.constraint_rms.std          # EMA σ_c 归一化
+                else:
+                    a_c = self._maybe_norm(raw_adv_c)
+                risk_weight = e * a_c
+                batch['_risk_weight'] = risk_weight.detach()
+                batch['_risk_advantage_raw'] = raw_adv_c.detach()
+                batch['_risk_cdf'] = psi_cdf.detach()
             else:
-                a_c = self._maybe_norm(raw_adv_c)
-            risk_weight = e * a_c
+                risk_weight = batch['_risk_weight']
+                raw_adv_c = batch['_risk_advantage_raw']
+                psi_cdf = batch['_risk_cdf']
+                v_m = None
 
             if self.reward_actor_mode == 'distributional':
                 psi_r = self.reward_critic(self._aug(s, steps), a)     # [T·B,N]
@@ -443,7 +484,10 @@ class DQCACBetaGPU(VecAgentBase):
                 reward_weight = batch['_reward_advantage']
 
             lagrange = self.lambda_dual.detach()
-            combined_weight = reward_weight - lagrange * risk_weight
+            normalizer = 1.0 + lagrange if self.sum_norm else torch.ones_like(lagrange)
+            reward_coef = normalizer.reciprocal()
+            risk_coef = lagrange / normalizer
+            combined_weight = reward_coef * reward_weight - risk_coef * risk_weight
 
         log_probs = self._compute_log_probs(s, a)             # 当前策略 logπθ(a|s)，对 θ 可导
         entropy = self._entropy(s).mean()
@@ -458,7 +502,7 @@ class DQCACBetaGPU(VecAgentBase):
             # reward 用 PPO pessimistic min；cost 是要最小化的坏事件，故用 conservative max。
             reward_surr = torch.minimum(ratio * reward_weight, clipped_ratio * reward_weight)
             risk_surr = torch.maximum(ratio * risk_weight, clipped_ratio * risk_weight)
-            actor_loss = -reward_surr.mean() + lagrange * risk_surr.mean() \
+            actor_loss = -reward_coef * reward_surr.mean() + risk_coef * risk_surr.mean() \
                 - self.entropy_coef * entropy
 
             # approx_kl 采用 Schulman 常用近似 (ratio-1)-log_ratio。
@@ -484,6 +528,8 @@ class DQCACBetaGPU(VecAgentBase):
             'actor/loss': float(actor_loss.item()),
             'actor/grad_norm': float(actor_grad_norm.item()),
             'actor/entropy': float(entropy.item()),
+            'actor/reward_coefficient': float(reward_coef.item()),
+            'actor/risk_coefficient': float(risk_coef.item()),
             'advantage/mean_adv_std': float(raw_adv_m.std(unbiased=False).item()),
             'advantage/risk_adv_std': float(raw_adv_c.std(unbiased=False).item()),
             'constraint/psi_c_mean': float(psi_cdf.mean().item()),
@@ -499,20 +545,62 @@ class DQCACBetaGPU(VecAgentBase):
 
     # ============================================================ Dual 更新 (cost-critic P(C≥d) 驱动) ============================================================
     def update_dual(self, batch):
-        """Ĝ = cost_critic 在 B 个 (s0, a0~π) 上估计的 P(C≥d) (上尾); λ ← [λ + ε_k(Ĝ-ω)]_+。"""
-        with torch.no_grad():
-            s0 = batch['s0']
-            a0 = self._sample_actions(s0)
-            psi0 = self.cost_critic(self._aug(s0, 0), a0)     # [B, N]
-            p = float((psi0 >= self.cost_limit).float().mean(dim=1).mean().item())  # P(C≥d) 上尾
-        self.last_dual_prob = p
+        """
+        按 dual_update_mode 更新 λ：旧 critic Adam，或 QCPO_refs 风格的经验积分控制器。
 
-        gap = torch.tensor([p - self.q_alpha], dtype=torch.float32, device=self.device)  # Ĝ-ω
-        self.lambda_optimizer.zero_grad(set_to_none=True)
-        (-self.lambda_dual * gap).backward()
-        self.lambda_optimizer.step()
+        empirical_pid 默认使用最近窗口 outage gap；也可选择 cost_quantile 信号，后者按
+        pid_cost_scale 缩放，逐式对应 QCPO_refs 的 Q_(1-ω)(C)/scale-d/scale。
+        """
+        if self.dual_update_mode == 'critic_adam':
+            with torch.no_grad():
+                s0 = batch['s0']
+                a0 = self._sample_actions(s0)
+                psi0 = self.cost_critic(self._aug(s0, 0), a0)  # [B,N]
+                p = float((psi0 >= self.cost_limit).float().mean(dim=1).mean().item())
+            self.last_dual_prob = p
+            self.last_dual_prob_gap = p - self.q_alpha
+            self.last_dual_control_error = self.last_dual_prob_gap
+
+            gap = torch.tensor(
+                [self.last_dual_prob_gap], dtype=torch.float32, device=self.device)
+            self.lambda_optimizer.zero_grad(set_to_none=True)
+            (-self.lambda_dual * gap).backward()
+            self.lambda_optimizer.step()
+            with torch.no_grad():
+                self.lambda_dual.clamp_(min=self.lambda_min, max=self.lambda_max)
+            return
+
+        # 当前 rollout 的真实 C 加入固定长度窗口；完全绕开尚未校准的 cost critic CDF。
+        costs = batch['disc_cost'].detach().cpu().numpy().astype(np.float64)
+        raw_prob = float(np.mean(costs >= self.cost_limit))
+        self.empirical_cost_window.extend(costs.tolist())
+        window = np.asarray(self.empirical_cost_window, dtype=np.float64)
+        window_prob = float(np.mean(window >= self.cost_limit))
+        sorted_costs = np.sort(window)
+        q_ind = min(int(np.floor(len(sorted_costs) * (1.0 - self.q_alpha))),
+                    len(sorted_costs) - 1)
+        cost_quantile = float(sorted_costs[q_ind])
+
+        self.last_dual_raw_prob = raw_prob
+        self.last_dual_window_prob = window_prob
+        self.last_dual_cost_quantile = cost_quantile
+        self.last_dual_prob_gap = window_prob - self.q_alpha
+        self.last_dual_quantile_gap = cost_quantile - self.cost_limit
+
+        if self.dual_pid_signal == 'outage':
+            control_error = self.last_dual_prob_gap
+        else:
+            if self.pid_cost_scale <= 0:
+                raise ValueError("pid_cost_scale must be positive for cost_quantile PID")
+            control_error = self.last_dual_quantile_gap / self.pid_cost_scale
+        self.last_dual_control_error = float(control_error)
+
+        # QCPO_refs 的默认所谓 PID 实际 Kp=Kd=0，仅 I 项：I←clip(I+Ki·error)。
+        self.pid_i = min(
+            self.lambda_max, max(self.lambda_min, self.pid_i + self.pid_Ki * control_error))
         with torch.no_grad():
-            self.lambda_dual.clamp_(min=self.lambda_min, max=self.lambda_max)
+            self.lambda_dual.fill_(self.pid_i)
+        self.last_dual_prob = window_prob
 
     # ============================================================ 辅助 (与模板同语义) ============================================================
     def _aug(self, states, steps):
@@ -617,7 +705,19 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/pred_cost_std': self.last_pred_cost_std,
             'constraint/dual_prob': self.last_dual_prob,
             'lambda/value': float(self.lambda_dual.detach().item()),
-            'lambda/lr': float(self.lambda_scheduler.get_last_lr()[0]),
+            'lambda/lr': float(self.pid_Ki if self.dual_update_mode == 'empirical_pid'
+                               else self.lambda_scheduler.get_last_lr()[0]),
+            'dual/mode_empirical_pid': float(self.dual_update_mode == 'empirical_pid'),
+            'dual/pid_signal_is_quantile': float(self.dual_pid_signal == 'cost_quantile'),
+            'dual/raw_empirical_prob': self.last_dual_raw_prob,
+            'dual/window_empirical_prob': self.last_dual_window_prob,
+            'dual/window_cost_quantile': self.last_dual_cost_quantile,
+            'dual/prob_gap': self.last_dual_prob_gap,
+            'dual/quantile_gap': self.last_dual_quantile_gap,
+            'dual/control_error': self.last_dual_control_error,
+            'dual/pid_i': self.pid_i,
+            'dual/window_size': float(len(self.empirical_cost_window)),
+            'dual/sum_norm_enabled': float(self.sum_norm),
             'budget/min': float(np.min(budgets_np)),
             'budget/max': float(np.max(budgets_np)),
             'budget/mean': float(np.mean(budgets_np)),
@@ -649,6 +749,11 @@ class DQCACBetaGPU(VecAgentBase):
             'empirical_outage_prob': self.last_outage_prob,   # 兼容旧字段 (=empirical_prob)
             'cdf_estimate_initial': self.last_cdf_initial,
             'dual_prob': self.last_dual_prob,
+            'dual_update_mode': self.dual_update_mode,
+            'dual_pid_signal': self.dual_pid_signal,
+            'pid_i': self.pid_i,
+            'dual_cost_quantile': self.last_dual_cost_quantile,
+            'sum_norm': self.sum_norm,
             'beta': self.beta,
             'reward_actor_mode': self.reward_actor_mode,
             'actor_updates_per_episode': self.actor_updates_per_episode,
