@@ -55,6 +55,7 @@ KEY_METRICS: Tuple[str, ...] = (
     "advantage/risk_adv_nonzero_fraction",
     "advantage/risk_query_target_online_abs_mean",
     "advantage/risk_query_crossfit_peer_abs_mean",
+    "advantage/risk_query_preupdate_postupdate_abs_mean",
     "critic/cost_crossfit_peer_abs_mean",
     "norm/return_sigma_ema",
     "norm/constraint_sigma_ema",

@@ -941,3 +941,13 @@
 - 路线保留为消融：① 600k使每个critic获得约300条轨迹，可单独回答样本量问题，但环境预算翻倍，不是主算法公平提升；② 标准K-fold complement让每个holdout模型看`(K-1)/K`数据，K=5约80%，代价约4倍cost-critic计算；③ 两模型max/UCB在本520上恰为peer `0.28924`、非常接近truth，但这是同一评估后观察，不能据此调参，而且actor若使用包含自身标签的in-fold模型会重新泄漏。
 - 下一优先路线C-X3是不分裂数据的pre-update online cache：在本批任何QR step前，用已吸收全部历史批次的online critic计算并冻结risk advantage，再执行critic和8个PPO epoch。它提供当前样本隔离、保留全部历史数据，又避免C-X1的Polyak长期滞后；先做默认exact回归与顺序/缓存断言，再给seed1完整1M而非100k裁决。
 - 正式history/profile/图在`_runs/wandb_export/dqc_frozen_baseline_vs_cx2_crossfit_300k_2026-07-16/`和`_runs/profiles/dqc_frozen_baseline_vs_cx2_crossfit_300k_2026-07-16/`；后者含`eval520_comparison.csv/json/png`，PNG为`1961×801`且PIL解码通过。
+
+### E69：C-X3 pre-update online cache实现、回归与1M长跑预注册（2026-07-16）
+
+- 新增默认关闭的`cost_actor_query_mode=preupdate`。每个rollout仍先用真实完整轨迹更新经验PID和constraint RMS；但第一个actor epoch改在任何本批cost-critic QR step之前，用已看过所有历史批次、尚未看当前标签的online critic生成`_risk_cdf/_risk_advantage/_risk_weight`。后续PPO epoch在critic更新后仍复用这份缓存，不再查询。
+- 它与C-X1的区别是没有Polyak长滞后，与C-X2的区别是不拆分训练数据。首版显式限制为已验证的recurrent GAE-PPO、MC/raw cost target、full-batch且`s0_aux=0`；这避免把MLP n-step内部bootstrap-action RNG顺序变化混入消融。actor与critic参数完全独立，在这些限制下两个optimizer step可交换，唯一有意变量是risk-query的critic版本。
+- 新增`advantage/risk_query_preupdate_postupdate_abs_mean`，在相同`(s,a,budget)`上比较缓存的QR更新前CDF与全部本批QR更新后CDF。该值与原`target_online` gap分开保存，避免把时间漂移误标为两网络差异；W&B、profile与最终JSON均已接入。
+- 默认`online`精确回归使用改动前提交`baa786f`的临时worktree与当前代码：80环境步后checkpoint内44个tensor leaves全部逐元素exact（其中43个属于6个module/optimizer状态），评估与summary一致；非数值差异只有checkpoint和W&B路径。这证明重构没有暗中改变历史基线。
+- 机制断言通过：两个inner updates的调用顺序精确为`A,C,C,A`；第一次actor调用时cost critic全参数仍与初始值exact，该epoch做`1+K=5`次risk query，第二个epoch新增查询为0且缓存逐元素exact；两次QR step后6个cost参数张量全部改变，pre/post CDF drift为`1.16e-8`。统一入口80步smoke也完成checkpoint、JSON和4轨迹评估、exit 0；初始低风险批次的drift极小只证明链路，不代表成熟阶段机制弱。
+- 正式C-X3只在P-M3 seed1上把`online→preupdate`，保持B20/C20/N32、MC/time-weight .995、T1 sigmoid、PID target .15、8个PPO epochs、LR和1M预算全部不变。不用100k早停；C-X1已证明这类时序组件在100k reward仍可为负而后期超过基线。预计A100纯训练`6.5–8分钟`，含140与fresh 520评估后总墙钟`11–14分钟`，全程持久化后台。
+- 预注册门与压力seed一致：相对P-M3 seed1的fresh520 `reward/outage=0.8622/0.3058`，候选需outage `≤0.22`且至少下降`.08`，reward `≥0.75`；同时成熟阶段pre/post drift必须非零，末200k不得出现更大的policy–critic–PID周期。通过后原参数扩seed0/2各1M+520；失败则保留为时序消融，不扫更多缓存间隔或叠加target-KL追逐偶然点。

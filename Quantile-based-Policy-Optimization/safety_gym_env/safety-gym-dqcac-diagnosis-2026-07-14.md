@@ -1404,3 +1404,15 @@ fresh 520条truth仍精确相同：outage 0.280769、mean cost 11.01731。单cri
 因此停止当前C-X2的live 1M，而不是因为100k曲线不好。继续到600k会让每个critic拿到与baseline 300k相当的300条轨迹，却同时把环境预算翻倍；可以作为样本效率消融，但不能包装成公平主配置。K=5 complement cross-fit能让每个holdout模型看80%数据，但cost-critic计算约增至4倍。max/UCB在本数据上会选到0.28924并很准，但这是评估后观察，且actor若读取含自身标签的模型就重新引入泄漏，不能直接采用。
 
 优先级更高的是pre-update online cache：本批rollout完成后、任何current-batch QR更新前，先用吸收了全部历史数据的online critic计算并冻结risk advantage；随后再训练critic和执行PPO。它和C-X2一样切断当前标签即时回灌，却不拆数据；又比C-X1的tau=.05 target更新鲜。这个组件必须在完整1M live闭环检验，因为冻结critic实验无法评价策略时序，100k同样可能误杀慢启动reward。
+
+### 13.58 C-X3：用最新历史critic，但不让当前标签驱动当前actor（2026-07-16）
+
+C-X3已实现`preupdate` actor-query模式。其核心不是减少critic更新或降低学习率，而是改变因果时序：先用仅训练到上一批的online critic在当前`(s,a,budget)`上计算并冻结risk advantage，再用当前完整轨迹cost做QR更新。后续七个PPO epoch使用同一份冻结risk weight。这样保留单critic的全数据效率，又不让本批标签经一次online拟合后立即回灌本批actor。
+
+首版仅允许recurrent GAE-PPO、MC/raw target、full-batch、无s0 auxiliary。这是为了保证归因：MLP n-step分支可能在critic内采样bootstrap action，若交换actor/critic顺序会改变RNG流。在MC recurrent路径中actor和critic没有共享参数，critic step也不采样，两者可交换；所以实验只改变risk-query看到的critic版本，不混入第二个随机变量。
+
+工程验证已完成。默认online模式与改动前版本在80环境步后共44个checkpoint tensor leaves逐元素相同，结果只差路径和耗时。机制测试直接拦截正式`train()`调用，得到`Actor→Critic→Critic→Actor`；第一次actor查询`1+K=5`次，第二次为0，且缓存不变；随后6个cost-critic参数张量都发生更新。新指标单独记录同一批`pre-update CDF→post-update CDF`的absolute drift，不再借用target-online名称。
+
+这个时序改动不适合用100k判败。C-X1的三个seed在100k时reward都很差，但到1M都表现出稳定的reward增益；它最终被拒绝的原因是两个seed安全性恶化，而非早期不学习。因此C-X3在P-M3 seed1上直接绑定1M预算，每100k保存checkpoint但不因早期reward差停掉。纯训练预计6.5–8分钟，加140和520轨迹评估总计11–14分钟，使用持久化后台运行。
+
+单seed预注册门是：fresh520 outage从P-M3 seed1的0.3058至少降低0.08且到0.22以内，reward不低于0.75，成熟阶段pre/post query drift确实非零，末200k周期不更大。通过后才原样扩seed0/2各1M+520；不通过则保留为负消融，不扫时间间隔，也不与target-KL叠加产生无法归因的组合。

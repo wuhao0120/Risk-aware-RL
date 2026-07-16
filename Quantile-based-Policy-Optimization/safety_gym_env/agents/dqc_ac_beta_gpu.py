@@ -147,9 +147,11 @@ class DQCACBetaGPU(VecAgentBase):
         # critic，从而隔离“本批标签先训练 online critic、再立刻驱动本批 actor”的泄漏。
         self.cost_actor_query_mode = str(
             getattr(args, 'cost_actor_query_mode', 'online')).lower()
-        if self.cost_actor_query_mode not in {'online', 'target', 'crossfit'}:
+        if self.cost_actor_query_mode not in {
+                'online', 'target', 'crossfit', 'preupdate'}:
             raise ValueError(
-                "cost_actor_query_mode must be 'online', 'target', or 'crossfit'")
+                "cost_actor_query_mode must be 'online', 'target', 'crossfit', "
+                "or 'preupdate'")
         self.n_step = max(1, int(getattr(args, 'n_step', 1)))
         # episodic (未折扣论文口径) 默认由 cost_gamma 推断: γc=1 → episode 末不 bootstrap
         self.episodic = bool(getattr(args, 'episodic', self.cost_gamma >= 1.0 - 1e-9))
@@ -338,6 +340,20 @@ class DQCACBetaGPU(VecAgentBase):
                 raise ValueError(
                     "cost_actor_query_mode='crossfit' currently requires critic_minibatch_size=0")
 
+        # C-X3首轮只服务已经验证的P-M3 recurrent/MC/raw/full-batch主路径。
+        # MLP critic update可能在内部采样bootstrap action；把actor提前会交换RNG
+        # 顺序并混入第二个变量，所以在专门对拍前显式拒绝这些未验证组合。
+        if self.cost_actor_query_mode == 'preupdate':
+            if not self.recurrent_policy or self.reward_actor_mode != 'gae_ppo':
+                raise ValueError(
+                    "cost_actor_query_mode='preupdate' currently requires recurrent gae_ppo")
+            if self.cost_target_mode != 'mc' or self.cost_history_mode != 'raw':
+                raise ValueError(
+                    "cost_actor_query_mode='preupdate' currently requires MC/raw cost critic")
+            if self.cost_s0_aux_coef > 0.0 or self.critic_minibatch_size != 0:
+                raise ValueError(
+                    "cost_actor_query_mode='preupdate' currently requires s0_aux=0 and full-batch")
+
         # dual 消融：旧 critic_adam 保持可复现；empirical_pid 用真实完成轨迹控制 λ。
         self.dual_update_mode = str(getattr(args, 'dual_update_mode', 'critic_adam')).lower()
         if self.dual_update_mode not in {'critic_adam', 'empirical_pid'}:
@@ -503,6 +519,7 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_pred_cost_mean = 0.0                        # cost-critic 估 E[C|s0]
         self.last_pred_cost_std = 0.0                         # cost-critic 估 std(C|s0)
         self.last_risk_query_target_online_abs_mean = 0.0     # actor查询网络间风险CDF差
+        self.last_risk_query_preupdate_postupdate_abs_mean = 0.0  # 同批QR前后CDF漂移
         self.last_cost_crossfit_peer_abs_mean = 0.0            # 两折critic同输入CDF分歧
         # replay 只保存少量 GPU tensor；原始 state 在使用时重新走当前 RMS，不能
         # 缓存旧归一化结果，否则 observation statistics 漂移会污染监督输入。
@@ -593,28 +610,53 @@ class DQCACBetaGPU(VecAgentBase):
             actor_updated = False
             actor_updates_completed = 0
             actor_early_stopped = False
+
+            def apply_actor_epoch():
+                """执行一次允许的actor epoch，并统一维护early-stop/scheduler计数。"""
+                nonlocal actor_info, actor_updated
+                nonlocal actor_updates_completed, actor_early_stopped
+                actor_info = self.update_actor(batch)
+                # target-KL越界的probe epoch不执行optimizer.step；它和剩余epoch
+                # 都不能推进actor scheduler，但critic更新预算保持不变。
+                update_applied = bool(
+                    actor_info.get('ppo/update_applied', 1.0))
+                if update_applied:
+                    actor_updated = True
+                    actor_updates_completed += 1
+                if bool(actor_info.get('ppo/early_stop', 0.0)):
+                    actor_early_stopped = True
+
             for update_idx in range(self.updates_per_episode):
+                actor_epoch_allowed = (
+                    not self.freeze_policy_updates and not in_warmup
+                    and update_idx < self.actor_updates_per_episode
+                    and not actor_early_stopped)
+                # C-X3只把首个actor epoch提前到任何current-batch QR step之前。
+                # update_actor会在这一刻缓存risk weight；后续epoch即使位于critic
+                # 更新后也复用缓存，因此当前批cost标签不会即时回灌同批actor。
+                actor_before_critic = (
+                    self.cost_actor_query_mode == 'preupdate'
+                    and update_idx == 0 and actor_epoch_allowed)
+                if actor_before_critic:
+                    apply_actor_epoch()
+
                 critic_info = self.update_critic(batch)
-                # 标量 reward value 在 warmup 中也训练；actor 仍由下面的 in_warmup 控制。
-                # value 每个 epoch 拟合同一批冻结 λ-return，actor 复用冻结 advantage。
+                # 标量 reward value 在warmup中也训练；actor仍由下面的in_warmup控制。
+                # value每个epoch拟合同一批冻结λ-return，actor复用冻结advantage。
                 if self.reward_actor_mode != 'distributional' and not self.recurrent_policy:
                     critic_info.update(self.update_reward_value(batch))
-                if (not self.freeze_policy_updates and not in_warmup
-                        and update_idx < self.actor_updates_per_episode
-                        and not actor_early_stopped):
-                    actor_info = self.update_actor(batch)
-                    # target-KL越界的probe epoch不执行optimizer.step；它和剩余epoch
-                    # 都不能推进actor scheduler，但20次critic更新继续完整执行。
-                    update_applied = bool(
-                        actor_info.get('ppo/update_applied', 1.0))
-                    if update_applied:
-                        actor_updated = True                   # scheduler 只能跟随真实 optimizer.step()
-                        actor_updates_completed += 1
-                    if bool(actor_info.get('ppo/early_stop', 0.0)):
-                        actor_early_stopped = True
+                if actor_epoch_allowed and not actor_before_critic:
+                    apply_actor_epoch()
                 if self.learning_steps % self.target_update_interval == 0:
                     self._soft_update_target()
                 self.learning_steps += 1
+
+            if self.cost_actor_query_mode == 'preupdate':
+                # actor缓存发生在首个critic step之前；这里用同一实际动作和budget
+                # 查询完成全部更新后的online critic，量化本来会即时灌回actor的漂移。
+                preupdate_drift = self._measure_preupdate_query_drift(batch)
+                actor_info[
+                    'advantage/risk_query_preupdate_postupdate_abs_mean'] = preupdate_drift
 
             # configured epochs与实际optimizer steps必须同时记录；否则target-KL只看
             # 最终KL会误以为仍执行了固定8次更新。
@@ -2123,8 +2165,9 @@ class DQCACBetaGPU(VecAgentBase):
         """
         返回单网络actor-query critic；crossfit必须改用逐样本路由helper。
 
-        online 是历史路径。target 使用 Polyak 网络。crossfit的每行样本可能需要
-        不同网络，若误调用本函数会把整批送入一个critic并破坏out-of-fold语义，
+        online/preupdate都查询online网络，区别只在外层调用时序；target使用
+        Polyak网络。crossfit的每行样本可能需要不同网络，若误调用本函数会把
+        整批送入一个critic并破坏out-of-fold语义，
         因此显式报错而不静默选择主网络。
         """
         if self.cost_actor_query_mode == 'target':
@@ -2133,6 +2176,26 @@ class DQCACBetaGPU(VecAgentBase):
             raise RuntimeError(
                 "crossfit actor query requires _cost_actor_query_quantiles")
         return self.cost_critic
+
+    @torch.no_grad()
+    def _measure_preupdate_query_drift(self, batch):
+        """
+        比较缓存的pre-update风险CDF与本批全部critic step后的online CDF。
+
+        两次查询复用相同states/actions/budgets，不采样也不改变训练；差值只来自
+        current-batch QR监督更新。若actor因warmup/冻结没有创建缓存，则返回0。
+        """
+        if self.cost_actor_query_mode != 'preupdate' or '_risk_cdf' not in batch:
+            self.last_risk_query_preupdate_postupdate_abs_mean = 0.0
+            return 0.0
+        cost_inputs = self._cost_inputs(
+            batch['states'], batch['steps'], batch.get('cost_feature'))
+        updated_quantiles = self.cost_critic(cost_inputs, batch['actions'])
+        updated_cdf = self._cost_tail_probability(
+            updated_quantiles, batch['budgets'])
+        drift = (batch['_risk_cdf'] - updated_cdf).abs().mean()
+        self.last_risk_query_preupdate_postupdate_abs_mean = float(drift.item())
+        return self.last_risk_query_preupdate_postupdate_abs_mean
 
     def _cost_actor_query_quantiles(self, inputs, actions, label_folds=None):
         """
@@ -2380,6 +2443,8 @@ class DQCACBetaGPU(VecAgentBase):
             'debug/cost_critic_weight_floor': self.cost_critic_weight_floor,
             'debug/cost_actor_query_is_target': float(
                 self.cost_actor_query_mode == 'target'),
+            'debug/cost_actor_query_is_preupdate': float(
+                self.cost_actor_query_mode == 'preupdate'),
             'debug/cost_cdf_is_sigmoid': float(
                 self.cost_cdf_mode == 'sigmoid'),
             'debug/cost_cdf_temperature': self.cost_cdf_temperature,
@@ -2419,6 +2484,11 @@ class DQCACBetaGPU(VecAgentBase):
                     self.last_risk_query_target_online_abs_mean))
             extra['critic/cost_crossfit_peer_abs_mean'] = (
                 self.last_cost_crossfit_peer_abs_mean)
+        if self.cost_actor_query_mode == 'preupdate':
+            extra['advantage/risk_query_preupdate_postupdate_abs_mean'] = float(
+                actor_info.get(
+                    'advantage/risk_query_preupdate_postupdate_abs_mean',
+                    self.last_risk_query_preupdate_postupdate_abs_mean))
         if self.advantage_norm == 'qcpo':
             extra['norm/return_sigma_ema'] = float(self.return_rms.std)
             extra['norm/constraint_sigma_ema'] = float(self.constraint_rms.std)
@@ -2621,4 +2691,7 @@ class DQCACBetaGPU(VecAgentBase):
                 'cost_crossfit_peer_abs_mean': (
                     self.last_cost_crossfit_peer_abs_mean),
             })
+        if self.cost_actor_query_mode == 'preupdate':
+            summary['risk_query_preupdate_postupdate_abs_mean'] = (
+                self.last_risk_query_preupdate_postupdate_abs_mean)
         return summary
