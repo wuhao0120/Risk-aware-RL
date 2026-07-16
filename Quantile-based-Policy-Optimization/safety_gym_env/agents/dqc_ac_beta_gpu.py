@@ -606,10 +606,24 @@ class DQCACBetaGPU(VecAgentBase):
                 reward_loss_value += weight * float(reward_loss_chunk.item())
                 cost_loss_value += weight * float(cost_loss_chunk.item())
 
+        # 分开记录两个 critic 的裁剪前梯度范数，诊断 MC 大 target 是否让
+        # joint clip 长期由 cost 分支主导。这里只读取 .grad，不建立二阶计算图。
+        reward_parameters = list(self.reward_critic.parameters())
+        cost_parameters = list(self.cost_critic.parameters())
+
+        def gradient_norm(parameters):
+            squared_norm = torch.zeros((), dtype=torch.float32, device=self.device)
+            for parameter in parameters:
+                if parameter.grad is not None:
+                    squared_norm += parameter.grad.detach().float().pow(2).sum()
+            return squared_norm.sqrt()
+
+        reward_grad_norm = gradient_norm(reward_parameters)
+        cost_grad_norm = gradient_norm(cost_parameters)
+        joint_parameters = reward_parameters + cost_parameters
+        joint_grad_norm = gradient_norm(joint_parameters)
         if self.critic_grad_clip and self.critic_grad_clip > 0:
-            nn.utils.clip_grad_norm_(
-                list(self.reward_critic.parameters()) + list(self.cost_critic.parameters()),
-                self.critic_grad_clip)
+            nn.utils.clip_grad_norm_(joint_parameters, self.critic_grad_clip)
         self.critic_optimizer.step()
         return {
             'critic/reward_qr_loss': reward_loss_value,
@@ -617,6 +631,12 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/chunked_update': float(use_chunks),
             'critic/cost_target_mean': float(cost_target.mean().item()),
             'critic/cost_target_is_mc': float(self.cost_target_mode == 'mc'),
+            'critic/reward_grad_norm': float(reward_grad_norm.item()),
+            'critic/cost_grad_norm': float(cost_grad_norm.item()),
+            'critic/joint_grad_norm': float(joint_grad_norm.item()),
+            'critic/grad_clip_fraction': float(
+                joint_grad_norm.item() > self.critic_grad_clip
+                if self.critic_grad_clip and self.critic_grad_clip > 0 else 0.0),
         }
 
     def _quantile_huber_loss(self, psi, y):

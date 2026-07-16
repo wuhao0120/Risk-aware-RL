@@ -406,4 +406,7 @@
 - **C-Q（后续）**：N=64/128、smooth CDF、局部 tau/IQN；只有 mean/return target 已校准后才进入，避免用更多 quantile 掩盖整体传播偏差。
 - 实现保护：MC 只允许 `episodic=True`，continuing 截断 rollout 会直接报错；scalar MC sample 重复为 N 列以保持现有 QR target-sample 求和的 loss/梯度尺度，避免同时重调 critic LR。
 - 验证：语法与手算 discounted return 通过；持久化 smoke `DQCAC_DynamicButton_smoke_recur_mc_cost_s0` 使用 recurrent+chunked QR，训练 `5.8s`、exit code 0，JSON/评估全链路通过。
-- 下一门：用 E15 胜出的 `lr=3e-4,value_coef=1` 跑 C-T1 100k。主判据不是 reward，而是 `pred_cost_mean / true cost mean`、s0 CDF calibration 与 cost QR loss；若低估不明显改善，不扩 300k，转 C-H1。
+- C-T1 100k 已完成：job `DQCAC_DynamicButton_recur_mc_cost_lr3e4_100k_s0`，W&B `wmlzu8la`，训练 `56.9s`、exit code 0。reward 序列与 n-step 对照逐点完全一致，证明 lambda=0 时只改变了 cost 学习。
+- 终评 predicted mean cost 从 n-step 的 `1.49` 提到 `4.02`，真实值 `8.96`；CDF 从 `0.00045` 提到 `0.0384`，真实 outage `0.2286`。MC 明确缓解传播低估，但 mean 仍低估 55%、CDF 仍低估 0.190，不扩 300k。profile：`_runs/profiles/dqc_cost_target_mc_100k_2026-07-16/`。
+- 新增 C-O1 优化诊断：记录 reward/cost/joint 裁剪前 gradient norm 和 clip indicator；profile 工具同步纳入 cost target/gradient 指标。持久化 recurrent+chunk smoke `DQCAC_DynamicButton_smoke_mc_grad_diag_s0` 训练 `4.6s`、exit code 0。
+- 下一门 C-O1：保持 MC 与 actor epochs=8，只把 critic epochs `10→20`。若校准仍无实质改善，再进入 C-H1；最终保留 `nstep/MC × Markov/recurrent-cost` 的 2×2 消融。
