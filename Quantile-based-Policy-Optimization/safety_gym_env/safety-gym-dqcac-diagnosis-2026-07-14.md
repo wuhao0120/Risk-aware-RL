@@ -1236,3 +1236,11 @@ P-M3的seed1/2均完成1M步，训练耗时`713.4s/717.9s`。三个seed各自520
 因此预算按用途分级：100k只做确定性机制/尺度/早期校准screen；300k判断闭环趋势，末段仍有定向改善才晋级；1M检验是否存在反复周期；最终候选至少3 seeds × 1.5M，与QCPO_refs正式数值比较对齐5M步。N64、local quantile和cost-LSTM的现有结论必须保持为“100k/seed0无早期收益”，不写成永久无效；而旧N64梯度尺度bug、uniform-transition目标错配和pre/post policy相位错位由公式、配对run或hash/checkpoint直接确认，无需靠更长训练重新证明。
 
 140条评估在p约0.2时的95%半宽约`0.066`，只能screen；520条半宽约`0.034`，用于单seed确认。即使520条也不能替代多seed，因为P-M3的跨seed outage standard deviation已达`0.0707`。后续早停看趋势、checkpoint与校准，不根据某个末点的运气做选择。
+
+### 13.40 P-M4：用K16检验action-risk baseline是否是闭环方差来源（2026-07-16）
+
+P-M4在P-M3 B20基础上只把`num_action_samples=4→16`，固定1M环境步。实现核对显示，K仅用于behavior policy下的无梯度action-conditioned cost CDF基线；它在constraint RMS与首个actor epoch各计算一次，随后risk advantage冻结并供8个PPO epoch复用。在相同动作风险离散度下，K16相对K4把baseline均值的Monte Carlo标准误理论上减半。
+
+该实验不应被解释成critic校准修复。seed1的CDF低估需要recent/initial-state replay或holdout objective单独处理；K16只检验相对动作排序噪声是否导致PPO/dual周期。预计纯训练7～10分钟，持久化后台运行，每100k保存快照。
+
+晋级门不仅看最终点：520条需满足reward>0.658和outage<=0.22，末200k训练reward/outage需不差于约0.70/0.22，并检查KL、clip和风险周期是否相对K4改善。通过后先在失败的seed1压力复现；失败则不继续扫K8/K32，转critic replay/holdout路线。

@@ -749,3 +749,12 @@
 - 应当早停的条件：末段已平稳且reward/outage同时被基线支配；多个checkpoint重复同样的风险周期；配对试验证明变量只修正梯度尺度却没有改善校准；或失败由确定性目标错配造成。这些情况下继续加步数只会浪费资源。
 - 评估协议保持两层：140条只作screen，520条作单seed确认。在outage约0.2时，520条的二项标准误约`0.0175`，95%半宽约`0.034`；140条半宽约`0.066`，不适合判定贴边界的安全性。最终候选至少3 seeds × 1.5M，与QCPO_refs正式比较时再对齐其5M环境步数。
 - 当前下一单变量路线是在B20上把`num_action_samples=4→16`，检验冻结后在8个PPO epoch重复使用的action risk baseline方差；同时把recent-rollout/initial-state replay和holdout CDF calibration作为更直接针对seed1 critic低估的独立路线。两者不在同一跑中混合。
+
+### E51：P-M4预注册——B20基础上仅将action baseline K4→K16（2026-07-16）
+
+- P-M4完全复用P-M3 seed0的1M配置，只把`num_action_samples=4→16`。网络、N32、MC cost target、time weighting、T1 sigmoid、PID target=.15、actor LR、8 PPO epochs、B20和总环境步都不变。
+- 代码核对确认K只影响两个无梯度的cost-action baseline查询：constraint RMS更新和首个recurrent PPO epoch的冻结risk advantage。实际动作CDF不变，K个baseline动作均从rollout保存的behavior Gaussian参数采样；冻结后的同一risk weight继续供8个PPO epoch使用。因此K4的baseline Monte Carlo标准误在相同动作离散度下约为K16的2倍，噪声还会被8次重复使用。
+- K16不会修复cost critic对初始状态的系统偏差，它检验的是“critic给定时，action相对风险排序是否被K4采样噪声放大”。recent/initial-state replay与holdout calibration仍是另一条独立路线，不能把两者同时加入后再归因。
+- 100k不足以否定此变量，因为其收益通过数十次policy/dual更新积累；本次直接跑1M，但仍按100k保存phase-aligned checkpoint。参考K4独占GPU训练`390.6s`，K16增加无梯度critic前向，预计纯训练约7～10分钟、含140条终评约9～12分钟。
+- 基本门仍为520条`reward>0.658,outage<=0.22`。相对K4 seed0还要求末200k训练outage不高于0.22、reward不低于约0.70，且KL/clip或风险周期至少一项显示稳定性不恶化；否则即使偶然终评好看也不晋级。
+- 140条只作是否扩520的screen。若P-M4通过，下一步优先在曾失败的seed1做同配置1M压力复现；若失败则停止K小网格，不试K8/K32碰运气，转recent/initial-state critic replay与holdout校准。
