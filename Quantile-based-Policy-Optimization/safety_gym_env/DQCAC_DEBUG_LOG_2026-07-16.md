@@ -831,3 +831,13 @@
 - 最后五批pre-CDF/Brier只改善约`10.0%/4.1%`，未过原20%小批门；但B20逐批truth在0.15～0.45间变化，方差远高于520条固定协议。结论定级为“独立大样本强通过、小批pre门未通过”，不声称所有校准指标一致改善。
 - 下一步只在P-M3最差的seed1加入`cost_s0_aux_coef=.25,replay_batches=4`跑完整1M；其余网络、B20、C20、MC/time-weight.995、T1、PID target=.15、8 PPO epochs、LR和checkpoint周期完全不变。独占GPU预计训练约6.5～8分钟、含140条评估约8～9分钟，持久化后台运行。
 - live通过门：用相同eval-only 520协议比较原seed1 baseline `reward/outage=0.8622/0.3058`。候选需reward保持`>0.658`且outage`≤0.22`，或至少把outage降低0.08且reward保持≥0.75；同时critic CDF absolute error至少降低50%，末200k不能出现更严重极限环。未通过则说明校准改善未转化为policy控制，不扩seed0/2。
+
+### E59：live seed1 1M——校准改善转化为显著安全收益，但牺牲reward（2026-07-16）
+
+- job `DQCAC_DynamicButton_pm3_s0aux025r4_timew995_pi_target015_smoothT1_b20_ckpt100k_1m_s1`，W&B `erayfl8y`，训练`392.3s`、exit code 0。相对原P-M3 seed1只增加`cost_s0_aux_coef=.25,cost_s0_replay_batches=4`，其余网络、B20、C20、PID、PPO、LR与1M预算完全相同。
+- 140条内置终评中，baseline到candidate的reward/outage为`0.8404/0.2429 -> 0.7379/0.2429`；小样本没有显示安全收益，但critic CDF从`0.1002`变为`0.2295`，相对同一个truth `0.2429`的absolute error从`0.1426`降到`0.0134`。
+- fresh eval-only 520条正式结果为：baseline reward `0.8622±0.5809`、outage `159/520=0.3058`、Wilson 95% `[0.2677,0.3467]`；candidate reward `0.6875±0.5783`、outage `98/520=0.1885`、区间 `[0.1572,0.2243]`。outage绝对下降`0.1173`、相对下降`38.4%`；reward绝对下降`0.1747`、相对下降`20.3%`，但仍高于预注册`>0.658`下限。
+- 520条critic CDF从baseline的`0.10427`变为candidate的`0.23696`。相对各自policy truth `0.30577/0.18846`，absolute calibration error由`0.20150`降到`0.04850`，降低`75.9%`，通过至少减半的校准门。
+- 时间结构不能被final点掩盖：300–600k candidate相对baseline的reward/outage为`0.827/0.207 vs 0.783/0.243`，看似全面占优；600–800k却回摆为`0.639/0.300 vs 0.823/0.260`，lambda均值`0.454 vs 0.341`；800k–1M为`0.603/0.170 vs 0.825/0.180`。因此600k会产生false positive，完整1M揭示了真实reward代价和中段极限环。
+- 结论：recent-s0 auxiliary不再是“只改善冻结critic”的局部trick；它在最差seed1上把大样本outage拉回0.2以内，并通过live晋级门。但它没有消除闭环周期，而且安全收益以明显reward损失为代价，尚不能作为稳定主配置。
+- 下一步保持单变量设计，在seed0/2各跑完整1M；不根据seed1结果回调coef或replay次数。两条并行预计训练约12分钟、含140条终评约14分钟。只有多seed聚合仍改善约束且reward可接受，才继续1.5M/同QCPO_refs预算确认。

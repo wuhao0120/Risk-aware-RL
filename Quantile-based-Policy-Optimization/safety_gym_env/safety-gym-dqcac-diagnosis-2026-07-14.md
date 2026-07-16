@@ -1304,3 +1304,13 @@ replay4把最后三批pre-CDF error从`0.19010`降到`0.15729`（改善17.3%）�
 最后五批B20 pre-CDF/Brier只改善10.0%/4.1%，没有通过小批门。它与520条结果的冲突来自逐批outage在0.15～0.45大幅波动，故结论保留为“大样本独立校准强改善，小批pre不稳定”。不能只汇报好看的520条而隐藏这点。
 
 下一实验使用原P-M3失败seed1，在live PID闭环中只加入`coef=.25,replay4`完整跑1M。原baseline的520条reward/outage为`0.8622/0.3058`、critic CDF仅0.1043。候选必须把outage降到0.22以内并保持reward>0.658，或至少下降0.08且reward≥0.75，同时critic CDF error减半、末200k不出现更大周期；否则不扩其他seed。
+
+### 13.48 live闭环验证：初始状态校准能改善安全性，但不是免费的性能提升（2026-07-16）
+
+seed1候选只加入`cost_s0_aux_coef=.25,replay_batches=4`，完整训练1M步、耗时`392.3s`。140条终评的outage与原baseline同为`0.2429`，reward从`0.8404`降到`0.7379`；如果只用这个小样本会判断组件没有安全收益。fresh eval-only扩到520条后，baseline与candidate的reward/outage分别为`0.8622/159/520=0.3058`和`0.6875/98/520=0.1885`。outage相对下降38.4%，且candidate Wilson 95%区间为`[0.1572,0.2243]`；reward相对下降20.3%，但仍通过预注册下限。
+
+critic修复与安全收益方向一致。baseline CDF `0.10427`相对truth `0.30577`低估0.20150；candidate CDF `0.23696`相对truth `0.18846`高估0.04850，absolute error下降75.9%。这证明此前发现的initial-state低估不是无关诊断：提高最终策略附近的初始风险估计，确实能让risk actor/PID采取更保守的动作。
+
+但训练动力学仍非单调。300–600k candidate同时提高reward并降低outage，若在600k停止会宣布全面成功；600–800k随即出现更大的风险/lambda回摆；最后200k outage与baseline接近，而reward均值低约0.22。当前结论应写成“校准组件有效、闭环与reward权衡仍待稳定”，不能写成DQCAC已经稳定超过参考算法。
+
+因此seed0/2沿用完全相同配置各跑1M，不调coef、不挑checkpoint。多seed结果若仍能降低聚合outage且reward保持可接受，再进入1.5M和与QCPO_refs同预算比较；若只在原失败seed1有效，则将它视为压力场景修复，并转向separate critic grad clipping、cross-fit/ensemble uncertainty和更慢的dual控制消除周期。
