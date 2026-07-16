@@ -689,3 +689,22 @@
 - 预注册判断：final 130条只做便宜screen；若reward `>0.658`且outage `≤0.27`，或600k–1M末段呈持续安全改善，则扩520条。正式通过仍要求520条点估计outage `≤0.22`且reward `>0.658`，并要求300k/600k/1M不存在P-M1那样的大幅回退。
 - 若LR降低能明显压低KL/clip却仍有risk周期，下一正交变量是`num_envs=20`（降低outage/PID和critic batch方差）；若KL稳定但action risk方向仍噪声，测试`num_action_samples=16`；若单次更新偶发越界，新增默认关闭的PPO target-KL early stop。三条路线不混入P-M2。
 - 当前仍只做seed0配置选择。随机初始化false negative的可能性保留；任何最终候选必须在3个seed复现，不能用P-M1-L1 seed0否定整个算法族。
+
+
+### E45：P-M2 1M结果——匹配QCPO_refs的1e-4 LR减小更新，但不改善outage（2026-07-16）
+
+- job `DQCAC_DynamicButton_pm2_timew995_pi_target015_smoothT1_lr1e4_ckpt50k_1m_s0`，W&B `3qqyab3s`，训练`509.2s`、exit code 0；相对P-M1-L1唯一变化是actor LR `3e-4→1e-4`。
+- 130条final为 reward `0.6909±0.6167`、outage `0.2462`、critic CDF `0.2200`、pred mean `9.609`、lambda `0.3818`。520条确认评估为 reward `0.6498`、outage `127/520=0.2442`、Q80 cost `16`、critic CDF `0.2166`，bias `-0.0277`。同时未通过reward `>0.658`和outage `≤0.22`两条门，不扩phase快照或多seed。
+- 小LR确实压低部分PPO更新：终点KL/clip从P-M1的`0.00661/0.3227`降到`0.00598/0.2221`。但末200k均值只从`0.00519/0.2414`降到`0.00485/0.2219`，幅度有限。
+- 代价明显：P-M2末200k训练reward均值`0.3868`，P-M1为`0.7522`；600k–1M raw outage从P-M1的`0.3025`降到`0.2525`，但final大样本outage仍同为`0.2442`。P-M2在830–900k同样出现outage上冲、lambda上升和reward短暂变负，只是周期相位改变。
+- 结论：DQCAC的actor LR不能仅因网络/PPO结构相同就机械迁移QCPO_refs参数。较小LR缓和更新并降低训练窗口outage，却没有消除risk signal/dual闭环的非平稳性，而且损害样本效率；它不作为当前推荐配置。
+- 对齐导出与图：`_runs/wandb_export/dqc_pm1_pm2_lr_1m_2026-07-16/`、`_runs/profiles/dqc_pm1_pm2_lr_1m_2026-07-16/`。
+
+### E46：P-M3 预注册——固定1M环境步，将num_envs从10增至20（2026-07-16）
+
+- P-M3以P-M1为基线，只改`num_envs=10→20`，并将`num_iterations=100→50`保持总环境步严格等于1M。actor LR恢复`3e-4`，其余PID、critic、CDF、网络和8 PPO epochs不变。
+- 每次rollout从10条增到20条，outage=.2时超限轨迹期望数从2增到4；critic每轮看到双倍不同初始状态。PID已有`pid_reference_episodes=10`，leaky-I在常值error下一次B20更新与两次B10严格等价，避免仅因batch变大暗改积分时间尺度。
+- 固定env-step比较下，50次policy update各使用20k transitions，P-M1为100次各10k；每个样本仍复用8个PPO epoch。该实验同时检验更低batch方差与更低policy/control更新频率是否能破坏极限环，属于num_envs本身的算法效应。
+- 当前128 CPU/A100 80GB资源对B20+N32安全；pairwise QR显存风险主要出现在B与N同时放大。本run每100k保存checkpoint，预计训练约8–10分钟，130条终评约1分钟。
+- screen与P-M2相同：final 130若reward `>0.658`且outage `≤0.27`则扩520；正式门为520条outage `≤0.22`且reward `>0.658`，并检查中后期是否比B10少一次完整风险周期。
+- 若B20失败，下一单变量为`num_action_samples=4→16`，直接降低冻结risk baseline在8个PPO epoch中被重复放大的Monte-Carlo噪声；随后才实现target-KL early stop。B20、K16和target-KL分别报告，不组合成无法归因的“trick包”。

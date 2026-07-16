@@ -1184,3 +1184,20 @@ P-M1-L1（W&B `p4hbaqtv`）把完全相同的seed0轨迹从300k延长到1M，训
 P-M2只把actor初始LR从`3e-4`降到QCPO_refs的`1e-4`。两者均为8 PPO epochs和clip=.1；P-M1-L1末200k KL/clip均值`0.00519/0.241`、终点`0.00661/0.323`，说明DQCAC的三倍LR可能放大风险边界附近的策略跃迁。因为小LR学习更慢，P-M2直接给1M预算，不允许用300k早期reward偏低否决。
 
 final 130条只用于screen，正式门仍是520条outage点估计不高于0.22且reward高于0.658，并检查300k/600k/1M是否维持而非只出现单个好checkpoint。下一分歧路线按证据排序：`num_envs=20`降低tail/PID批方差；`num_action_samples=16`降低每个状态action baseline的Monte-Carlo噪声；PPO target-KL early stop限制偶发大更新。它们分别测试，不和LR同时改。seed0用于选配置，最终必须至少3 seeds；100k的N64/local quantile/LSTM负结果继续只解释为“无早期收益”，不升级成长期定论。
+
+
+### 13.34 P-M2：与QCPO_refs相同的LR只降低更新幅度，没有迁移其稳定性（2026-07-16）
+
+P-M2（W&B `3qqyab3s`）相对P-M1-L1只把actor LR从`3e-4`改为`1e-4`，完整训练1M步、耗时`509.2s`。130条final为`reward/outage=0.6909/0.2462`；520条确认后为`0.6498/0.2442`，critic CDF `0.2166`，因此未通过reward和outage门。
+
+LR变化确实生效：终点PPO clip fraction从`0.3227`降到`0.2221`，末200k均值从`0.2414`降到`0.2219`；600k–1M训练raw outage从P-M1的`0.3025`降到`0.2525`。但末200kreward从`0.7522`大幅降到`0.3868`，830–900k仍出现第二次risk/lambda周期，final 520条outage又与P-M1的`0.2442`完全相同。
+
+因此参数不能因为网络结构相同就直接迁移。QCPO_refs和DQCAC虽都使用8 epoch/clip .1/LSTM，但cost advantage的构造、action baseline噪声、critic非平稳性和dual响应不同；同一LR只能改变步长，不能复制参考算法的稳定机制。P-M2不扩seed。
+
+### 13.35 P-M3：用更大的并行trajectory batch处理控制观测噪声（2026-07-16）
+
+下一条只把P-M1的B从10提高到20，并把iteration从100减到50，固定总预算1M。PID的episode scaling保证常值error下积分量按完成轨迹数等价；window仍是最近50条episode，因此没有通过扩大时间窗口偷换controller目标。
+
+B20使每轮约束尾部样本期望从2增到4、critic初始布局覆盖翻倍，并将每1M步policy/control更新次数减半。每个样本仍做8个PPO epoch，所以这是batch方差与更新频率的可解释消融，不是额外采样预算。硬件对B20+N32有充分余量；每100k保存checkpoint，预计总耗时约9–11分钟。
+
+若520条reward/outage不能达到`>0.658/≤0.22`，则不再盲目扩大B；下一步把每状态action baseline samples从4提高到16，检验冻结risk advantage的Monte-Carlo方差。再后面才加入PPO target-KL early stop。三者保持单变量顺序。
