@@ -951,3 +951,13 @@
 - 机制断言通过：两个inner updates的调用顺序精确为`A,C,C,A`；第一次actor调用时cost critic全参数仍与初始值exact，该epoch做`1+K=5`次risk query，第二个epoch新增查询为0且缓存逐元素exact；两次QR step后6个cost参数张量全部改变，pre/post CDF drift为`1.16e-8`。统一入口80步smoke也完成checkpoint、JSON和4轨迹评估、exit 0；初始低风险批次的drift极小只证明链路，不代表成熟阶段机制弱。
 - 正式C-X3只在P-M3 seed1上把`online→preupdate`，保持B20/C20/N32、MC/time-weight .995、T1 sigmoid、PID target .15、8个PPO epochs、LR和1M预算全部不变。不用100k早停；C-X1已证明这类时序组件在100k reward仍可为负而后期超过基线。预计A100纯训练`6.5–8分钟`，含140与fresh 520评估后总墙钟`11–14分钟`，全程持久化后台。
 - 预注册门与压力seed一致：相对P-M3 seed1的fresh520 `reward/outage=0.8622/0.3058`，候选需outage `≤0.22`且至少下降`.08`，reward `≥0.75`；同时成熟阶段pre/post drift必须非零，末200k不得出现更大的policy–critic–PID周期。通过后原参数扩seed0/2各1M+520；失败则保留为时序消融，不扫更多缓存间隔或叠加target-KL追逐偶然点。
+
+### E70：C-X3 seed1完整1M结果——校准与安全改善，但reward代价使其不进多seed（2026-07-16）
+
+- job `DQCAC_DynamicButton_cx3_preupdate_timew995_pi_target015_smoothT1_b20_ckpt100k_1m_s1`、W&B `xcv8ghw6`正常exit 0；纯训练`390.9s`，与P-M3的约6.5分钟一致，没有增加可测wall-time或显存代价。fresh520 eval-only job也exit 0。
+- 完整长跑再次证明不能以中期终点替代结论。0–300k的P-M3/C-X3 reward为`0.2571/0.3015`、outage同为`0.1033`；300–600k为`reward 0.7835/0.7775,outage 0.2433/0.2233`，候选看似略安全且reward持平。但600–800k已变为`0.8233/0.7556,0.260/0.265`，末200k更恶化为`0.8253/0.6130,0.180/0.255`，lambda从`0.2206→0.3203`。若600k停掉会得到false positive。
+- pre/post query drift在全程的mean/std/max为`0.09684/0.05287/0.22251`，末200k均值`0.10407`，最终训练JSON为`0.12024`。它与同批outage、lambda、prequential s0 CDF error的Pearson相关分别为`0.626/0.559/0.669`；这是描述性共振，不解读为单向因果，但证明当前批QR更新会大幅移动actor风险信号。
+- 内置140条为reward/outage `0.57035/27÷140=0.19286`，hard CDF `0.24487`。严格fresh520中，P-M3→C-X3的reward为`0.86220±0.58095→0.58645±0.61862`，差`-0.27575`（`-32.0%`），近似95%区间`[-0.34869,-0.20281]`；outage为`159/520=0.30577→108/520=0.20769`，差`-0.09808`（`-32.1%`），保守Newcombe 95%区间`[-0.17164,-0.02307]`。两个方向都超出520回合抽样噪声。
+- 校准改善是实质性的。hard CDF absolute error从`|0.10427-0.30577|=0.20150`降至`|0.26929-0.20769|=0.06160`，改善`69.4%`；smooth CDF error `0.19837→0.06670`，改善`66.4%`；predicted mean-cost error `5.74198→1.00415`，改善`82.5%`。真实cost mean/Q80也从`12.3308/18`降到`10.1865/15`。
+- 预注册裁决：outage `≤0.22`且降低至少`.08`两项通过，但reward `0.58645<0.75`失败，末200k周期也比baseline大。因此C-X3保留为“切断同批反馈能换来更准critic和更安全policy，但会明显压低reward”的机制消融；不扩seed0/2、不扫缓存间隔、不叠加target-KL。
+- 正式数据和图位于`_runs/wandb_export/dqc_pm3_seed1_vs_cx3_preupdate_1m_2026-07-16/`和`_runs/profiles/dqc_pm3_seed1_vs_cx3_preupdate_1m_2026-07-16/`；后者含`phase_comparison.csv`、`eval520_comparison.csv`、`eval520_summary.json`、`overview.png`及`eval520_comparison.png`（2700×1350，PIL解码通过）。
