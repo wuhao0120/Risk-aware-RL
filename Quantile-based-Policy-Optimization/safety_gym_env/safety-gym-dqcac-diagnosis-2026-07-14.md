@@ -840,3 +840,10 @@ MC target 后，主要剩余误差首先来自 critic 优化不足。把 critic 
 PID 分歧也显式保留。当前 QCPO_refs 配置所谓 PID 实际 `Kp=Kd=0`，只有 bounded I；E10 的失败更接近窗口滞后和 lambda 不衰减，而非隐藏积分状态超过上限。代码因此新增默认关闭的 bounded leaky-I：leak、deadband、每次最大 delta，以及按新增 episode 数缩放的 reference。默认 `leak=1,deadband=0,delta_max=inf,reference=0` 与旧结果逐式相同；开启 episode scaling 时用几何积分和，保证常值误差下一次 B=20 等价于两次 B=10。手算断言与持久化 smoke 均通过。
 
 首条 P-B1 constrained 门控固定 C20+MC/recurrent reward 主干，使用 `beta=.995,sum_norm=true,outage error,Ki=.1,leak=.97,deadband=.02,delta_max=.05,reference=10`。它与 E9 legacy-I 分开命名；若控制偏弱，保留 leak=.98/Ki=.15 路线，若过保守则保留 leak=.95/更大 deadband。recurrent cost critic C-H1 继续保留，但不与 PID 同一 run 同时引入。
+
+
+### 13.9 P-B1 结果与真正的 PI 路线（2026-07-16）
+
+P-B1 的 300k leaky-I 门控失败于控制偏弱，而非 windup。λ 在 170k 前一直为 0，到 200k/250k/300k 仅约 `0.012/0.056/0.130`；130 条终评 reward `1.332`、outage `0.462`，不满足 0.2。critic CDF `0.295` 对 truth `0.462`，bias `-0.167`；因此 trajectory PID 绕开 critic 只能保证 dual 信号真实，actor 的局部 risk advantage 仍受 cost critic 低估影响。W&B 为 `9pxv0bmd`。
+
+为直接修复迟滞，代码增加默认 `pid_Kp=0` 的 PI 输出 `lambda=clip(I_state+Kp*filtered_error)`。Kp=0 与旧 I 路径逐式相同；Kp>0 时当前 error 能立即影响 λ，并在约束恢复后立即撤回，而 leaky-I 只承担稳态项。手算断言和强制正误差 smoke 均通过，后者实际输出 λ=0.7999。P-B2 只把 Kp 设为 1，其余沿用 P-B1；若仍偏弱，Kp=2 与 window=50 作为两个独立消融，不同时打开。C-H1 recurrent cost critic 继续保留为 PI 之后的结构主线。

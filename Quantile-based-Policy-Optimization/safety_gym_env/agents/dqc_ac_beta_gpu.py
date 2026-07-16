@@ -148,6 +148,9 @@ class DQCACBetaGPU(VecAgentBase):
         if self.dual_pid_signal not in {'outage', 'cost_quantile'}:
             raise ValueError("dual_pid_signal must be 'outage' or 'cost_quantile'")
         self.pid_Ki = float(getattr(args, 'pid_Ki', 0.1))
+        self.pid_Kp = float(getattr(args, 'pid_Kp', 0.0))
+        if self.pid_Kp < 0.0:
+            raise ValueError("pid_Kp must be non-negative")
         self.pid_window_episodes = max(1, int(getattr(args, 'pid_window_episodes', 100)))
         self.pid_cost_scale = float(getattr(args, 'pid_cost_scale', 10.0))
         # 默认 rho=1/deadband=0/delta_max=inf/reference=0 逐式复现旧 I 控制器。
@@ -241,7 +244,9 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_pid_episode_scale = 1.0                      # 本次新增 episode / reference
         self.last_pid_effective_leak = 1.0                     # rho ** episode_scale
         self.last_pid_delta = 0.0                              # clip 后积分增量（不含 leak）
-        self.last_pid_actual_delta = 0.0                       # 最终 lambda_new-lambda_old
+        self.last_pid_actual_delta = 0.0                       # 最终 I_state_new-I_state_old
+        self.last_pid_proportional = 0.0                       # Kp * filtered_error
+        self.last_pid_output = 0.0                             # clip(I_state + P)
 
     # ============================================================ 主训练循环 (与模板一致) ============================================================
     def train(self):
@@ -1037,6 +1042,15 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_pid_delta = bounded_delta
         self.last_pid_actual_delta = self.pid_i - old_pid
 
+    def _pid_output_value(self):
+        """返回 clip(I_state + Kp*filtered_error)，Kp=0 时严格等于旧 bounded-I。"""
+        proportional = self.pid_Kp * self.last_dual_filtered_error
+        output = min(
+            self.lambda_max, max(self.lambda_min, self.pid_i + proportional))
+        self.last_pid_proportional = proportional
+        self.last_pid_output = output
+        return output
+
     def update_dual(self, batch):
         """
         按 dual_update_mode 更新 λ：旧 critic Adam，或 QCPO_refs 风格的经验积分控制器。
@@ -1091,8 +1105,9 @@ class DQCACBetaGPU(VecAgentBase):
         # QCPO_refs 默认 Kp=Kd=0；这里的默认参数精确复现其 bounded I，
         # 显式参数可打开 leaky/deadband/episode-scaled 版本抑制窗口滞后。
         self._update_pid_integral(control_error, new_episodes=len(costs))
+        pid_output = self._pid_output_value()
         with torch.no_grad():
-            self.lambda_dual.fill_(self.pid_i)
+            self.lambda_dual.fill_(pid_output)
         self.last_dual_prob = window_prob
 
     # ============================================================ 辅助 (与模板同语义) ============================================================
@@ -1229,6 +1244,8 @@ class DQCACBetaGPU(VecAgentBase):
             'dual/pid_effective_leak': self.last_pid_effective_leak,
             'dual/pid_delta': self.last_pid_delta,
             'dual/pid_actual_delta': self.last_pid_actual_delta,
+            'dual/pid_proportional': self.last_pid_proportional,
+            'dual/pid_output': self.last_pid_output,
             'dual/pid_i': self.pid_i,
             'dual/window_size': float(len(self.empirical_cost_window)),
             'dual/sum_norm_enabled': float(self.sum_norm),

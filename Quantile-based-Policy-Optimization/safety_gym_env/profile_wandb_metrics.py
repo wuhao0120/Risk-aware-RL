@@ -46,6 +46,8 @@ KEY_METRICS: Tuple[str, ...] = (
     "dual/pid_effective_leak",
     "dual/pid_delta",
     "dual/pid_actual_delta",
+    "dual/pid_proportional",
+    "dual/pid_output",
     "advantage/mean_adv_std",
     "advantage/risk_adv_std",
     "norm/return_sigma_ema",

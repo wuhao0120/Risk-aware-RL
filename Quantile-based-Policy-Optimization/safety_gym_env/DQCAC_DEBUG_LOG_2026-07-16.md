@@ -422,3 +422,14 @@
 - 新增默认兼容的 bounded leaky-I：`pid_integral_leak`、`pid_deadband`、`pid_delta_max`、`pid_reference_episodes`。默认 `1/0/inf/0` 精确复现旧 `lambda<-clip(lambda+Ki*error)`。
 - episode scaling 使用几何积分和：常值误差下，一次 B=20 update 与两次 B=10 update 数值相同；手算断言覆盖 legacy exact、episode-scale exact 和 deadband。持久化 smoke `DQCAC_DynamicButton_smoke_leaky_pid_s0` 训练 `6.0s`、exit code 0。
 - 首条 constrained 门控采用 C20+MC、recurrent actor、`beta=.995,sum_norm=true,outage PID`，并设 `Ki=.1,leak=.97,deadband=.02,delta_max=.05,reference=10`。这是 P-B1，不覆盖 E9 legacy-I；若 outage 偏高，路线是 leak=.98/Ki=.15；若过保守，路线是 leak=.95 或更大 deadband。
+
+
+### E18：P-B1 纯 leaky-I 结果与 P-B2 PI
+
+- P-B1：job `DQCAC_DynamicButton_recur_mc_c20_leakpid097_300k_s0`，W&B `9pxv0bmd`，启动 commit `02efba9`，训练 `158.2s`、exit code 0；配置为 C20+MC+recurrent、`beta=.995,sum_norm=true,Ki=.1,leak=.97,deadband=.02,delta_max=.05,reference=10,Kp=0`。
+- 控制启动过晚：170k 以前 lambda=0；200k/250k/300k 约为 `0.012/0.056/0.130`，同期 batch outage 多为 `0.3～0.7`。130 条终评 reward `1.332`、outage `0.462`，明确不可行。
+- 终评 critic CDF `0.295` 对 truth `0.462`（bias `-0.167`），pred mean cost `12.85` 对 truth `16.92`。C20+MC 在高 cost 策略分布上仍低估，后续 C-H1 必须保留。
+- P-B1 证明 leak 解决过保守不等于闭环合格；纯 I + 100 episode 窗口在 300k 内响应太慢。它作为负消融保留，不通过 seed/长预算扩展门。
+- P-B2 新增 `pid_Kp`，默认 0 精确保持旧 bounded-I。PI 输出为 `lambda=clip(I_state+Kp*filtered_error)`；P 项随当前窗口 error 立即出现/撤回，leaky-I 只消除稳态误差。
+- 手算断言覆盖 Kp=0 legacy、Kp=1 和 lambda 下界；持久化 smoke `DQCAC_DynamicButton_smoke_pi_kp1_s0` 用 `cost_limit=0` 强制正误差，实际得到 `lambda=0.7999`，训练/评估 exit code 0。
+- P-B2 保持 P-B1 所有参数，只设 `Kp=1`。按 P-B1 末 error 约 0.23 推算 lambda 会从 I≈0.13 立即升到约 0.34；若仍偏弱，后续路线是 Kp=2 或 window=50，二者不在同一 run 同时改变。
