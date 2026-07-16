@@ -800,3 +800,14 @@
 - 结论：停止recent-s0 replay的coef/replay小网格，不把它放入PID闭环跑1M。100k在这里不是用来评价最终策略，而是固定策略下提供5批独立数据刷新和100次cost-critic更新，直接检验该局部作用链；继续长跑缺乏晋级证据。
 - 对“短跑会不会误杀慢热组合”的统一规则：100k只否决确定性bug或可直接观测且不过门的局部机制；策略/dual/LSTM组合不能据此作长期结论，至少给300k趋势窗，仍在改善则续到600k/1M。P-M1的520条复评`0.776/0.248→0.814/0.225→0.632/0.244`已经证明中期可改善、后期又回退；因此候选看多个checkpoint而非单个终点，最终至少3 seeds，并与QCPO_refs对齐相同环境步数。
 - 完整history与对齐图：`_runs/wandb_export/dqc_cs0_baseline_r1_r4_100k_2026-07-16/`、`_runs/profiles/dqc_cs0_baseline_r1_r4_100k_2026-07-16/`。
+
+
+### E56：C-S0B统计功效修正与冻结高风险策略校准预注册（2026-07-16）
+
+- 用户质疑100k是否过短后复核事件数：C-S0A五个B20 rollout的outage为`0/0/0/0/0.05`，即前80k没有任何超限轨迹，最后一批仅1条；最终140条truth也只有`0.05`。因此E55能否定“早期低风险分布上已有泛化收益”，但不能外推为接近约束边界时永久无效。
+- 为避免重新跑1M等待策略进入风险区，新增默认关闭的`--critic_calibration_from`。它只恢复成熟checkpoint的actor、recurrent actor RMS和raw critic observation RMS；cost/reward critic与optimizer重新初始化，lambda/PID/runtime不恢复，并强制actor、dual及两套RMS冻结。
+- 不同critic架构构造会消耗不同随机数，因此所有Module构造和policy-only恢复后再次设置Python/NumPy/Torch/CUDA seed。这样同rollout seed的baseline/候选使用相同环境布局、动作噪声和真实cost轨迹。
+- 两个持久化smoke均exit0：旧eval-only回归通过；校准模式完成rollout、MC QR和评估，日志明确`actor_updates/iter=0,policy_frozen=True,obs_stats_frozen=True`。训练后actor（含内部RMS）与raw obs normalizer相对源checkpoint逐tensor exact，源cost critic未加载。
+- C-S0B使用P-M3 seed1的1M final actor（原520条outage `0.3058`）作为相关高风险策略，另用rollout seed101。baseline与`coef=.25,replay4`各跑5×B20×T1000=100k、20 critic updates/rollout、140条配对终评；预计每条纯训练约45～60秒、含评估约1.5～2分钟，持久化后台串行。
+- 统计功效门：100条训练轨迹至少出现10次超限，否则不作负结论，改为增加冻结数据量；在事件充分时，候选须使最后三批prequential CDF error/Brier至少改善20%，且独立终评CDF absolute error或mean-cost relative error至少改善25%。只改善post同批仍判为记忆，不晋级。
+- 若C-S0B仍无pre/final信号，才停止simple replay coef网格并转direct exceedance classifier、bootstrap ensemble/upper-confidence CDF或cross-fit early stopping；若通过，再给冻结critic 300k确认，之后才放回PID闭环。

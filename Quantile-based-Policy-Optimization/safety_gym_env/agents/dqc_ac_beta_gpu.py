@@ -193,8 +193,13 @@ class DQCACBetaGPU(VecAgentBase):
         self.num_action_samples = max(1, int(getattr(args, 'num_action_samples', 4)))
         self.updates_per_episode = max(1, int(getattr(args, 'updates_per_episode', 10)))
         # critic/value 可复用同一 rollout 多次；非 PPO actor 必须保持 1 次严格 on-policy 更新。
-        self.actor_updates_per_episode = max(
-            1, int(getattr(args, 'actor_updates_per_episode', 1)))
+        # checkpoint critic-calibration 显式允许0次policy update；默认路径仍把用户
+        # 输入下限夹到1，保持历史训练语义。独立freeze flag还会同时禁止dual更新。
+        self.freeze_policy_updates = bool(
+            getattr(args, 'freeze_policy_updates', False))
+        requested_actor_updates = int(getattr(args, 'actor_updates_per_episode', 1))
+        self.actor_updates_per_episode = (
+            0 if self.freeze_policy_updates else max(1, requested_actor_updates))
         if self.actor_updates_per_episode > self.updates_per_episode:
             raise ValueError("actor_updates_per_episode cannot exceed updates_per_episode")
         self.advantage_norm = getattr(args, 'advantage_norm', 'qcpo')
@@ -491,7 +496,8 @@ class DQCACBetaGPU(VecAgentBase):
               f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}"
               f"/target{self.pid_target_prob:g}, "
-              f"sum_norm={self.sum_norm}, "
+              f"sum_norm={self.sum_norm}, policy_frozen={self.freeze_policy_updates}, "
+              f"obs_stats_frozen={self.freeze_observation_stats}, "
               f"device={self.device}")
 
         for it in range(self.num_iterations):
@@ -524,7 +530,8 @@ class DQCACBetaGPU(VecAgentBase):
 
             # 经验 PID 不依赖尚未校准的 critic，并在 actor epochs 前更新，逐位对齐 QCPO_refs 时序。
             dual_updated = False
-            if (not in_warmup and self.dual_update_mode == 'empirical_pid'
+            if (not self.freeze_policy_updates and not in_warmup
+                    and self.dual_update_mode == 'empirical_pid'
                     and it % self.outer_interval == 0):
                 self.update_dual(batch)
                 dual_updated = True
@@ -538,7 +545,8 @@ class DQCACBetaGPU(VecAgentBase):
                 # value 每个 epoch 拟合同一批冻结 λ-return，actor 复用冻结 advantage。
                 if self.reward_actor_mode != 'distributional' and not self.recurrent_policy:
                     critic_info.update(self.update_reward_value(batch))
-                if not in_warmup and update_idx < self.actor_updates_per_episode:
+                if (not self.freeze_policy_updates and not in_warmup
+                        and update_idx < self.actor_updates_per_episode):
                     actor_info = self.update_actor(batch)
                     actor_updated = True                       # scheduler 只能跟随真实 optimizer.step()
                 if self.learning_steps % self.target_update_interval == 0:
@@ -546,7 +554,8 @@ class DQCACBetaGPU(VecAgentBase):
                 self.learning_steps += 1
 
             # 旧 critic_adam 路径保留 actor 后更新时序，保证历史实验可复现。
-            if (not in_warmup and self.dual_update_mode == 'critic_adam'
+            if (not self.freeze_policy_updates and not in_warmup
+                    and self.dual_update_mode == 'critic_adam'
                     and it % self.outer_interval == 0):
                 self.update_dual(batch)
                 dual_updated = True                            # warmup 时不推进 λ 的学习率时间轴
@@ -558,7 +567,8 @@ class DQCACBetaGPU(VecAgentBase):
 
             # recurrent policy 的 augmented-observation moments 必须在所有 PPO epoch
             # 完成后再合并；否则固定 old_logπ 与 current logπ 会使用不同输入变换。
-            if self.recurrent_policy and self.normalize_observation:
+            if (self.recurrent_policy and self.normalize_observation
+                    and not self.freeze_observation_stats):
                 self.actor.update_obs_rms(batch['actor_obs'])
 
             # ===== 4. 日志 + 调度 =====
@@ -805,7 +815,7 @@ class DQCACBetaGPU(VecAgentBase):
         keep_logp = self.reward_actor_mode == 'gae_ppo'
         roll = self._rollout_core(keep_logp=keep_logp)        # S,A,R,C,S2_last,(可选 logp)
         Smat, Amat, Rmat, Cmat = roll['S'], roll['A'], roll['R'], roll['C']
-        if self.normalize_observation:
+        if self.normalize_observation and not self.freeze_observation_stats:
             # 采样期间 moments 冻结；整段完成后一次合并，随后 actor/value/critic 共用新统计。
             self.obs_normalizer.update(Smat)
 
@@ -2268,6 +2278,8 @@ class DQCACBetaGPU(VecAgentBase):
             'quantile_target_reduction': self.quantile_target_reduction,
             'quantile_loss_reference_samples': self.quantile_loss_reference_samples,
             'actor_updates_per_episode': self.actor_updates_per_episode,
+            'freeze_policy_updates': self.freeze_policy_updates,
+            'freeze_observation_stats': self.freeze_observation_stats,
             'num_envs': self.num_envs,
             'num_iterations': self.num_iterations,
         }

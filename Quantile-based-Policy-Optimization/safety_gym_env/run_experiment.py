@@ -107,6 +107,9 @@ def base_args(algo, seed, device, env_key):
     # 由 DQCAC 在对应 rollout 的任何参数更新前保存评估快照。
     a.checkpoint_dir = None
     a.checkpoint_interval = 0
+    # 仅在 --critic_calibration_from 中强制打开；默认训练继续更新观测moments。
+    a.freeze_observation_stats = False
+    a.freeze_policy_updates = False
 
     if algo == 'QCPO':
         # MC 轨迹级约束版。safety-gym 观测信息量足 → θ 默认 adam (非 portfolio 噪声特征情形)。
@@ -338,27 +341,38 @@ def main():
     parser.add_argument(
         '--eval_only', type=str, default=None,
         help="加载 safety-gym-eval-checkpoint-v1 并跳过训练；algo/env/seed/结构取自快照")
+    parser.add_argument(
+        '--critic_calibration_from', type=str, default=None,
+        help="只恢复DQCAC actor/观测统计并冻结策略，重新初始化critic后继续采样训练")
     parser.add_argument('--set', nargs='*', default=[], metavar='K=V', help="覆盖任意超参")
     cli = parser.parse_args()
 
     # eval-only 先读轻量元数据，再构造同形 agent。文件由本仓库原子保存，
     # weights_only=False 是因为 payload 还包含配置与标量字典，不只有 tensor。
+    if cli.eval_only is not None and cli.critic_calibration_from is not None:
+        raise ValueError("--eval_only and --critic_calibration_from are mutually exclusive")
     checkpoint_payload = None
-    if cli.eval_only is not None:
+    checkpoint_path = cli.eval_only or cli.critic_calibration_from
+    is_eval_only = cli.eval_only is not None
+    is_critic_calibration = cli.critic_calibration_from is not None
+    if checkpoint_path is not None:
         checkpoint_payload = torch.load(
-            os.path.abspath(cli.eval_only), map_location='cpu', weights_only=False)
+            os.path.abspath(checkpoint_path), map_location='cpu', weights_only=False)
         if checkpoint_payload.get('format') != 'safety-gym-eval-checkpoint-v1':
             raise ValueError(
                 f"unsupported eval checkpoint: {checkpoint_payload.get('format')!r}")
         cli.algo = str(checkpoint_payload['algo'])
         cli.env = str(checkpoint_payload['env'])
-        cli.seed = int(checkpoint_payload['seed'])
+        # eval-only必须复原原seed；critic calibration则保留CLI seed，让新环境布局
+        # 与源训练独立，同时baseline/候选仍可用同seed做common-random-number配对。
+        if is_eval_only:
+            cli.seed = int(checkpoint_payload['seed'])
         if cli.algo not in {'QCPO', 'DQCAC', 'QCPO_REF'}:
             raise ValueError(f"unsupported checkpoint algo: {cli.algo!r}")
         if cli.env not in PAPER_ENVS:
             raise ValueError(f"unsupported checkpoint env: {cli.env!r}")
         # 独立复评默认不创建同名线上 run；用户显式传 online/offline 时仍尊重。
-        if cli.wandb_mode is None:
+        if is_eval_only and cli.wandb_mode is None:
             cli.wandb_mode = 'disabled'
 
     if cli.wandb_mode:
@@ -381,10 +395,11 @@ def main():
         args.algo_name = cli.algo
         args.env_name = cli.env
         args.env_id = PAPER_ENVS[cli.env]['env_id']
-        args.checkpoint_dir = None
-        args.checkpoint_interval = 0
-        previous_name = str(getattr(args, 'wandb_name', cli.algo))
-        args.wandb_name = f"{previous_name}_eval_{cli.tag}"
+        if is_eval_only:
+            args.checkpoint_dir = None
+            args.checkpoint_interval = 0
+            previous_name = str(getattr(args, 'wandb_name', cli.algo))
+            args.wandb_name = f"{previous_name}_eval_{cli.tag}"
 
     overrides = {}
     for kv in cli.set:
@@ -394,6 +409,21 @@ def main():
     # theta_lr0 便捷覆盖 (按最终 theta_b/c 重算 theta_a)
     if 'theta_lr0' in overrides:
         args.theta_a = (args.theta_b ** args.theta_c) * float(overrides['theta_lr0'])
+
+    if is_critic_calibration:
+        if cli.algo != 'DQCAC':
+            raise ValueError("--critic_calibration_from currently supports DQCAC only")
+        # 这是critic数据/目标实验，不是策略续训。actor epoch设0，整个预算保持
+        # warmup令两条dual路径都不更新；lambda新初始化为0，不从源快照恢复。
+        args.actor_updates_per_episode = 0
+        args.warmup_iters = max(
+            int(args.num_iterations), int(getattr(args, 'warmup_iters', 0)))
+        args.lambda_max = 0.0
+        args.freeze_observation_stats = True
+        args.freeze_policy_updates = True
+        args.calibration_source_checkpoint = os.path.abspath(checkpoint_path)
+        args.calibration_source_phase = str(checkpoint_payload.get('phase'))
+        args.calibration_source_env_steps = int(checkpoint_payload.get('env_steps', 0))
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -418,7 +448,19 @@ def main():
     t0 = time.time()
     agent = AgentCls(args, env)
     saved_checkpoint_path = None
-    if checkpoint_payload is None:
+    if not is_eval_only:
+        if is_critic_calibration:
+            # critic/target保持本run新初始化，只恢复成熟behavior policy和输入坐标系。
+            agent.load_policy_calibration_checkpoint(checkpoint_payload)
+            # 不同cost架构的参数shape会消耗不同数量的初始化随机数。这里在所有Module
+            # 构造/恢复后重置host与CUDA RNG，使冻结策略的动作噪声跨候选严格配对。
+            random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(args.seed)
+            print(
+                f"\ncritic_calibration_from={os.path.abspath(checkpoint_path)} "
+                f"source_phase={checkpoint_payload.get('phase')} "
+                f"source_step={checkpoint_payload.get('env_steps')} rollout_seed={args.seed}")
         agent.train()
         train_t = time.time() - t0
         print(f"\ntrain_time {train_t:.1f}s")
@@ -489,7 +531,7 @@ def main():
         run.log(eval_log)
         try:
             run.summary['eval/constraint_ok'] = bool(ok)
-            if checkpoint_payload is None:
+            if not is_eval_only:
                 total_env_steps = (
                     int(args.num_envs) * int(args.num_iterations) * int(args.horizon))
             else:
@@ -504,7 +546,10 @@ def main():
         'overrides': {k: str(v) for k, v in overrides.items()},
         'train_seconds': train_t, 'eval': res, 'summary': summary,
         'checkpoint_loaded': (
-            os.path.abspath(cli.eval_only) if cli.eval_only is not None else None),
+            os.path.abspath(checkpoint_path) if checkpoint_path is not None else None),
+        'checkpoint_load_mode': (
+            'eval_only' if is_eval_only else
+            ('critic_calibration_policy_only' if is_critic_calibration else None)),
         'checkpoint_phase': (
             checkpoint_payload.get('phase') if checkpoint_payload is not None else None),
         'checkpoint_env_steps': (

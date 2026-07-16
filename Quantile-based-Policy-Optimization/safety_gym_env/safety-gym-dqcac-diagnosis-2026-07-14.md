@@ -1277,3 +1277,12 @@ K16在300–600k有真实的阶段性收益：K4→K16使训练outage `0.237→0
 这不能推广成“100k足以评价所有算法组合”。本实验在100k内已有5个新rollout批次和100个cost-critic optimizer steps，且被测变量的直接输出就是holdout calibration，所以足以否决这项局部机制。相反，actor、PID、LSTM和distributional critic构成慢闭环；P-M1从300k到600k确实由`reward/outage=0.776/0.248`改善到`0.814/0.225`，随后1M又退到`0.632/0.244`。这既证明早期false negative真实存在，也证明盲目延长不能保证最终变好。
 
 后续执行分层预算：100k只做bug、尺度和局部因果screen；策略组合至少300k，若末段仍有方向性改善则续到600k/1M；若多个checkpoint重复极限环或独立holdout不过门才停止；主候选至少3 seeds，最终与QCPO_refs同环境步数比较。140条评估只screen，边界候选用至少520条确认。完整数据和图保存在`_runs/wandb_export/dqc_cs0_baseline_r1_r4_100k_2026-07-16/`与`_runs/profiles/dqc_cs0_baseline_r1_r4_100k_2026-07-16/`。
+
+
+### 13.45 对C-S0A负结论的统计功效修正（2026-07-16）
+
+用户指出短跑可能因初始化或早期阶段产生false negative。复核后，C-S0A的五批训练outage其实是`0,0,0,0,0.05`，总共100条轨迹只有最后一批1条超限；140条终评truth也只有0.05。这组配对数据足以证明simple replay在早期低风险分布上只改善同批拟合，却不足以排除它在outage约0.2～0.3时的作用。E55的停止结论因此收窄到该早期数据分布，不能写成算法族的长期否定。
+
+新增`--critic_calibration_from`提供更干净且便宜的补测：从P-M3 seed1的1M checkpoint只恢复actor和两套归一化统计，critic从同seed重新初始化，actor/dual/RMS显式冻结；模块构造后重置采样RNG，使不同critic候选看到相同轨迹。smoke确认训练后actor与RMS逐tensor exact、actor update数为0、源cost critic没有加载。
+
+正式C-S0B用该成熟高风险策略和独立rollout seed101比较baseline与`coef=.25,replay4`，先各100k。只有训练超限事件至少10个时才允许作负结论；通过条件仍要求最后三批prequential误差改善20%且独立终评CDF或mean误差改善25%。这不是给所有失败组合无条件增加预算，而是在发现原screen缺乏tail事件后，用冻结相关分布恢复检验功效。

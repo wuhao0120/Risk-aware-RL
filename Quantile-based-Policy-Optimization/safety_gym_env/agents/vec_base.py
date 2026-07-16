@@ -88,6 +88,11 @@ class VecAgentBase(object):
         self._log_2pi = float(np.log(2.0 * np.pi))            # 高斯 logπ 常量项
         # 可选 QCPO_refs 风格的逐维观测归一化；默认关闭，保证旧实验可精确复现。
         self.normalize_observation = bool(getattr(args, 'normalize_observation', False))
+        # 冻结模式只用于从成熟策略checkpoint重新采样、校准新critic。默认False时
+        # 完全保持历史训练路径；True时仍使用已恢复moments做前向，但禁止新rollout
+        # 改写统计量，否则所谓“冻结策略”会因输入变换漂移而并不真正冻结。
+        self.freeze_observation_stats = bool(
+            getattr(args, 'freeze_observation_stats', False))
         self.obs_norm_var_clip = float(getattr(args, 'obs_norm_var_clip', 1e-6))
         self.obs_norm_clip = float(getattr(args, 'obs_norm_clip', 10.0))
         self.obs_norm_warmup_iters = max(
@@ -251,6 +256,45 @@ class VecAgentBase(object):
             f"[checkpoint] loaded phase={payload.get('phase')} "
             f"step={payload.get('env_steps')} algo={payload.get('algo')} "
             f"env={payload.get('env')}")
+        return payload
+
+    def load_policy_calibration_checkpoint(self, checkpoint):
+        """
+        只恢复产生行为数据所需的actor与observation preprocessing。
+
+        该接口服务于冻结策略的critic校准：critic/target/optimizer、lambda/PID和
+        runtime都必须保持新agent的初始状态，避免把源run的critic误当成本轮方法
+        的起点。recurrent actor自己的obs_rms包含在actor state_dict中；raw cost
+        critic使用的独立obs_normalizer也一并恢复，确保输入坐标系与成熟策略一致。
+        """
+        if isinstance(checkpoint, (str, os.PathLike)):
+            payload = torch.load(
+                os.fspath(checkpoint), map_location='cpu', weights_only=False)
+        else:
+            payload = checkpoint
+        if payload.get('format') != 'safety-gym-eval-checkpoint-v1':
+            raise ValueError(f"unsupported checkpoint format: {payload.get('format')!r}")
+        if str(payload.get('algo')) != str(self.algo_name):
+            raise ValueError(
+                f"checkpoint algo={payload.get('algo')!r} != agent algo={self.algo_name!r}")
+        if str(payload.get('env')) != str(self.env_name):
+            raise ValueError(
+                f"checkpoint env={payload.get('env')!r} != agent env={self.env_name!r}")
+
+        saved_modules = payload.get('modules', {})
+        restored = []
+        for name in ('actor', 'obs_normalizer'):
+            module = getattr(self, name, None)
+            state = saved_modules.get(name)
+            if not isinstance(module, nn.Module) or state is None:
+                raise KeyError(f"checkpoint calibration module {name!r} is unavailable")
+            module.load_state_dict(state, strict=True)
+            restored.append(name)
+
+        print(
+            f"[checkpoint] loaded policy-only modules={restored} "
+            f"phase={payload.get('phase')} step={payload.get('env_steps')} "
+            f"algo={payload.get('algo')} env={payload.get('env')}")
         return payload
 
     def _maybe_save_rollout_checkpoint(self, iteration, batch):
