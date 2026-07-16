@@ -81,3 +81,48 @@ class DistributionalCritic(nn.Module):
         """
         x = torch.cat([state, action], dim=-1)              # 在最后一维拼接 → [B, sd+ad]
         return self.net(x)                                  # → [B, N]
+
+
+class ScalarValueCritic(nn.Module):
+    """
+    状态价值网络 V(s)，专供 DQCAC 的 reward GAE/PPO 可选主干使用。
+
+    为什么不直接复用 DistributionalCritic:
+        - GAE 需要低方差的 V(s)，而不是用少量动作采样近似 E_a[mean ψ(s,a)]；
+        - V(s) 不接动作，避免 Q(s,a)-E_a Q(s,a) 两个相近估计相减后的 critic/采样噪声；
+        - cost 约束仍由原 distributional critic 负责，所以该网络不改变风险分布建模。
+    """
+
+    def __init__(self, state_dim, hidden=None):
+        """
+        Args:
+            state_dim: 原始观测维度；当前 Safety-Gym 为 60 或 76。
+            hidden:    隐藏层宽度列表；None 时使用 [256, 256]。
+
+        输出:
+            任意前缀形状 `[..., state_dim]` → `[...]` 的标量状态价值。
+        """
+        super().__init__()
+        hidden = [256, 256] if hidden is None else list(hidden)
+        dims = [state_dim] + hidden
+        layers = []
+
+        # 与 actor 的平滑 Tanh 主干保持相近表达能力，减少“网络容量不同”这个额外变量。
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(nn.Tanh())
+        layers.append(nn.Linear(dims[-1], 1))                 # V(s) 只有一个标量输出
+        self.net = nn.Sequential(*layers)
+
+        # 隐藏层 gain=1；输出层用较小 gain，令初始 V≈0，避免首批 GAE 被随机大偏置支配。
+        linear_layers = [module for module in self.modules() if isinstance(module, nn.Linear)]
+        for module in linear_layers:
+            nn.init.orthogonal_(module.weight, gain=1.0)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
+        nn.init.orthogonal_(linear_layers[-1].weight, gain=0.01)
+
+    def forward(self, state):
+        """调用 MLP 并移除末尾长度为 1 的 value 维度。"""
+
+        return self.net(state).squeeze(-1)

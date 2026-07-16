@@ -34,13 +34,17 @@ fi
 
 # ===== 2. 建立实验管理目录；训练产物仍由 run_experiment.py 写入 _runs =====
 base_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" # safety_gym_env 绝对路径
+storage_root="$(cd "$base_dir/../../.." && pwd)"          # /vepfs 用户目录，不占 20G 根分区
+scratch_dir="${SAFETY_GYM_TMPDIR:-$storage_root/.tmp/safety_gym_env}"
+wandb_cache_dir="$scratch_dir/wandb-cache"
+mpl_config_dir="$scratch_dir/matplotlib"
 job_dir="$base_dir/_runs/jobs/$job_name"                   # 本 job 的控制面文件目录
 log_dir="$base_dir/_runs/logs"                             # 与 W&B 导出脚本约定一致
 log_file="$log_dir/$job_name.log"                          # stdout/stderr 完整日志
 pid_file="$job_dir/pid"                                    # nohup/setsid 外层进程 PID
 run_script="$job_dir/run.sh"                               # %q 序列化后的实际运行脚本
 
-mkdir -p "$job_dir" "$log_dir"
+mkdir -p "$job_dir" "$log_dir" "$scratch_dir" "$wandb_cache_dir" "$mpl_config_dir"
 
 # 已有 live PID 时拒绝复用名称；空文件或已退出 PID 视为 stale，可安全覆盖控制面文件。
 if [[ -s "$pid_file" ]]; then
@@ -56,6 +60,7 @@ fi
     printf '#!/usr/bin/env bash\n'
     printf 'set +e\n'                                        # 即使训练失败也必须写 exit_code
     printf 'cd %q\n' "$base_dir"
+    printf 'export TMPDIR=%q WANDB_CACHE_DIR=%q MPLCONFIGDIR=%q\n' "$scratch_dir" "$wandb_cache_dir" "$mpl_config_dir"
     printf '/usr/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ > %q\n' "$job_dir/worker_started_at"
     printf '%q ' "$@"                                       # 每个 argv 用 Bash %q 转义，保留参数边界
     printf '\n'

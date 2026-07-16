@@ -148,6 +148,13 @@ def base_args(algo, seed, device, env_key):
         a.entropy_coef = 0.0
         a.actor_grad_clip = 100.0
         a.critic_grad_clip = 10.0
+        # reward actor 主干消融：默认保持旧 distributional；实验按 gae → gae_ppo 逐项打开。
+        a.reward_actor_mode = 'distributional'
+        a.gae_lambda = 0.97
+        a.reward_advantage_norm = False                 # QCPO_refs 默认不标准化 reward advantage
+        a.ppo_ratio_clip = 0.1
+        a.reward_value_lr = 3e-4
+        a.reward_value_grad_clip = 10.0
     elif algo == 'QCPO_REF':
         # NIPS'22 QCPO 移植版 (config_qcpo.py / launch_qcpo.py 论文缺省超参)。
         a.ref_lr = 1e-4

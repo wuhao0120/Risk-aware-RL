@@ -5,13 +5,13 @@ DQCACBetaGPU (safety_gym_env · CMDP 版) —— 用户 DQC-AC-β 迁移到 safe
 算法逐式对齐 portfolio_env_inf/agents/dqc_ac_beta_gpu.py (已验证的 per-transition DQCAC),
 核心三机制不变, 仅按 CMDP【双回报流】扩展 + 约束翻为【上尾 cost】:
     优化问题:  max_θ E[R]  s.t.  P_θ(C ≥ d) ≤ ω
-    Critic:    【两个】QR 分布式 critic (都 QR-TD, target 软更新, 1-step bootstrap, 截断恒 bootstrap):
-                 reward_critic ψ^r(s,a) → 目标均值优势 Q̂_m=mean(ψ^r)
-                 cost_critic   ψ^c(s,a) → 约束【上尾】CDF Ψ̂(s,a,b)=(1/N)Σ𝟙{ψ^c_i ≥ b}
-    Actor:     per-transition 权重 w = γ^t·Â_m - λ·β^t·Â_c
-                 Â_m = Q̂_m - V̂_m         (reward 均值优势)
-                 Â_c = Ψ̂(s,a,b) - V̂_c    (cost 局部上尾 CDF 优势)
-               budget 在【cost】上递推: b_0=d, b_{t+1}=(b_t - c_t)/γc  (对应论文 remain_discounted_cost)
+    Critic:    reward/cost 两个 QR 分布式 critic (QR N-step TD + target 软更新):
+                 reward_critic ψ^r(s,a) → 默认 reward 均值优势 Q̂_m=mean(ψ^r)
+                 cost_critic   ψ^c(s,a) → 约束上尾 CDF Ψ̂(s,a,b)=(1/N)Σ𝟙{ψ^c_i ≥ b}
+    Actor:     默认 distributional: w = γ^t·(Q̂_m-V̂_m) - λ·β^t·(Ψ̂-V̂_c)
+               可选 gae: scalar V_r(s,t)+冻结 GAE λ-return，替换低信噪比 reward Q 优势
+               可选 gae_ppo: 在 GAE 上再使用 old-logπ ratio 与 PPO clip 多 epoch 更新
+               cost budget 始终递推 b_0=d, b_{t+1}=(b_t-c_t)/γc
     Dual:      λ ← [λ + ε_k·(Ĝ - ω)]_+,  Ĝ = cost_critic 在 (s0,a0) 估计的 P(C≥d) (上尾, 同源信号)
     归一化:    advantage_norm='qcpo' → 跨迭代 EMA σ_R (reward 回报) / σ_c (cost 约束优势)
 
@@ -35,7 +35,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from utils import RunningMeanStd
 from .vec_base import VecAgentBase
-from .common import DistributionalCritic, lr_lambda, indicator_ge
+from .common import DistributionalCritic, ScalarValueCritic, lr_lambda, indicator_ge
 
 
 class DQCACBetaGPU(VecAgentBase):
@@ -66,6 +66,21 @@ class DQCACBetaGPU(VecAgentBase):
         self.lambda_min = getattr(args, 'lambda_min', 0.0)
         self.critic_grad_clip = getattr(args, 'critic_grad_clip', 10.0)
         self.actor_grad_clip = getattr(args, 'actor_grad_clip', 100.0)
+
+        # reward actor 主干做成显式消融开关，默认 distributional 完全复现旧实现。
+        # - distributional: Q_r(s,a)-E_a Q_r(s,a)，即排查前 DQCACBeta；
+        # - gae:            标量 V_r(s)+GAE，但仍用单次 logπ policy-gradient；
+        # - gae_ppo:        同一 GAE，再加 old-logπ ratio 与 PPO clip 多 epoch 更新。
+        self.reward_actor_mode = str(getattr(args, 'reward_actor_mode', 'distributional')).lower()
+        valid_reward_modes = {'distributional', 'gae', 'gae_ppo'}
+        if self.reward_actor_mode not in valid_reward_modes:
+            raise ValueError(f"reward_actor_mode must be one of {sorted(valid_reward_modes)}, "
+                             f"got {self.reward_actor_mode!r}")
+        self.gae_lambda = float(getattr(args, 'gae_lambda', 0.97))
+        self.reward_advantage_norm = bool(getattr(args, 'reward_advantage_norm', False))
+        self.ppo_ratio_clip = float(getattr(args, 'ppo_ratio_clip', 0.1))
+        self.reward_value_lr = float(getattr(args, 'reward_value_lr', 3e-4))
+        self.reward_value_grad_clip = float(getattr(args, 'reward_value_grad_clip', 10.0))
 
         # qcpo 归一化配方: σ_R (reward 回报尺度) / σ_c (cost 约束优势尺度) + warmup
         self.norm_ema_decay = float(getattr(args, 'norm_ema_decay', 0.1))
@@ -107,6 +122,15 @@ class DQCACBetaGPU(VecAgentBase):
             list(self.reward_critic.parameters()) + list(self.cost_critic.parameters()),
             getattr(args, 'critic_lr', 1e-3), eps=1e-5)
 
+        # GAE/PPO 模式额外维护 V_r(s)。cost critic、budget 与 dual 均保持原实现，
+        # 因此短实验只替换 reward advantage 来源，不偷偷改风险约束链路。
+        self.reward_value = None
+        self.reward_value_optimizer = None
+        if self.reward_actor_mode != 'distributional':
+            self.reward_value = ScalarValueCritic(cdim, hidden=list(hidden)).to(self.device)
+            self.reward_value_optimizer = Adam(
+                self.reward_value.parameters(), self.reward_value_lr, eps=1e-5)
+
         # -------------------- 拉格朗日乘子 λ --------------------
         self.lambda_dual = torch.tensor([0.0], dtype=torch.float32,
                                         device=self.device, requires_grad=True)
@@ -128,7 +152,8 @@ class DQCACBetaGPU(VecAgentBase):
         print(f"DQCACBetaGPU[CMDP]: env={self.env_name}, beta={self.beta}, omega={self.q_alpha}, "
               f"d(cost_limit)={self.cost_limit}, cost_gamma={self.cost_gamma}, episodic={self.episodic}, "
               f"step_feature={self.critic_step_feature}, N={self.num_quantiles}, B={self.num_envs}, T={self.n}, "
-              f"iters={self.num_iterations}, updates/iter={self.updates_per_episode}, device={self.device}")
+              f"iters={self.num_iterations}, updates/iter={self.updates_per_episode}, "
+              f"reward_actor={self.reward_actor_mode}, device={self.device}")
 
         for it in range(self.num_iterations):
             # ===== 1. 采样 + DQCAC 专属后处理 (cost budget / n-step / d,e) =====
@@ -137,12 +162,19 @@ class DQCACBetaGPU(VecAgentBase):
             # ===== 1b. qcpo: 刷新 EMA 归一化器 (σ_R / σ_c) =====
             if self.advantage_norm == 'qcpo':
                 self._update_norm_stats(batch)
+            # GAE 与 value target 每个 rollout 固定一次，供后续多个 epoch 共同使用。
+            if self.reward_actor_mode != 'distributional':
+                self._prepare_reward_gae(batch)
             in_warmup = it < self.warmup_iters
 
             # ===== 2. 内层更新 (双 critic + actor) =====
             critic_info, actor_info = {}, {}
             for _ in range(self.updates_per_episode):
                 critic_info = self.update_critic(batch)
+                # 标量 reward value 在 warmup 中也训练；actor 仍由下面的 in_warmup 控制。
+                # value 每个 epoch 拟合同一批冻结 λ-return，actor 复用冻结 advantage。
+                if self.reward_actor_mode != 'distributional':
+                    critic_info.update(self.update_reward_value(batch))
                 if not in_warmup:
                     actor_info = self.update_actor(batch)
                 if self.learning_steps % self.target_update_interval == 0:
@@ -167,7 +199,9 @@ class DQCACBetaGPU(VecAgentBase):
             d=γ^t (reward 折扣), e=β^t (Abel 风险折扣)
         """
         n, B = self.n, self.num_envs
-        roll = self._rollout_core()                           # S,A,R(reward),C(cost),S2_last
+        # PPO 必须保存采样策略的 logπ_old；其它模式不保留，节省一个 [T,B] 张量。
+        keep_logp = self.reward_actor_mode == 'gae_ppo'
+        roll = self._rollout_core(keep_logp=keep_logp)        # S,A,R,C,S2_last,(可选 logp)
         Smat, Amat, Rmat, Cmat = roll['S'], roll['A'], roll['R'], roll['C']
 
         # ---- cost budget 后处理递推: b[t+1]=(b[t]-c[t])/γc, b[0]=d ----
@@ -212,7 +246,7 @@ class DQCACBetaGPU(VecAgentBase):
         d = (self.gamma ** t_idx).unsqueeze(1).expand(n, B).reshape(n * B)
         e = (self.beta ** t_idx).unsqueeze(1).expand(n, B).reshape(n * B)
 
-        return {
+        batch = {
             'states': states, 'actions': actions, 'rewards': rewards, 'costs': costs,
             'next_states': next_states,
             'dones': torch.zeros(n * B, dtype=torch.float32, device=self.device),
@@ -226,6 +260,9 @@ class DQCACBetaGPU(VecAgentBase):
             'disc_cost': roll['disc_cost'],                   # [B] C
             'undisc_cost': roll['undisc_cost'],               # [B] Σc
         }
+        if keep_logp:
+            batch['old_log_probs'] = roll['logp'].reshape(n * B).detach()  # rollout 固定行为策略
+        return batch
 
     # ============================================================ Critic 更新 (双 QR-TD) ============================================================
     def update_critic(self, batch):
@@ -272,46 +309,171 @@ class DQCACBetaGPU(VecAgentBase):
         weight = (taus - (u.detach() < 0).float()).abs()
         return (weight * huber / self.huber_kappa).sum(dim=2).mean(dim=1).mean()
 
-    # ============================================================ Actor 更新 (与模板逐式一致, 约束换 cost 上尾) ============================================================
+    # ============================================================ 可选 reward V+GAE ============================================================
+    def _prepare_reward_gae(self, batch):
+        """
+        用 rollout 时的 V_r(s) 计算一次固定 GAE advantage/value target。
+
+        当前论文环境每段 T=1000 就是完整 episode，QCPO_refs 在最后一步设置 done=1，
+        所以这里末步 next_value=0；中间步仍用 V(s_{t+1})。target 在 PPO/GAE 的
+        多个 epoch 之间保持冻结，避免 value 网络每更新一次就移动一次监督目标。
+        """
+        if self.reward_value is None:
+            raise RuntimeError("reward GAE requested in distributional mode")
+
+        n, B = self.n, self.num_envs
+        states = batch['states']                              # [T·B, state_dim]，时间主序
+        value_states = self._aug(states, batch['steps'])         # episodic 模式追加 t/T
+        rewards = batch['rewards'].reshape(n, B)              # [T,B] 原始每步 reward
+
+        with torch.no_grad():
+            values_old = self.reward_value(value_states).reshape(n, B)
+            # episode 最后一步不 bootstrap；其它位置的 next value 来自同一轨迹下一状态。
+            next_values = torch.cat([values_old[1:], torch.zeros_like(values_old[:1])], dim=0)
+            deltas = rewards + self.gamma * next_values - values_old
+
+            gae = torch.zeros(B, dtype=torch.float32, device=self.device)
+            advantages = torch.empty_like(deltas)
+            for t in range(n - 1, -1, -1):
+                gae = deltas[t] + self.gamma * self.gae_lambda * gae
+                advantages[t] = gae
+            returns = advantages + values_old
+
+            raw_advantages = advantages.reshape(n * B)
+            actor_advantages = raw_advantages
+            if self.reward_advantage_norm:
+                adv_mean = raw_advantages.mean()
+                adv_std = raw_advantages.std(unbiased=False).clamp_min(1e-8)
+                actor_advantages = (raw_advantages - adv_mean) / adv_std
+
+            batch['_reward_advantage_raw'] = raw_advantages.detach()
+            batch['_reward_advantage'] = actor_advantages.detach()
+            batch['_reward_value_targets'] = returns.reshape(n * B).detach()
+
+    def update_reward_value(self, batch):
+        """对当前 V_r(s) 拟合本 rollout 冻结的 GAE λ-return target。"""
+        if self.reward_value is None or self.reward_value_optimizer is None:
+            raise RuntimeError("reward value update requested in distributional mode")
+        if '_reward_value_targets' not in batch:
+            raise RuntimeError("call _prepare_reward_gae(batch) before value epochs")
+
+        states = batch['states']
+        value_states = self._aug(states, batch['steps'])
+        value_targets = batch['_reward_value_targets']
+        value_pred = self.reward_value(value_states)
+        value_error = value_pred - value_targets
+        value_loss = 0.5 * value_error.pow(2).mean()
+
+        self.reward_value_optimizer.zero_grad(set_to_none=True)
+        value_loss.backward()
+        if self.reward_value_grad_clip > 0:
+            value_grad_norm = nn.utils.clip_grad_norm_(
+                self.reward_value.parameters(), self.reward_value_grad_clip)
+        else:
+            value_grad_norm = torch.zeros((), device=self.device)
+        self.reward_value_optimizer.step()
+
+        # explained variance=1-Var(target-pred)/Var(target)；target 近常数时定义为 0。
+        target_var = value_targets.var(unbiased=False)
+        explained_var = torch.where(
+            target_var > 1e-8,
+            1.0 - value_error.detach().var(unbiased=False) / target_var,
+            torch.zeros_like(target_var))
+        return {
+            'reward_value/loss': float(value_loss.item()),
+            'reward_value/explained_variance': float(explained_var.item()),
+            'reward_value/grad_norm': float(value_grad_norm.item()),
+            'reward_value/pred_mean': float(value_pred.detach().mean().item()),
+            'reward_value/target_mean': float(value_targets.mean().item()),
+        }
+
+    # ============================================================ Actor 更新 (reward 主干可消融) ============================================================
     def update_actor(self, batch):
-        """w = γ^t·Â_m - λ·β^t·Â_c;  Â_m 来自 reward critic 均值, Â_c 来自 cost critic 上尾 CDF。"""
+        """按 reward_actor_mode 选择 distributional / GAE / GAE+PPO，cost 风险优势保持一致。"""
         s, a, b = batch['states'], batch['actions'], batch['budgets']
         d, e = batch['d'], batch['e']
         steps = batch['steps']
 
-        with torch.no_grad():                                 # 优势不建图
-            psi_r = self.reward_critic(self._aug(s, steps), a)          # [n·B, N]
-            q_m = psi_r.mean(dim=1)                                     # Q̂_m (reward 均值)
-            psi_c = self.cost_critic(self._aug(s, steps), a)           # [n·B, N]
+        with torch.no_grad():
+            # cost 优势在三种 reward 模式下完全相同，仍查询 distributional cost critic。
+            psi_c = self.cost_critic(self._aug(s, steps), a)           # [T·B,N]
             psi_cdf = (psi_c >= b.unsqueeze(1)).float().mean(dim=1)    # Ψ̂(s,a,b) 上尾 CDF
-            v_m, v_c = self._estimate_baselines(s, b, steps)          # V̂_m(reward), V̂_c(cost)
+            v_m, v_c = self._estimate_baselines(
+                s, b, steps, need_reward=self.reward_actor_mode == 'distributional')
+            raw_adv_c = psi_cdf - v_c
             if self.advantage_norm == 'qcpo':
-                a_m = (q_m - v_m) / self.return_rms.std               # EMA σ_R 归一化
-                a_c = (psi_cdf - v_c) / self.constraint_rms.std       # EMA σ_c 归一化
+                a_c = raw_adv_c / self.constraint_rms.std              # EMA σ_c 归一化
             else:
-                a_m = self._maybe_norm(q_m - v_m)
-                a_c = self._maybe_norm(psi_cdf - v_c)
-            w = d * a_m - self.lambda_dual.detach() * e * a_c         # [n·B] 复合权重
+                a_c = self._maybe_norm(raw_adv_c)
+            risk_weight = e * a_c
 
-        log_probs = self._compute_log_probs(s, a)             # 对 θ 可导
-        actor_loss = -(log_probs * w).mean() \
-            - self.entropy_coef * self._entropy(s).mean()
+            if self.reward_actor_mode == 'distributional':
+                psi_r = self.reward_critic(self._aug(s, steps), a)     # [T·B,N]
+                q_m = psi_r.mean(dim=1)                                # Q̂_m (reward 均值)
+                raw_adv_m = q_m - v_m
+                if self.advantage_norm == 'qcpo':
+                    reward_weight = d * raw_adv_m / self.return_rms.std
+                else:
+                    reward_weight = d * self._maybe_norm(raw_adv_m)
+            else:
+                # 标准 episodic GAE 已通过递推包含 γ/λ，不再额外乘 γ^t；与 QCPO_refs 一致。
+                raw_adv_m = batch['_reward_advantage_raw']
+                reward_weight = batch['_reward_advantage']
+
+            lagrange = self.lambda_dual.detach()
+            combined_weight = reward_weight - lagrange * risk_weight
+
+        log_probs = self._compute_log_probs(s, a)             # 当前策略 logπθ(a|s)，对 θ 可导
+        entropy = self._entropy(s).mean()
+        ppo_info = {}
+        if self.reward_actor_mode == 'gae_ppo':
+            old_log_probs = batch['old_log_probs']            # rollout 时冻结的行为策略 logπ_old
+            log_ratio = log_probs - old_log_probs
+            ratio = torch.exp(log_ratio)
+            clipped_ratio = torch.clamp(
+                ratio, 1.0 - self.ppo_ratio_clip, 1.0 + self.ppo_ratio_clip)
+
+            # reward 用 PPO pessimistic min；cost 是要最小化的坏事件，故用 conservative max。
+            reward_surr = torch.minimum(ratio * reward_weight, clipped_ratio * reward_weight)
+            risk_surr = torch.maximum(ratio * risk_weight, clipped_ratio * risk_weight)
+            actor_loss = -reward_surr.mean() + lagrange * risk_surr.mean() \
+                - self.entropy_coef * entropy
+
+            # approx_kl 采用 Schulman 常用近似 (ratio-1)-log_ratio。
+            ppo_info = {
+                'ppo/ratio_mean': float(ratio.detach().mean().item()),
+                'ppo/ratio_std': float(ratio.detach().std(unbiased=False).item()),
+                'ppo/clip_fraction': float(
+                    ((ratio.detach() - 1.0).abs() > self.ppo_ratio_clip).float().mean().item()),
+                'ppo/approx_kl': float(((ratio.detach() - 1.0) - log_ratio.detach()).mean().item()),
+            }
+        else:
+            actor_loss = -(log_probs * combined_weight).mean() - self.entropy_coef * entropy
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         if self.actor_grad_clip and self.actor_grad_clip > 0:
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
+            actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
+        else:
+            actor_grad_norm = torch.zeros((), device=self.device)
         self.actor_optimizer.step()
 
-        raw_adv_m = q_m - v_m
-        raw_adv_c = psi_cdf - v_c
-        return {'actor/loss': float(actor_loss.item()),
-                'advantage/mean_adv_std': float(raw_adv_m.std(unbiased=False).item()),
-                'advantage/risk_adv_std': float(raw_adv_c.std(unbiased=False).item()),
-                'critic/q_mean': float(q_m.mean().item()),
-                'constraint/psi_c_mean': float(psi_cdf.mean().item()),
-                'actor/w_mean': float(w.mean().item()),
-                'actor/w_std': float(w.std(unbiased=False).item())}
+        actor_info = {
+            'actor/loss': float(actor_loss.item()),
+            'actor/grad_norm': float(actor_grad_norm.item()),
+            'actor/entropy': float(entropy.item()),
+            'advantage/mean_adv_std': float(raw_adv_m.std(unbiased=False).item()),
+            'advantage/risk_adv_std': float(raw_adv_c.std(unbiased=False).item()),
+            'constraint/psi_c_mean': float(psi_cdf.mean().item()),
+            'actor/w_mean': float(combined_weight.mean().item()),
+            'actor/w_std': float(combined_weight.std(unbiased=False).item()),
+            'debug/reward_actor_is_gae': float(self.reward_actor_mode != 'distributional'),
+            'debug/reward_actor_is_ppo': float(self.reward_actor_mode == 'gae_ppo'),
+        }
+        if self.reward_actor_mode == 'distributional':
+            actor_info['critic/q_mean'] = float(q_m.mean().item())
+        actor_info.update(ppo_info)
+        return actor_info
 
     # ============================================================ Dual 更新 (cost-critic P(C≥d) 驱动) ============================================================
     def update_dual(self, batch):
@@ -340,17 +502,24 @@ class DQCACBetaGPU(VecAgentBase):
         sf = (steps.float() / self.n).reshape(-1, 1)
         return torch.cat([states, sf], dim=1)
 
-    def _estimate_baselines(self, states, budgets, steps=None):
-        """V̂_m(s)=E_a[mean ψ^r], V̂_c(s,b)=E_a[Ψ̂ 上尾] —— K 个动作样本近似。"""
+    def _estimate_baselines(self, states, budgets, steps=None, need_reward=True):
+        """
+        用 K 个策略动作近似 V_c(s,b)，仅在 distributional reward 模式下同时近似 V_m(s)。
+
+        GAE actor 已由独立 V_r(s) 提供 reward baseline；跳过无用的 reward critic K 次前向
+        不改变 cost advantage 数值，可显著减少长 rollout 的 GPU 计算。
+        """
         b_col = budgets.unsqueeze(1)
         s_aug = self._aug(states, steps) if steps is not None else states
         q_list, c_list = [], []
         for _ in range(self.num_action_samples):
             a = self._sample_actions(states)
-            q_list.append(self.reward_critic(s_aug, a).mean(dim=1))            # reward 均值
-            c_list.append((self.cost_critic(s_aug, a) >= b_col).float().mean(dim=1))  # cost 上尾 CDF
-        return (torch.stack(q_list, dim=0).mean(dim=0),
-                torch.stack(c_list, dim=0).mean(dim=0))
+            if need_reward:
+                q_list.append(self.reward_critic(s_aug, a).mean(dim=1))          # reward 均值
+            c_list.append((self.cost_critic(s_aug, a) >= b_col).float().mean(dim=1))
+        reward_baseline = torch.stack(q_list, dim=0).mean(dim=0) if need_reward else None
+        cost_baseline = torch.stack(c_list, dim=0).mean(dim=0)
+        return reward_baseline, cost_baseline
 
     def _maybe_norm(self, x, eps=1e-8):
         """'separate': 批内标准化; 'none': 原样。"""
@@ -382,7 +551,7 @@ class DQCACBetaGPU(VecAgentBase):
             a = batch['actions']
             steps = batch['steps']
             psi_cdf = (self.cost_critic(self._aug(s, steps), a) >= b.unsqueeze(1)).float().mean(dim=1)
-            _, v_c = self._estimate_baselines(s, b, steps)
+            _, v_c = self._estimate_baselines(s, b, steps, need_reward=False)
             adv_c = psi_cdf - v_c
         self._ema_update(self.constraint_rms,
                          float(adv_c.mean().item()), float(adv_c.var(unbiased=False).item()))
@@ -448,6 +617,7 @@ class DQCACBetaGPU(VecAgentBase):
             'cdf_estimate_initial': self.last_cdf_initial,
             'dual_prob': self.last_dual_prob,
             'beta': self.beta,
+            'reward_actor_mode': self.reward_actor_mode,
             'num_envs': self.num_envs,
             'num_iterations': self.num_iterations,
         }

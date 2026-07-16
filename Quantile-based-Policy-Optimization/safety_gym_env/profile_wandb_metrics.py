@@ -47,6 +47,17 @@ KEY_METRICS: Tuple[str, ...] = (
     "actor/w_mean",
     "actor/w_std",
     "actor/loss",
+    "actor/grad_norm",
+    "actor/entropy",
+    "reward_value/loss",
+    "reward_value/explained_variance",
+    "reward_value/grad_norm",
+    "reward_value/pred_mean",
+    "reward_value/target_mean",
+    "ppo/ratio_mean",
+    "ppo/ratio_std",
+    "ppo/clip_fraction",
+    "ppo/approx_kl",
     "training/actor_lr",
     "critic/reward_qr_loss",
     "critic/cost_qr_loss",
@@ -86,6 +97,8 @@ PLOT_PANELS: Tuple[Tuple[str, Tuple[str, ...], bool], ...] = (
     ("reward critic", ("critic/reward_qr_loss", "ref/r_value_loss"), True),
     ("cost critic", ("critic/cost_qr_loss",), True),
     ("predicted / sampled cost", ("critic/pred_cost_mean", "debug/cost_mean"), False),
+    ("reward value", ("reward_value/loss", "reward_value/explained_variance"), True),
+    ("PPO health", ("ppo/clip_fraction", "ppo/approx_kl"), True),
 )
 
 
@@ -237,7 +250,7 @@ def flatten_profiles(profiles: Dict[str, Dict[str, Dict[str, object]]]) -> pd.Da
 
 
 def plot_overview(frame: pd.DataFrame, out_path: Path, common_steps: float, smooth_window: int) -> None:
-    """绘制共同预算内的 3×3 对齐图；使用无 GUI Agg 后端，适合 SSH/headless 节点。"""
+    """绘制共同预算内的动态网格对齐图；使用无 GUI Agg 后端，适合 SSH/headless 节点。"""
 
     import matplotlib
 
@@ -245,7 +258,9 @@ def plot_overview(frame: pd.DataFrame, out_path: Path, common_steps: float, smoo
     import matplotlib.pyplot as plt
 
     run_names = list(dict.fromkeys(frame["run_name"].astype(str).tolist()))
-    fig, axes = plt.subplots(3, 3, figsize=(18, 13), constrained_layout=True)
+    ncols = 3
+    nrows = int(math.ceil(len(PLOT_PANELS) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(18, 4.3 * nrows), constrained_layout=True)
     for axis, (title, metrics, log_y) in zip(axes.flat, PLOT_PANELS):
         drew_line = False
         for run_name in run_names:
@@ -273,6 +288,8 @@ def plot_overview(frame: pd.DataFrame, out_path: Path, common_steps: float, smoo
         axis.grid(alpha=0.2)
         if drew_line:
             axis.legend(fontsize=6)
+    for unused_axis in axes.flat[len(PLOT_PANELS):]:
+        unused_axis.set_visible(False)
     fig.suptitle(f"Safety-Gym W&B profile (matched budget ≤ {common_steps:,.0f} env steps)", fontsize=15)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=160)

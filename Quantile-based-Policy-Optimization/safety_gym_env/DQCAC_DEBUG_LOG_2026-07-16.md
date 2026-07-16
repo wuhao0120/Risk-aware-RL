@@ -38,23 +38,23 @@
 4. 每次训练结束后，用 W&B API 的 `scan_history()` 下载全部指标，不以控制台抽样点代替 history。
 5. 用 `profile_wandb_metrics.py` 在共同 env-step 预算下统计 early/middle/late、趋势斜率、非有限值并画对齐图。
 6. 修改在早期窗口没有形成方向一致的提升时提前停止；只对通过短预算门的版本扩大预算/seed。
-7. 一次性数据、PID、日志与图放入 Git 已忽略的 `_runs/`；只提交可复用工具、算法实现和这份账本。
+7. 一次性数据、PID、日志与图放入 Git 已忽略的 _runs；TMPDIR、W&B cache 和 Matplotlib cache 固定到 /vepfs-mlp2/c20250510/251204033/.tmp/safety_gym_env，不占 20G 根分区。
 8. 阶段结束清理失败的空 job、重复导出和不再使用的一次性探针；保留支撑结论的原始 W&B 导出/profile。
 
 ## 3. 当前实验
 
 ### E1：只扩大固定探索尺度
 
-- 状态：运行中。
+- 状态：已完成（exit code 0）。
 - job：`DQCAC_DynamicButton_dbg_e1_std1_fixed_1500k_s0`。
 - W&B run id：`hqf29nyd`。
-- PID：`23149`（独立 session，父进程已由 init 接管）。
+- PID：`23149`（已退出；训练期间为独立 session）。
 - 代码 commit：`caf5021`；算法代码与旧基线一致。
 - 唯一算法变量：`init_std: 0.5 -> 1.0`；`learn_std=False` 保持不变。
 - 固定项：`B=10`、`T=1000`、`warmup_iters=30`、`updates_per_episode=10`、`seed=0`。
 - 预算：150 iterations = 150 万 env steps，为旧全量的 30%。
-- 2026-07-16 08:18 UTC 实测速率：约 4.7 秒/iteration；预计总训练约 11.8 分钟，训练后 130 条评估轨迹另需少量时间。
-- 早期检查点：75 万步。若 reward late mean 不优于旧基线噪声带且 slope 不为正，可提前停止；本次运行本身成本很低，最终是否停还要结合实际剩余时间。
+- 实际训练耗时：644.5 秒（10.7 分钟）；训练后完成 130 条统一评估轨迹。
+- 75 万步检查点通过：同预算 reward late mean 和 slope 均优于旧 DQCAC；因此完成 150 万步短预算。
 - 判定重点：探索变化是否显著增加 reward advantage / actor weight 的有效尺度，并让 reward 窗口均值与趋势同时上升。
 
 命令：
@@ -68,6 +68,30 @@
   wandb_name=DQCAC_DynamicButton_dbg_e1_std1_fixed_1500k_s0 \
   wandb_group=dqcac_debug_dynamicbutton wandb_tags=debug,phase1,reward-gate,std1
 ```
+
+### E1 最终结论
+
+- 训练耗时：`644.5s`（10.7 分钟），150 iterations 实测约 4.30 秒/iteration；退出码 0。
+- W&B 完整导出：`_runs/wandb_export/final_e1_dynamicbutton_2026-07-16/`。
+- 同 150 万步 profile：`_runs/profiles/final_e1_dynamicbutton_2026-07-16/`。
+- 统一评估：mean reward `-0.0144`，outage `0.0846`，critic CDF `0.0558`，λ final `0.9205`。
+- 后 20% 训练窗口：reward mean `-0.0315`、slope `+0.0266/百万步`、λ mean `2.215`、actor weight std `0.224`。
+
+结论：固定 `std=1.0` 在 73 万步 checkpoint 的确把 reward late mean 从旧基线 `0.0238` 提到 `0.1192`，说明探索不足是一个因素；但 90 万步后 critic-dual 把 λ 推高，reward 又回落。E1 只获得“探索有帮助”的证据，没有通过“正常训练”门，也说明 reward 主干实验必须暂时固定 `λ=0`。
+
+### Smoke 验证（候选 GAE/PPO 实现）
+
+2026-07-16 分别对 `distributional`、`gae`、`gae_ppo` 三条路径执行 `B=2,T=32,iters=2` 后台 smoke。三者训练、评估、JSON 保存和退出码均正常；训练分别约 8 秒，无 NaN/Traceback。scalar reward value 在 episodic 模式下与 distributional critic 一样接收 `t/T` step feature；GAE target 每个 rollout 只计算一次并在 value/PPO epochs 间冻结。
+
+### E2：纯奖励门——scalar value + GAE（不启用 PPO）
+
+- 状态：待候选代码提交后启动。
+- 唯一 reward 主干变化：`reward_actor_mode=gae`；PPO clip 暂不开。
+- 隔离设置：`lambda_max=0`，确保 cost critic/dual 不能污染 reward actor 梯度。
+- 沿用 E1 的 `init_std=1.0`、`B=10`、`T=1000`、`warmup_iters=30`、10 epochs、seed 0。
+- 预算：80 iterations = 80 万 env steps；按 E1 速度加上 scalar value 开销，预计训练约 7~9 分钟，评估后总计约 9~11 分钟。
+- 检查点：60 万步。届时已完成约 30 个 actor rollout；若 reward late mean/斜率均不优于 E1 的 matched-budget 曲线，则停止，不扩大预算。
+- 通过后才运行 E3 `gae_ppo`，从而把 GAE 和 PPO clip 的贡献拆开。
 
 ## 4. 分阶段改进路线
 
