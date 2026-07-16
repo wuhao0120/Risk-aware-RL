@@ -860,3 +860,14 @@
 - 用既有六条1M history选阈值而不扫网格：在P-M3 baseline中第8 epoch KL超过`.004`的rollout占18%，s0-aux中占25.3%；baseline 0–300k仅2.2%，300–600k与600–800k均33.3%。aux的KL与同批outage相关系数约0.394，因此`.004`能命中中段回摆而不会普遍砍掉早期更新。
 - P-M5以原P-M3 seed1为压力基线，只增加`ppo_target_kl=.004`，不带s0 aux；B20、C20、N32、T1、PID、LR和8个最大epoch全部不变。直接跑1M，因为100k/300k几乎不会触发该机制，短跑没有检验功效。
 - 原seed1 fresh520为reward/outage `0.8622/0.3058`。候选要求520条outage至少下降0.08并到`≤0.22`，reward保持`≥0.75`，且末200k不出现更大的risk周期；无论140条screen好坏都执行520。预计训练6～7分钟、140终评约1～2分钟、520复评约4分钟，总计约11～13分钟，持久化后台运行。
+
+### E62：P-M5 seed1完整1M通过大样本门，已晋级多seed（2026-07-16）
+
+- P-M5相对P-M3 seed1只增加`ppo_target_kl=.004`，不加入已经被三seed否决的recent-s0 replay。job为`DQCAC_DynamicButton_pm5_targetkl004_timew995_pi_target015_smoothT1_b20_ckpt100k_1m_s1`，W&B run为`54y9bpza`；1M纯训练`391.2s`，后台job与内置评估均exit code 0，无NaN/Inf。
+- target-KL实际参与了优化，而非未触发的装饰项：50个rollout中19个提前停止actor更新，共完成`308/400`个允许的actor epoch；前/中/后20%阶段的early-stop率为`30%/40%/60%`，后20%平均只完成`4.6/8`个epoch。critic更新不受影响。
+- 训练末20%均值相对P-M3 seed1由reward/outage/lambda/KL=`0.8253/0.1800/0.2206/0.00246`变为`0.9185/0.2350/0.1977/0.00387`。target-KL提高了后段reward并限制越界epoch，但训练小批outage略高，说明它可能减慢risk/PID纠偏，不能仅凭训练曲线宣布成功。
+- 内置140条final为reward `0.8960`、outage `28/140=0.2000`、Q80 cost `14.2`。随后从同一个post-update final checkpoint做fresh eval-only 520条，得到reward `0.8684±0.5429`、outage `88/520=0.16923`、Q80 cost `13`、mean cost `8.8212`；作业`dqc_pm5_targetkl004_1m_s1_final_eval520_20260716`正常退出。
+- 与严格同协议P-M3 seed1的`reward=0.8622±0.5809,outage=159/520=0.30577,Q80=18,mean cost=12.3308`比较，reward差为`+0.0062`，近似95%区间`[-0.0621,+0.0746]`，可视为持平；outage绝对下降`0.13654`，差值近似95%区间`[-0.18760,-0.08548]`。单独Wilson 95%区间从baseline `[0.26771,0.34667]`降为candidate `[0.13946,0.20386]`。
+- critic也有改善但尚未校准：初始状态CDF absolute error从`|0.10427-0.30577|=0.20150`降至`|0.29561-0.16923|=0.12638`，约改善37.3%，但由严重低估转成明显高估。P-M5的主要收益不能归因于critic目标变化，因为critic配置与P-M3完全一致，更符合“限制8-epoch PPO过冲、改变策略—PID周期相位”的机制。
+- 该结果通过预注册门：outage不高于0.22、相对baseline下降超过0.08、reward不低于0.75，且520条而非140条给出一致方向。因此已原样启动seed0/2各1M的持久化后台复现，不调阈值、不挑checkpoint。两条并行预计约11～13分钟完成训练和内置评估，随后各做同协议520条fresh evaluation；多seed裁决仍使用全部三个seed，不能只保留压力seed1。
+- 对齐history与图位于`_runs/wandb_export/dqc_pm3_seed1_vs_pm5_targetkl004_1m_2026-07-16/`和`_runs/profiles/dqc_pm3_seed1_vs_pm5_targetkl004_1m_2026-07-16/`。seed0/2后台job分别为`DQCAC_DynamicButton_pm5_targetkl004_timew995_pi_target015_smoothT1_b20_ckpt100k_1m_s0`和同名`s2`。

@@ -1332,3 +1332,13 @@ seed0/2各完整训练1M并做520条fresh eval-only。baseline→aux的reward/ou
 阈值`.004`来自已有数据，不是新网格。P-M3 baseline最终epoch KL超过它的比例为18%，s0-aux为25.3%；baseline前300k只有2.2%，300–600k和600–800k各33.3%。因此跑100k几乎看不到target-KL触发，用短跑宣布无效属于错误实验设计。它必须在完整1M中检验是否削弱中段风险周期。
 
 P-M5只在原P-M3失败seed1上增加`.004`，不混入已经多seed失败的s0 replay。通过门为520条outage不高于0.22且相对0.3058至少下降0.08，reward不低于0.75；同时报告实际completed epochs和末200k周期。若失败，不扫`.003/.005/.006`，转cross-fit/慢target校准；若通过，再以seed0/2验证而不是只保留压力seed。
+
+### 13.51 P-M5 seed1结果：target-KL显著降低独立outage，值得多seed长跑（2026-07-16）
+
+P-M5只在P-M3 seed1上设置`ppo_target_kl=.004`，完整训练1M步、耗时`391.2s`。50个rollout中19个触发early stop，实际actor epoch为`308/400`；后20%阶段触发率60%、平均完成`4.6/8`个epoch。因而这个实验确实检验了target-KL，而100k阶段几乎不触发、没有足够功效。
+
+fresh 520条终评把P-M3→P-M5的reward/outage从`0.8622/159/520=0.3058`变为`0.8684/88/520=0.1692`。reward差仅`+0.0062`，其近似95%区间跨零；outage绝对下降`0.1365`，差值近似95%区间为`[-0.1876,-0.0855]`，两个单独Wilson区间分别是`[0.2677,0.3467]`和`[0.1395,0.2039]`。Q80 cost由18降到13，mean cost由12.33降到8.82。这不是140条末点运气：140条同样给出outage 0.20，但正式裁决使用520条。
+
+critic CDF误差从0.2015降到0.1264，仍然明显且符号由低估变为高估；因此target-KL不是distributional critic校准的替代品。更合理的解释是，8个PPO epoch中的整批策略位移被限制，缓和了critic/PID发生变化后actor一次性过冲。训练末20%outage反而由0.18变为0.235，也提醒target-KL可能减慢约束反馈，必须看独立策略而非只看20条训练batch。
+
+本配置通过预注册的seed1晋级门，seed0/2已经以完全相同的`.004`阈值、B20、1M预算和post-update final协议在后台并行运行。预计约11～13分钟完成训练与内置评估，之后各做520条fresh evaluation。只有三seed聚合仍改善且reward不退化，target-KL才进入主推荐；若只救seed1，它将被定级为压力seed稳定器，下一路线仍是cross-fit/慢target critic而不是扫描KL阈值。
