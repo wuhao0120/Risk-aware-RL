@@ -183,6 +183,10 @@ def base_args(algo, seed, device, env_key):
         a.cost_critic_time_weighting = 'uniform'
         a.cost_critic_weight_discount = None             # None 时跟随 beta
         a.cost_critic_weight_floor = 0.0
+        # recent-s0 auxiliary 默认关闭；显式开启时只重排 cost critic 的监督
+        # 质量，coef 按 auxiliary/base ratio 解释并归一化总梯度尺度。
+        a.cost_s0_aux_coef = 0.0
+        a.cost_s0_replay_batches = 4
         # cost history 消融：raw=历史 Markov critic；actor_feature=C-H0.5 共享并
         # detach policy feature；cost_lstm=C-H1 独立同输入 MLP+LSTM（当前要求 MC）。
         a.cost_history_mode = 'raw'

@@ -1252,3 +1252,17 @@ K16完整1M训练耗时`393.1s`，与K4的`390.6s`基本相同。140条final得�
 K16在300–600k有真实的阶段性收益：K4→K16使训练outage `0.237→0.163`、KL `0.00404→0.00222`、clip `0.207→0.117`。但600k–1M时outage反而`0.235→0.270`，680k出现0.65 outage；末200k reward `0.711→0.621`、window outage `0.212→0.236`、KL/clip也变差。若只跑到600k，会错误地宣布K16稳定化成功。
 
 结论是action baseline MC噪声存在，但不是主瓶颈。按预注册不做520、不扩seed、不扫K8/K32；下一主线直接处理三seed均出现、seed1最严重的initial-state critic低估，通过recent/initial-state replay、holdout CDF calibration或direct s0 auxiliary做独立消融。完整对齐数据位于`_runs/wandb_export/dqc_pm3_k4_pm4_k16_1m_2026-07-16/`和`_runs/profiles/dqc_pm3_k4_pm4_k16_1m_2026-07-16/`。
+
+### 13.42 C-S0实现：把critic训练测度直接对齐到真正决策的初始风险（2026-07-16）
+
+新增默认关闭的recent-s0辅助目标。每批保存真实`s0,a0,trajectory MC cost`，并用`L_cost=(L_transition+cL_s0)/(1+c)`训练，所以它重排cost监督质量而不抬高总loss尺度。状态始终保存raw值，使用时经过当前RMS；首轮只允许raw+MC，避免同时改变history或bootstrap语义。
+
+同时新增prequential holdout：新rollout在本轮critic更新前，用实际a0评估CDF、Brier和mean-cost bias；训练后在同一批上再算post。pre衡量跨rollout泛化，post-pre衡量同批拟合，解决过去日志只在重复训练过的s0上查询、容易把记忆误报为校准的问题。该诊断不采样，不改变RNG。
+
+默认关闭的改前/改后checkpoint中六个Module、RMS、lambda和runtime逐tensor完全一致。开启`c=.25,replay=2`后，两批smoke只有cost critic/target hash改变，actor、reward critic/target和RMS保持exact；chunk与full-batch路径分别训练8.8/8.9秒并exit0。profile工具也已扩展为保留和绘制新指标。
+
+### 13.43 C-S0A固定策略门：先证明泛化校准，再进入PID闭环（2026-07-16）
+
+第一门固定P-M3的B20/N32/MC/time-weight/recurrent配置并令lambda最大值为0，比较aux关闭与`c=.25,replay=1`，各100k。由于cost critic不能影响actor，两条真实policy/reward/cost应逐点相同；差异只允许来自cost critic。
+
+通过条件不是post同批loss下降，而是独立140条终评的CDF bias或mean error至少改善25%，且最后三批prequential CDF error或Brier至少改善20%。replay=1通过或只改善post时，再单独测试replay=4；失败则停止coef网格。每条预计含评估约1.5～2分钟，全部持久化后台串行运行。

@@ -768,3 +768,23 @@
 - 因此K16减小action baseline Monte Carlo误差可以短暂降低PPO位移和中期outage，但它不是后期策略—critic—PID周期的主瓶颈。更长的1M预算再次避免了只看300–600k而把K16误判为成功。
 - 由于末段趋势门和140条reward门同时失败，不扩520，不跑seed1，也不继续K8/K32小网格。K16保留为负/阶段性正消融；主线转recent/initial-state cost critic replay、holdout CDF calibration或直接s0 auxiliary。
 - 完整history和对齐图：`_runs/wandb_export/dqc_pm3_k4_pm4_k16_1m_2026-07-16/`、`_runs/profiles/dqc_pm3_k4_pm4_k16_1m_2026-07-16/`。
+
+### E53：C-S0 recent初始状态辅助目标与prequential holdout实现（2026-07-16）
+
+- 新增默认关闭的`cost_s0_aux_coef`和`cost_s0_replay_batches`。显式开启目前要求`cost_target_mode=mc,cost_history_mode=raw`，防止把n-step bootstrap或旧actor feature语义混入首轮消融。
+- 每个新rollout保存实际`(raw s0, behavior a0, 完整trajectory MC cost)`。有限deque只保留最近若干批；raw observation不缓存归一化值，辅助更新时重新通过当前RMS，避免旧输入尺度污染。
+- cost目标采用归一化凸组合：`L_cost=(L_transition+c*L_s0)/(1+c)`。因此`c=.25`对应基础/辅助权重`0.8/0.2`，改变监督时间测度而不增加cost objective总尺度，和直接把loss相加或抬高critic LR严格区分。
+- 新增训练前/后同批校准。pre使用刚采到、尚未进入本轮任何optimizer step的真实`s0/a0/return`，是prequential holdout；post使用完全相同样本但更新后的critic。指标包含hard CDF、truth、bias/absolute error、逐状态Brier、predicted/true mean cost。它不重采动作、不消耗RNG。
+- W&B/profile新增aux loss/scale/replay样本数及pre/post全套校准指标；最终JSON也保存最后一次pre/post字典。profile新增s0 probability与Brier面板。
+- 默认精确回归：改前/改后同一两环境短run的obs RMS、actor、reward critic/target、cost critic/target、lambda与runtime逐tensor完全一致。Module hash分别为obs `725eed9a0dd35f01`、actor `b1bb7c15a8c9e891`、reward `7845310dde10f777`、reward target `ff1133ce8d624aba`、cost `aa8d0b0d2b19382a`、cost target `bbbe962d16969daf`。
+- 辅助边界回归：两批默认与`coef=.25,replay=2`对照中，obs RMS、actor、reward critic/target hash完全相同，只有cost critic及target不同；证明lambda=0时没有意外改动策略/reward分支。chunk smoke训练`8.8s`、full-batch smoke `8.9s`，均exit0并完成recurrent PPO、QR、checkpoint/JSON和评估。
+- profile旧数据回归也通过；缺少新列的历史导出仍可正常生成报告和overview。
+
+### E54：C-S0A 100k固定策略校准门预注册（2026-07-16）
+
+- 为隔离critic效果，C-S0A使用P-M3的B20/N32/MC/time-weight.995/recurrent网络和8 PPO epochs，但设`lambda_max=0`，总预算100k。先跑aux关闭的新基线，再只开`coef=.25,replay_batches=1`；两条policy、reward和真实cost轨迹理论上应逐点相同。
+- replay=1首先检验“直接提高当前s0监督质量”本身；只有它改善post/final却没有改善下一批pre holdout时，才晋级replay=4检验跨批稳定。这样不会把direct s0 weighting和old-policy replay一次混入。
+- 每条5次B20 rollout、共100条训练初始状态，内置140条独立评估。参考P-M3吞吐，预计纯训练约40秒、含评估约1.5～2分钟；均用持久化后台串行运行。
+- 工程门：两条actor/真实reward-cost逐点相同，无NaN/OOM，aux cost总尺度与grad clipping不能显著恶化。
+- 算法门：相对新基线，独立评估CDF absolute bias或mean-cost relative error至少改善25%；同时最后三批prequential CDF error或Brier至少改善20%，否则只能说明同批记忆，不能晋级闭环。
+- 若C-S0A通过，先做replay=4的同预算正交门，再把胜者放回B20/PID跑300k；若失败停止coef小网格，转独立holdout early stopping或显式ensemble/uncertainty，而不是扫`.1/.25/.5/1`碰运气。

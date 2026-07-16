@@ -174,6 +174,19 @@ class DQCACBetaGPU(VecAgentBase):
             raise ValueError("cost_critic_weight_discount must be in (0,1]")
         if self.cost_critic_weight_floor < 0.0:
             raise ValueError("cost_critic_weight_floor must be non-negative")
+
+        # C-S0 只重排 cost critic 的监督测度：recent replay 保存每条完整轨迹的
+        # (s0, a0, MC cost)，并对初始风险分布增加独立 QR 辅助项。coef 表示辅助
+        # loss 与原 transition loss 的比值；更新时再除以 (1+coef)，保持 cost
+        # objective 总尺度，避免把“重视 s0”混淆成“提高 critic learning rate”。
+        self.cost_s0_aux_coef = float(
+            getattr(args, 'cost_s0_aux_coef', 0.0))
+        self.cost_s0_replay_batches = int(
+            getattr(args, 'cost_s0_replay_batches', 4))
+        if self.cost_s0_aux_coef < 0.0:
+            raise ValueError("cost_s0_aux_coef must be non-negative")
+        if self.cost_s0_replay_batches <= 0:
+            raise ValueError("cost_s0_replay_batches must be positive")
         # step feature 默认跟随 episodic: 有限期界下剩余 cost 分布依赖剩余步数 (已验证配方)
         _csf = getattr(args, 'critic_step_feature', None)
         self.critic_step_feature = bool(_csf) if _csf is not None else self.episodic
@@ -279,6 +292,11 @@ class DQCACBetaGPU(VecAgentBase):
         # t+N 构造 target cost history，是另一项独立算法改动，不能混入本消融。
         if self.cost_history_mode == 'cost_lstm' and self.cost_target_mode != 'mc':
             raise ValueError("cost_history_mode='cost_lstm' currently requires cost_target_mode='mc'")
+        if self.cost_s0_aux_coef > 0.0:
+            if self.cost_target_mode != 'mc':
+                raise ValueError("cost_s0_aux_coef>0 currently requires cost_target_mode='mc'")
+            if self.cost_history_mode != 'raw':
+                raise ValueError("cost_s0_aux_coef>0 currently requires cost_history_mode='raw'")
 
         # dual 消融：旧 critic_adam 保持可复现；empirical_pid 用真实完成轨迹控制 λ。
         self.dual_update_mode = str(getattr(args, 'dual_update_mode', 'critic_adam')).lower()
@@ -431,6 +449,11 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_cdf_smooth_initial = 0.0                    # sigmoid CDF，仅作 surrogate 诊断
         self.last_pred_cost_mean = 0.0                        # cost-critic 估 E[C|s0]
         self.last_pred_cost_std = 0.0                         # cost-critic 估 std(C|s0)
+        # replay 只保存少量 GPU tensor；原始 state 在使用时重新走当前 RMS，不能
+        # 缓存旧归一化结果，否则 observation statistics 漂移会污染监督输入。
+        self.cost_s0_replay = deque(maxlen=self.cost_s0_replay_batches)
+        self.last_s0_holdout_pre = {}                          # 最新新批训练前校准
+        self.last_s0_holdout_post = {}                         # 同一批critic更新后校准
         self.empirical_cost_window = deque(maxlen=self.pid_window_episodes)
         self.pid_i = float(self.lambda_min)                    # QCPO_refs 默认 Kp=Kd=0，仅积分项
         self.last_dual_raw_prob = 0.0                          # 当前 rollout 的经验 outage
@@ -458,6 +481,8 @@ class DQCACBetaGPU(VecAgentBase):
               f"cost_time_weight={self.cost_critic_time_weighting}"
               f"/d{self.cost_critic_weight_discount:g}"
               f"/floor{self.cost_critic_weight_floor:g}, "
+              f"s0_aux={self.cost_s0_aux_coef:g}"
+              f"/replay{self.cost_s0_replay_batches}, "
               f"cost_cdf={self.cost_cdf_mode}/T{self.cost_cdf_temperature:g}, "
               f"cost_grid={self.cost_quantile_grid_mode}/{self.cost_quantile_prediction_weighting}"
               f"/local{self.cost_quantile_local_count}, "
@@ -476,6 +501,12 @@ class DQCACBetaGPU(VecAgentBase):
                 # EMA constraint baseline 在 critic update 前就会查询 cost feature；
                 # 先用当前 encoder 刷新整段历史，后续每次 encoder step 后再刷新。
                 self._refresh_cost_history_features(batch)
+
+            # 新 rollout 在进入任何本轮 optimizer step 前就是 prequential holdout。
+            # 先记录泛化，再把它加入可选 recent replay；诊断本身不采样、不会改 RNG。
+            self.last_s0_holdout_pre = self._s0_prequential_calibration(batch)
+            batch['_s0_holdout_pre'] = self.last_s0_holdout_pre
+            self._append_cost_s0_replay(batch)
 
             # ===== 1b. qcpo: 刷新 EMA 归一化器 (σ_R / σ_c) =====
             if self.advantage_norm == 'qcpo':
@@ -519,6 +550,11 @@ class DQCACBetaGPU(VecAgentBase):
                     and it % self.outer_interval == 0):
                 self.update_dual(batch)
                 dual_updated = True                            # warmup 时不推进 λ 的学习率时间轴
+
+            # 与 pre 指标使用完全相同的 s0/a0/真实回报；这里只改变 critic 版本。
+            # 放在 actor.obs_rms 合并前，避免把输入统计变化混入 pre/post 差值。
+            self.last_s0_holdout_post = self._s0_prequential_calibration(batch)
+            batch['_s0_holdout_post'] = self.last_s0_holdout_post
 
             # recurrent policy 的 augmented-observation moments 必须在所有 PPO epoch
             # 完成后再合并；否则固定 old_logπ 与 current logπ 会使用不同输入变换。
@@ -876,6 +912,113 @@ class DQCACBetaGPU(VecAgentBase):
                 batch['cost_feature'] = batch['actor_feature']
         return batch
 
+    # ============================================================ 初始状态校准 / recent replay ============================================================
+    @torch.no_grad()
+    def _s0_prequential_calibration(self, batch):
+        """
+        在当前 rollout 尚未用于本轮 critic 更新时，评估真实 a0 上的初始风险校准。
+
+        这是 prequential holdout：样本来自刚完成的新 rollout，因此没有参与当前
+        batch 的任何 optimizer step。与训练后的同批结果配对，可以区分跨 rollout
+        泛化和“在同一批 s0 上重复拟合 20 次”造成的表面校准。整个函数复用实际
+        a0，不采新动作、不消耗 RNG，也不改变默认训练轨迹。
+        """
+        sample_count = int(batch['disc_cost'].numel())           # 每条完整轨迹提供一个 s0
+        initial_states = batch['s0']                             # [B,state_dim] 原始 observation
+        initial_actions = batch['actions'][:sample_count]        # time-major 前 B 行就是 a0
+
+        # 非 raw 历史路径使用 rollout 已保存并 detach 的零历史 feature；当前主实验
+        # 是 raw，但诊断本身可覆盖 actor_feature/cost_lstm，便于发现各分支的泛化差异。
+        initial_features = None
+        if self.cost_history_mode != 'raw':
+            if 'cost_feature' not in batch:
+                raise RuntimeError("s0 calibration requires refreshed cost_feature")
+            initial_features = batch['cost_feature'][:sample_count]
+        initial_inputs = self._cost_inputs(
+            initial_states, 0, initial_features)
+
+        quantiles = self.cost_critic(initial_inputs, initial_actions)
+        predicted_probability = self._cost_tail_probability(
+            quantiles, float(self.cost_limit), mode='hard')
+        observed_event = (
+            batch['disc_cost'] >= float(self.cost_limit)).to(torch.float32)
+        predicted_mean, _predicted_std = self._cost_quantile_moments(quantiles)
+
+        cdf_bias = predicted_probability.mean() - observed_event.mean()
+        cost_mean_bias = predicted_mean.mean() - batch['disc_cost'].mean()
+        return {
+            'cdf': float(predicted_probability.mean().item()),
+            'truth': float(observed_event.mean().item()),
+            'cdf_bias': float(cdf_bias.item()),
+            'cdf_abs_error': float(cdf_bias.abs().item()),
+            # Brier score 是逐状态 proper score；仅比较两个总体均值会掩盖错误排序。
+            'brier': float(
+                (predicted_probability - observed_event).pow(2).mean().item()),
+            'pred_cost_mean': float(predicted_mean.mean().item()),
+            'truth_cost_mean': float(batch['disc_cost'].mean().item()),
+            'cost_mean_bias': float(cost_mean_bias.item()),
+            'samples': float(sample_count),
+        }
+
+    @torch.no_grad()
+    def _append_cost_s0_replay(self, batch):
+        """
+        把当前 rollout 的 (raw s0, behavior a0, 完整 MC cost) 加入有限 recent replay。
+
+        只在辅助系数大于 0 时保存。state 保持原始尺度，后续每次 auxiliary update
+        都通过当前 observation RMS 重新变换；这避免缓存旧归一化值造成伪分布漂移。
+        """
+        if self.cost_s0_aux_coef <= 0.0:
+            return
+        sample_count = int(batch['disc_cost'].numel())
+        self.cost_s0_replay.append({
+            'states': batch['s0'].detach().clone(),
+            'actions': batch['actions'][:sample_count].detach().clone(),
+            'targets': batch['disc_cost'].detach().clone(),
+        })
+
+    def _cost_s0_auxiliary_loss(self):
+        """
+        在 recent 初始样本上计算 action-conditioned cost quantile regression loss。
+
+        返回未缩放 loss；update_critic 使用 ratio/(1+ratio) 与基础 cost loss 做
+        凸组合，保持 cost objective 总权重为 1。MC scalar 重复到 N_target 列只为
+        延续项目既有 QR target 尺度，不会把一个轨迹 realization 冒充 N 个样本。
+        """
+        if self.cost_s0_aux_coef <= 0.0 or not self.cost_s0_replay:
+            return None, {
+                'critic/cost_s0_aux_loss': 0.0,
+                'critic/cost_s0_aux_scaled_loss': 0.0,
+                'critic/cost_s0_replay_samples': 0.0,
+                'critic/cost_s0_replay_batches': 0.0,
+                'critic/cost_s0_target_mean': 0.0,
+            }
+
+        states = torch.cat(
+            [entry['states'] for entry in self.cost_s0_replay], dim=0)
+        actions = torch.cat(
+            [entry['actions'] for entry in self.cost_s0_replay], dim=0)
+        scalar_targets = torch.cat(
+            [entry['targets'] for entry in self.cost_s0_replay], dim=0)
+
+        # 参数校验已限制 auxiliary 为 raw+MC；输入在这里使用当前 RMS 和 t=0 feature。
+        inputs = self._cost_inputs(states, 0, None)
+        prediction = self.cost_critic(inputs, actions)
+        targets = scalar_targets.unsqueeze(1).expand(
+            -1, self.num_quantiles)
+        loss = self._cost_quantile_huber_loss(prediction, targets)
+
+        auxiliary_scale = (
+            self.cost_s0_aux_coef / (1.0 + self.cost_s0_aux_coef))
+        return loss, {
+            'critic/cost_s0_aux_loss': float(loss.detach().item()),
+            'critic/cost_s0_aux_scaled_loss': float(
+                auxiliary_scale * loss.detach().item()),
+            'critic/cost_s0_replay_samples': float(states.shape[0]),
+            'critic/cost_s0_replay_batches': float(len(self.cost_s0_replay)),
+            'critic/cost_s0_target_mean': float(scalar_targets.mean().item()),
+        }
+
     # ============================================================ Critic 更新 (双 QR-TD) ============================================================
     def _backward_recurrent_cost_loss(
             self, batch, cost_target, cost_sample_weights=None):
@@ -997,6 +1140,15 @@ class DQCACBetaGPU(VecAgentBase):
         use_chunks = 0 < chunk_size < total_size
         self.critic_optimizer.zero_grad(set_to_none=True)
 
+        # 辅助目标只改变 cost 监督在 transition 与 recent-s0 间的质量分配。
+        # coef=0 时 s0_aux_loss=None，下面保留历史 backward 表达式逐位不变。
+        s0_aux_loss, s0_aux_info = self._cost_s0_auxiliary_loss()
+        if s0_aux_loss is None:
+            cost_base_scale, cost_aux_scale = 1.0, 0.0
+        else:
+            cost_base_scale = 1.0 / (1.0 + self.cost_s0_aux_coef)
+            cost_aux_scale = self.cost_s0_aux_coef * cost_base_scale
+
         if recurrent_cost:
             # reward critic 仍按 transition chunk 配置更新；cost loss 另按连续时间
             # chunk 做 TBPTT，二者梯度累积后只执行一次 joint optimizer step。
@@ -1028,7 +1180,12 @@ class DQCACBetaGPU(VecAgentBase):
             reward_loss = self._quantile_huber_loss(reward_pred, reward_target)
             cost_loss = self._cost_quantile_huber_loss(
                 cost_pred, cost_target, cost_sample_weights)
-            (reward_loss + cost_loss).backward()
+            if s0_aux_loss is None:
+                # 默认关闭路径保持历史 autograd 图和浮点运算顺序。
+                (reward_loss + cost_loss).backward()
+            else:
+                (reward_loss + cost_base_scale * cost_loss).backward()
+                (cost_aux_scale * s0_aux_loss).backward()
             reward_loss_value = float(reward_loss.item())
             cost_loss_value = float(cost_loss.item())
         else:
@@ -1047,9 +1204,18 @@ class DQCACBetaGPU(VecAgentBase):
                     cost_pred, cost_target[begin:finish],
                     None if cost_sample_weights is None
                     else cost_sample_weights[begin:finish])
-                (weight * (reward_loss_chunk + cost_loss_chunk)).backward()
+                if s0_aux_loss is None:
+                    # 默认关闭路径保持原来的 chunk 聚合与 backward 顺序。
+                    (weight * (reward_loss_chunk + cost_loss_chunk)).backward()
+                else:
+                    (weight * (
+                        reward_loss_chunk
+                        + cost_base_scale * cost_loss_chunk)).backward()
                 reward_loss_value += weight * float(reward_loss_chunk.item())
                 cost_loss_value += weight * float(cost_loss_chunk.item())
+            if s0_aux_loss is not None:
+                # recent-s0 图很小，只在全部 transition chunk 释放后反传一次。
+                (cost_aux_scale * s0_aux_loss).backward()
 
         # 分开记录两个 critic 的裁剪前梯度范数，诊断 MC 大 target 是否让
         # joint clip 长期由 cost 分支主导。C-H1 的 cost norm 包含 encoder，
@@ -1076,7 +1242,7 @@ class DQCACBetaGPU(VecAgentBase):
         if recurrent_cost:
             # actor risk 与 rollout 日志必须使用 optimizer.step 后的当前 encoder。
             self._refresh_cost_history_features(batch)
-        return {
+        critic_info = {
             'critic/reward_qr_loss': reward_loss_value,
             'critic/cost_qr_loss': cost_loss_value,
             'critic/chunked_update': float(use_chunks),
@@ -1109,7 +1275,15 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/grad_clip_fraction': float(
                 joint_grad_norm.item() > self.critic_grad_clip
                 if self.critic_grad_clip and self.critic_grad_clip > 0 else 0.0),
+            'critic/cost_s0_aux_enabled': float(s0_aux_loss is not None),
+            'critic/cost_s0_base_scale': float(cost_base_scale),
+            'critic/cost_s0_aux_scale': float(cost_aux_scale),
+            'critic/cost_objective_loss': float(
+                cost_base_scale * cost_loss_value
+                + s0_aux_info['critic/cost_s0_aux_scaled_loss']),
         }
+        critic_info.update(s0_aux_info)
+        return critic_info
 
     def _quantile_target_scale(self, num_target_samples):
         """
@@ -1942,6 +2116,14 @@ class DQCACBetaGPU(VecAgentBase):
             'training/actor_lr': float(self.actor_scheduler.get_last_lr()[0]),
             'training/actor_updates_per_iteration': self.actor_updates_per_episode,
         }
+        # pre 是本轮训练前的新样本泛化，post 是同一批被重复更新后的拟合；
+        # 两者键完全对齐，profile 可直接计算 post-pre 而不混入动作/RNG差异。
+        for phase in ('pre', 'post'):
+            metrics = batch.get(f'_s0_holdout_{phase}')
+            if metrics is not None:
+                for metric_name, metric_value in metrics.items():
+                    extra[
+                        f'critic/s0_holdout_{phase}_{metric_name}'] = metric_value
         extra.update(critic_info)
         extra.update(actor_info)
         if self.advantage_norm == 'qcpo':
@@ -2071,6 +2253,10 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_critic_time_weighting': self.cost_critic_time_weighting,
             'cost_critic_weight_discount': self.cost_critic_weight_discount,
             'cost_critic_weight_floor': self.cost_critic_weight_floor,
+            'cost_s0_aux_coef': self.cost_s0_aux_coef,
+            'cost_s0_replay_batches': self.cost_s0_replay_batches,
+            's0_holdout_pre': dict(self.last_s0_holdout_pre),
+            's0_holdout_post': dict(self.last_s0_holdout_post),
             'cost_cdf_mode': self.cost_cdf_mode,
             'cost_cdf_temperature': self.cost_cdf_temperature,
             'cost_quantile_grid_mode': self.cost_quantile_grid_mode,
