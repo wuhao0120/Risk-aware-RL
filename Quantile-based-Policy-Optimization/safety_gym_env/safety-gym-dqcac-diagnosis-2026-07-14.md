@@ -944,3 +944,19 @@ P-S1 job `DQCAC_DynamicButton_recur_mc_c20_pi_kp1_w50_smoothT1_300k_s0`（W&B `i
 5. C-H1：独立 online/target recurrent cost encoder；若增加 quantile 分辨率后 risk advantage 仍弱，再优先处理 history sufficient-state 问题。
 
 完整对齐结果位于 `_runs/profiles/dqc_smooth_cdf_ps1_300k_2026-07-16/`，原始 W&B 导出位于 `_runs/wandb_export/dqc_smooth_cdf_ps1_300k_2026-07-16/`。所有未选路线保留为轻量验证或论文消融，不因当前主路线选择而删除。
+
+### 13.16 P-S2 结果：T=2 Pareto 改善，但不足以通过约束门（2026-07-16）
+
+P-S2 job `DQCAC_DynamicButton_recur_mc_c20_pi_kp1_w50_smoothT2_300k_s0`（W&B `agmbfhlz`）从 commit `87548a8` 启动，训练 `159.6s`、exit code 0。相对 P-S1 只有 `cost_cdf_temperature=1→2` 一项变化。
+
+终评 reward `0.9725`、outage `0.2385`，同时优于 T=1 的 `0.8296/0.2692`；但仍没有达到预设 `outage≤0.22`，因此不能进入 multi-seed 胜出确认。hard/smooth critic CDF 为 `0.1834/0.2013`，真实 outage 为 `0.2385`；predicted mean cost `8.97` 对真实 `12.12`，说明该策略分布上 critic 又出现低估。最终 `lambda=0.1212`，末期 PPO KL `0.00187`、clip fraction `0.0957`，risk-adv nonzero fraction `0.9808`、std `0.0145`，没有训练崩坏。
+
+必须同时记录统计上的保留意见。当前 `num_eval=128` 在 B=10 下实际评估 130 条，T=2 的 `0.2385` 即 `31/130`，Wilson 95% interval 约为 `[0.173,0.319]`；T=1 的 `35/130` interval 约为 `[0.200,0.351]`，hard P-B3 的 `41/130` interval 约为 `[0.242,0.400]`。T=2 对 hard 的安全改善有较一致方向，但 T=1/T=2 区间高度重叠；不能把单次终评的小数差异解释为温度单调规律。
+
+这也形成两条有分歧、都必须保留的路线：
+
+1. **温度核路线**：T=2 当前是最好单点，但 sigmoid 导数随温度和距离共同变化，温度不是简单的风险 penalty gain。固定网格在 `{1,2}` 后暂停；`T=.5` 与 `T=4` 作为反向/外推消融保留。更有理论依据的 C-Q2 是按查询附近 quantile spacing 自适应温度。
+2. **分辨率路线（当前主门）**：C-Q3A 先跑 `N=64,lambda=0,100k`，与 N=32 C20/MC 校准基线只改变 quantile 数；`critic_minibatch_size=2500` 让 `2500×64²` 与旧 `10000×32²` 的 pairwise QR 元素量相当，降低显存混杂。通过门是 CDF bias 至少下降 25%，或 mean-cost relative error 进入 15%，且另一指标不恶化超过 10%。通过后再组合 `N64+T2` 做 300k constrained；失败则转 local-τ/IQN 或 C-H1。
+3. **评估工程路线 C-E1**：当前训练入口没有保存 checkpoint，导致 P-S2 结束后不能低成本把评估扩到 512/1024 条。后续增加 opt-in final checkpoint 与 eval-only 恢复；最终候选必须报告更大评估样本和多 seed，而不是只看 130 条。该工程改动独立验证，不与算法变量混写。
+
+统一 300k profile 位于 `_runs/profiles/dqc_smooth_cdf_ps12_300k_2026-07-16/`，同时包含 hard/T1/T2/E9/QCPO_refs；完整 history 导出位于 `_runs/wandb_export/dqc_smooth_cdf_ps12_300k_2026-07-16/`。T=0.5、T=4、自适应 spacing、N=128、uniform+local τ、uniform-IQN/query-mixture-IQN 与 C-H1 均保留为轻量验证或论文消融候选。

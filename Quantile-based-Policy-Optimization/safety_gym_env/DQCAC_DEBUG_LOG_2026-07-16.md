@@ -490,3 +490,14 @@
 - profile：`_runs/profiles/dqc_smooth_cdf_ps1_300k_2026-07-16/`；export：`_runs/wandb_export/dqc_smooth_cdf_ps1_300k_2026-07-16/`。
 - **当前单变量路线 P-S2**：只把温度 `1→2`。通过门为 outage `≤0.22` 且 reward `>0.658`；若 outage 不优于 T=1，或 reward 降到 `≤0.658`，立即停止固定温度网格。
 - **保留但不混跑的分歧路线**：`T=.5` 用于检验 T=1 是否过度平滑；自适应温度按查询附近 quantile spacing 定标；N=64/128 直接提高 hard-CDF 分辨率；uniform+local τ mixture 用 importance weight 保持目标分布；IQN 分 uniform-IQN 与 query-mixture-IQN 两条。若 T=2 失败，优先在 C-Q2/C-Q3 与 C-H1 中按诊断证据选择，不把多个变化塞进同一 run。
+
+### E25：P-S2 `sigmoid,T=2` 结果、统计不确定性与 C-Q3A 门
+
+- P-S2：job `DQCAC_DynamicButton_recur_mc_c20_pi_kp1_w50_smoothT2_300k_s0`，W&B `agmbfhlz`，启动 commit `87548a8`，训练 `159.6s`、exit code 0；相对 P-S1 唯一变化为 temperature `1→2`。
+- 130 条终评 reward `0.9725`、outage `0.2385`、hard/smooth critic CDF `0.1834/0.2013`；pred mean cost `8.97` 对 truth `12.12`，最终 `lambda=0.1212`。它同时优于 T=1 的 `0.8296/0.2692`，但没过预设 `outage≤0.22` 硬门，不扩 multi-seed。
+- 训练后段 reward `0.9715`、empirical probability `0.2833`；末点 risk-adv nonzero fraction `0.9808`、std `0.0145`，PPO KL `0.00187`、clip fraction `0.0957`，没有数值或更新异常。
+- 统计保留意见：outage 是 `31/130`，Wilson 95% interval 约 `[0.173,0.319]`；T=1 的 `35/130` interval 约 `[0.200,0.351]`。区间高度重叠，故“Pareto 改善”只能作为单 seed 正信号，不能当显著结论。
+- 固定温度主网格在 T=2 暂停；`T=.5`（是否过平滑）与 `T=4`（更宽核是否反而稀释局部差异）均记录为温度曲线消融。下一主门 C-Q3A 为 `N=64,lambda=0,100k`，相对 N=32 C20/MC 只改 N，并用 `critic_minibatch_size=2500` 保持 pairwise QR 峰值规模近似相同。
+- C-Q3A 通过门：CDF bias 相对 N32 的 `0.0978` 至少下降 25%，或 mean relative error 进入 15%，且另一指标不恶化超过 10%、reward 轨迹正常。通过后才做 `N64+T2,300k`；失败则转 C-Q2 自适应 spacing/local-τ 或 C-H1。
+- 工程路线 C-E1：增加 opt-in final checkpoint + eval-only 恢复，候选策略用 512/1024 episodes 复评；当前入口没有 checkpoint，P-S2 无法事后无训练复评。该缺口记录但不与 C-Q3A 同时改算法。
+- 对齐 profile：`_runs/profiles/dqc_smooth_cdf_ps12_300k_2026-07-16/`；完整导出：`_runs/wandb_export/dqc_smooth_cdf_ps12_300k_2026-07-16/`。
