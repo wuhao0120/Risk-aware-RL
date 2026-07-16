@@ -433,3 +433,12 @@
 - P-B2 新增 `pid_Kp`，默认 0 精确保持旧 bounded-I。PI 输出为 `lambda=clip(I_state+Kp*filtered_error)`；P 项随当前窗口 error 立即出现/撤回，leaky-I 只消除稳态误差。
 - 手算断言覆盖 Kp=0 legacy、Kp=1 和 lambda 下界；持久化 smoke `DQCAC_DynamicButton_smoke_pi_kp1_s0` 用 `cost_limit=0` 强制正误差，实际得到 `lambda=0.7999`，训练/评估 exit code 0。
 - P-B2 保持 P-B1 所有参数，只设 `Kp=1`。按 P-B1 末 error 约 0.23 推算 lambda 会从 I≈0.13 立即升到约 0.34；若仍偏弱，后续路线是 Kp=2 或 window=50，二者不在同一 run 同时改变。
+
+
+### E19：P-B2 Kp=1 结果与最后一个窗口消融
+
+- P-B2：job `DQCAC_DynamicButton_recur_mc_c20_pi_kp1_300k_s0`，W&B `rgt6qukp`，启动 commit `1dfa3e1`，训练 `158.7s`、exit code 0；与 P-B1 唯一差异是 `pid_Kp=1`。
+- P 项真实加速响应：180k/190k lambda `0.011/0.045`，P-B1 为 `0.001/0.005`；到 250k/280k/300k 为 `0.203/0.310/0.356`。I state 最终 `0.146`，P 输出约 `0.210`。
+- 但控制到达工作区间太晚：130 条终评 reward `1.303`、outage `0.508`，训练最后 batch outage `0.3`。相对 P-B1 的 outage `0.462` 未改善，单 seed 波动下不能宣称 PI 更差，但明确仍不可行。
+- critic CDF `0.365` 对 truth `0.508`（bias `-0.142`），pred mean `14.75` 对 truth `22.33`；较大的 lambda 不能补偿 actor risk advantage 的系统低估/表示误差。
+- 只再保留 P-B3：window `100→50`，其余完全不变，让 PI 约早 5 iterations 响应。若仍不可行，停止 Kp/Ki/window 小网格，进入 C-H1 recurrent action-conditioned cost critic；Kp=2 只留作后续消融表选项，不立即运行。

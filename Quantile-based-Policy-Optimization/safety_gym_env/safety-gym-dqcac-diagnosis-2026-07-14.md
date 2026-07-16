@@ -847,3 +847,10 @@ PID 分歧也显式保留。当前 QCPO_refs 配置所谓 PID 实际 `Kp=Kd=0`�
 P-B1 的 300k leaky-I 门控失败于控制偏弱，而非 windup。λ 在 170k 前一直为 0，到 200k/250k/300k 仅约 `0.012/0.056/0.130`；130 条终评 reward `1.332`、outage `0.462`，不满足 0.2。critic CDF `0.295` 对 truth `0.462`，bias `-0.167`；因此 trajectory PID 绕开 critic 只能保证 dual 信号真实，actor 的局部 risk advantage 仍受 cost critic 低估影响。W&B 为 `9pxv0bmd`。
 
 为直接修复迟滞，代码增加默认 `pid_Kp=0` 的 PI 输出 `lambda=clip(I_state+Kp*filtered_error)`。Kp=0 与旧 I 路径逐式相同；Kp>0 时当前 error 能立即影响 λ，并在约束恢复后立即撤回，而 leaky-I 只承担稳态项。手算断言和强制正误差 smoke 均通过，后者实际输出 λ=0.7999。P-B2 只把 Kp 设为 1，其余沿用 P-B1；若仍偏弱，Kp=2 与 window=50 作为两个独立消融，不同时打开。C-H1 recurrent cost critic 继续保留为 PI 之后的结构主线。
+
+
+### 13.10 P-B2 结果：PI 更快但仍太晚（2026-07-16）
+
+P-B2 只增加 `Kp=1`。λ 在 180k/190k 达到 `0.011/0.045`，约为 P-B1 的 9 倍，最终 λ `0.356=I 0.146+P 0.210`；实现和参数确实生效。但 130 条终评 reward `1.303`、outage `0.508`，仍不可行。critic CDF `0.365` 对 truth `0.508`，pred mean `14.75` 对 `22.33`，说明更快 dual 无法自动修复局部 risk advantage 的表示/校准误差。W&B 为 `rgt6qukp`。
+
+只再运行一条 window `100→50` 的 P-B3，隔离 5-iteration 观测滞后；若它仍不可行，就停止 PID 小网格并实现 C-H1 recurrent action-conditioned cost critic。Kp=2、Ki 调大继续记录为可能消融，但不在没有新证据时消耗全量训练预算。
