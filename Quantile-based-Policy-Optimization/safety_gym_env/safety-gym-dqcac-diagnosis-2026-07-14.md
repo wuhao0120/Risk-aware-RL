@@ -1373,3 +1373,16 @@ C-X1相对P-M3 seed1只把actor的cost CDF查询从刚接受当前批监督的on
 target-online查询差不是装饰：末20%平均absolute gap为0.0521、末点为0.1024。机制上，慢target切断了“当前批cost标签→online critic一步更新→同批actor risk advantage”的即时反馈，结果支持同批off-distribution/overfitting反馈确实是先前振荡的一部分。不过online critic的520条CDF仍为0.3608，对真实0.2173高估0.1435；baseline则低估0.1984。故当前证据是闭环改善，不是distributional critic已经准确。
 
 预算策略据此固定下来：bug/尺度和冻结局部机制可以100k筛；actor–critic–PID组合至少跨过300k冷启动，有持续趋势就跑满1M；贴边界配置用520条；普适结论依赖多个训练seed。C-X1 seed1通过后不在这个seed上继续1.5M或调target tau，而是原配置串行扩seed0/2各1M+520。只有跨seed回报和outage方向仍一致，才进入主推荐及与QCPO_refs对齐的更长预算；否则它与target-KL一样只保留为压力seed消融。
+
+
+### 13.55 C-X1三seed结论：解决同批反馈不能只靠滞后一个共享critic（2026-07-16）
+
+C-X1三条1M长跑和各520条fresh评估已经完成。baseline到target-query的逐seed reward/outage为：seed0 `0.7180/0.1673→1.0455/0.3288`，seed1 `0.8622/0.3058→0.9661/0.2173`，seed2 `0.8670/0.2115→1.0767/0.3115`。三个seed的reward全部提高，跨seed均值从0.8157升到1.0294；但outage有两个seed显著恶化，合并事件由356/1560升到446/1560。
+
+这解释了慢target的实际作用：它降低actor对最新risk标签的响应速度，使策略能更激进地优化reward。对原本严重低估风险的seed1，这种滞后恰好打破了有害的同批反馈；对原本较安全的seed0/2，它却让risk correction落后。critic误差也从baseline逐seed`0.0587/0.1984/0.0434`变成`0.1841/0.1435/0.1423`，即救回压力seed、损害另外两个seed。单一Polyak target仍共享online critic的参数轨迹，只是低通滤波，不是真正的out-of-fold预测。
+
+训练日志会把该配置误报为成功：三seed末20% reward由0.8083升到0.9031，训练outage从0.2050略降到0.1983，lambda从0.2459降到0.1378；独立初始状态却在seed0/2大量失约。这表明经验PID只控制当前训练布局，并不能保证actor对未见初始布局的risk query可靠。以后闭环晋级必须同时要求fresh initial-state评估，而不能用训练outage替代。
+
+对训练长度问题，C-X1是一个很干净的双重例子。100k时三个seed的reward都远低于后段，短跑会漏掉它稳定提高reward的真实作用；但若只延长一个seed到1M，又会把seed1的全面改善错误推广。只有3 seeds×1M+520揭示了真实结论：它是reward–safety trade-off，不是安全稳定器。因此不续1.5M、不扫target tau，也不把target-KL和target-query叠加试运气。
+
+下一步使用真正的两折cross-fit/双cost critic。环境轨迹按固定fold拆分；critic A只用fold A标签训练，critic B只用fold B标签训练；actor在fold A状态上查询未见A标签的critic B，在fold B上查询critic A。最终控制可同时记录两critic分歧，并在评估时比较平均CDF与保守上置信CDF。该设计比慢target更贵，但直接对应当前证据指向的“训练样本泄漏与初始状态泛化”问题；先做默认关闭回归、配对冻结机制门和轻量校准验证，通过后才给live PID长预算。

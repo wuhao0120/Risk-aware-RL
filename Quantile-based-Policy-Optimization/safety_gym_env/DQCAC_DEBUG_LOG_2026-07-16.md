@@ -906,3 +906,17 @@
 - critic仍未解决：C-X1的online smooth CDF `0.3608`相对truth `0.2173`高估`0.1435`；baseline则为`0.1074`相对`0.3058`低估`0.1984`。absolute error有所下降但偏差符号翻转，说明慢target查询改善了闭环反馈，不等于distributional critic已经校准。
 - 按规则不在seed1上续1.5M或扫target tau，而是原样扩展seed0/2各1M+520。机器只有一张A100，改为串行持久化后台运行以避免GPU争用；独占训练实测约6.6分钟，含140 screen约8分钟，单个520复评约5分钟。seed0已启动，只有三seed方向和reward都可接受时才将C-X1列为主候选。
 - 正式数据：`_runs/wandb_export/dqc_pm3_seed1_vs_cx1_targetquery_1m_2026-07-16/`、`_runs/profiles/dqc_pm3_seed1_vs_cx1_targetquery_1m_2026-07-16/`；520结果为`_runs/DQCAC_DynamicButton_cx1_targetquery_1m_s1_final_eval520_s1.json`。
+
+
+### E66：C-X1三seed裁决——长跑避免早期误杀，但慢target把回报提升换成更高风险（2026-07-16）
+
+- seed0/1/2的1M训练均正常exit 0，纯训练耗时`394.4/393.9/389.0s`，W&B run为`5t6sxi2j/3oogqkf5/yod7kvxy`。三条都是独占单张A100串行持久化后台作业，配置只在训练seed和输出路径上不同。
+- 内置140条reward/outage为seed0 `1.142/49/140=0.350`、seed1 `1.058/31/140=0.2214`、seed2 `1.163/47/140=0.3357`。没有根据seed1通过而保留、也没有根据seed0/2失败而停止；三个post-update final checkpoint全部按同协议做fresh 520。
+- 520条baseline→C-X1结果为：seed0 reward/outage `0.7180/87/520=0.1673 → 1.0455/171/520=0.3288`；seed1 `0.8622/159/520=0.3058 → 0.9661/113/520=0.2173`；seed2 `0.8670/110/520=0.2115 → 1.0767/162/520=0.3115`。
+- C-X1在三个seed都提高reward，逐seed增量为`+0.3275/+0.1039/+0.2097`；跨seed均值从`0.8157±0.0847`升到`1.0294±0.0570`，平均约增加26.2%。这是该组件明确且可复现的正面效果。
+- 安全性方向不稳定且总体恶化。逐seed outage变化为`+0.1615/-0.0885/+0.1000`，sample std `0.1303`；合并事件从`356/1560=0.2282`升到`446/1560=0.2859`，Wilson 95%区间从`[0.2081,0.2497]`变为`[0.2640,0.3088]`。episode池化差值为`+0.05769`、近似95%区间`[+0.02709,+0.08829]`，但最终解释仍以2/3 seed恶化和强seed异质性为主。
+- online critic smooth-CDF absolute error逐seed从baseline `0.0587/0.1984/0.0434`变为C-X1 `0.1841/0.1435/0.1423`，跨seed均值`0.1002→0.1566`。它修复原压力seed1的低估，却让原先较准的seed0/2明显低估；这与outage方向完全一致。
+- 三seed训练曲线反而容易给出false positive：末20% reward `0.8083→0.9031`，训练outage `0.2050→0.1983`，lambda `0.2459→0.1378`，看起来全面更好；fresh初始状态评估却在seed0/2失约。训练布局上的经验PID并没有暴露policy的initial-state泛化风险。
+- 训练长度结论要同时保留两面：100k会因三个seed尚未形成高reward而误杀C-X1的性能作用；但完整`3 seeds×1M+520`又证明它不是安全主配置。继续1.5M或扫描target tau更可能改变闭环相位，而没有跨seed定向安全证据，因此停止该小网格。
+- C-X1定级为“稳定提高reward、但平均放松约束”的机制消融，不与target-KL组合补丁式试错。下一条路线是两个独立cost critic的两折cross-fit：每个critic只在一半环境轨迹上训练，actor对该折状态查询未见该折标签的另一critic，提供比Polyak一步滞后更严格的样本隔离；先做默认兼容回归和冻结机制门，再决定是否进入live 1M。
+- 正式history、profile和训练图在`_runs/wandb_export/dqc_pm3_vs_cx1_targetquery_multiseed_1m_2026-07-16/`及`_runs/profiles/dqc_pm3_vs_cx1_targetquery_multiseed_1m_2026-07-16/`。后者含`eval_multiseed.csv`、`eval_multiseed_summary.json`与`eval_multiseed_comparison.png`（2084×755，PNG解码验证通过）。
