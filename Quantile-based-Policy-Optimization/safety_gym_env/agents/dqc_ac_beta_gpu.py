@@ -36,7 +36,7 @@ import torch.nn as nn
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 
-from utils import RecurrentActorValue, RunningMeanStd
+from utils import RecurrentActorValue, RecurrentCostEncoder, RunningMeanStd
 from .vec_base import VecAgentBase
 from .common import DistributionalCritic, ScalarValueCritic, lr_lambda, indicator_ge
 
@@ -226,14 +226,15 @@ class DQCACBetaGPU(VecAgentBase):
                 raise ValueError("DQCAC mlp_lstm currently requires reward_actor_mode=gae_ppo")
             if self.n % self.recurrent_seq_len != 0:
                 raise ValueError("horizon must be divisible by recurrent_seq_len")
-            recurrent_hidden = getattr(args, 'recurrent_hidden', [512, 512])
-            if isinstance(recurrent_hidden, str):
-                recurrent_hidden = [
-                    int(x) for x in recurrent_hidden.split(',') if x.strip()]
+            self.recurrent_hidden = getattr(
+                args, 'recurrent_hidden', [512, 512])
+            if isinstance(self.recurrent_hidden, str):
+                self.recurrent_hidden = [
+                    int(x) for x in self.recurrent_hidden.split(',') if x.strip()]
             self.actor = RecurrentActorValue(
                 observation_dim=self.state_dim + 1,
                 action_dim=self.action_dim,
-                hidden=recurrent_hidden,
+                hidden=self.recurrent_hidden,
                 lstm_size=int(getattr(args, 'lstm_size', 512)),
                 lstm_skip=bool(getattr(args, 'lstm_skip', True)),
                 init_std=float(getattr(args, 'init_std', 1.0)),
@@ -241,15 +242,23 @@ class DQCACBetaGPU(VecAgentBase):
                 normalize_observation=self.normalize_observation,
                 var_clip=self.obs_norm_var_clip).to(self.device)
 
-        # C-H0.5 只改变 cost critic 的条件变量：raw 是历史默认；actor_feature
-        # 使用产生行为动作的 recurrent feature。特征在 rollout 时 detach，cost loss
-        # 不反传 actor，因此它是“共享表示输入”而不是 full shared recurrent critic。
+        # cost history 三路线：
+        # - raw：历史默认，只看当前 Markov observation；
+        # - actor_feature：C-H0.5，共享但 detach PPO recurrent feature；
+        # - cost_lstm：C-H1，用 cost QR loss 独立训练同输入协议的 MLP+LSTM。
         self.cost_history_mode = str(
             getattr(args, 'cost_history_mode', 'raw')).lower()
-        if self.cost_history_mode not in {'raw', 'actor_feature'}:
-            raise ValueError("cost_history_mode must be 'raw' or 'actor_feature'")
-        if self.cost_history_mode == 'actor_feature' and not self.recurrent_policy:
-            raise ValueError("cost_history_mode='actor_feature' requires policy_arch='mlp_lstm'")
+        valid_cost_history_modes = {'raw', 'actor_feature', 'cost_lstm'}
+        if self.cost_history_mode not in valid_cost_history_modes:
+            raise ValueError(
+                f"cost_history_mode must be one of {sorted(valid_cost_history_modes)}")
+        if self.cost_history_mode != 'raw' and not self.recurrent_policy:
+            raise ValueError(
+                f"cost_history_mode={self.cost_history_mode!r} requires policy_arch='mlp_lstm'")
+        # C-H1 首轮只验证完整 finite-horizon MC calibration。n-step 需要为
+        # t+N 构造 target cost history，是另一项独立算法改动，不能混入本消融。
+        if self.cost_history_mode == 'cost_lstm' and self.cost_target_mode != 'mc':
+            raise ValueError("cost_history_mode='cost_lstm' currently requires cost_target_mode='mc'")
 
         # dual 消融：旧 critic_adam 保持可复现；empirical_pid 用真实完成轨迹控制 λ。
         self.dual_update_mode = str(getattr(args, 'dual_update_mode', 'critic_adam')).lower()
@@ -319,7 +328,8 @@ class DQCACBetaGPU(VecAgentBase):
         reward_cdim = self.state_dim + (1 if self.critic_step_feature else 0)
         cost_base_dim = (
             self.actor.lstm_size
-            if self.cost_history_mode == 'actor_feature' else self.state_dim)
+            if self.cost_history_mode in {'actor_feature', 'cost_lstm'}
+            else self.state_dim)
         cost_cdim = cost_base_dim + (1 if self.critic_step_feature else 0)
         # reward critic: ψ^r(s,a), 只用其均值 mean(ψ^r) 作 Q̂_m (目标优势)
         self.reward_critic = DistributionalCritic(
@@ -338,10 +348,36 @@ class DQCACBetaGPU(VecAgentBase):
             cost_cdim, self.action_dim, self.num_quantiles,
             list(hidden)).to(self.device)
         self.cost_target_critic.load_state_dict(self.cost_critic.state_dict())
-        # 一个优化器统管两 critic (loss = reward_qr + cost_qr, 一次 backward)
+
+        # C-H1 编码器放在 critic heads 初始化之后，保证 actor/reward critic 与
+        # C-H0.5 在相同 seed 下不因额外网络提前消费 RNG 而改变初始参数。
+        self.cost_history_encoder = None
+        self.cost_target_history_encoder = None
+        if self.cost_history_mode == 'cost_lstm':
+            self.cost_history_encoder = RecurrentCostEncoder(
+                observation_dim=self.state_dim + 1,
+                action_dim=self.action_dim,
+                hidden=self.recurrent_hidden,
+                lstm_size=self.actor.lstm_size,
+                lstm_skip=bool(getattr(args, 'lstm_skip', True))).to(self.device)
+            self.cost_target_history_encoder = RecurrentCostEncoder(
+                observation_dim=self.state_dim + 1,
+                action_dim=self.action_dim,
+                hidden=self.recurrent_hidden,
+                lstm_size=self.actor.lstm_size,
+                lstm_skip=bool(getattr(args, 'lstm_skip', True))).to(self.device)
+            self.cost_target_history_encoder.load_state_dict(
+                self.cost_history_encoder.state_dict())
+
+        # 一个优化器统管双 critic 与可选 cost encoder；reward/cost loss 各自
+        # backward 后累积梯度，最后统一 clip 和 optimizer.step。
+        critic_parameters = (
+            list(self.reward_critic.parameters())
+            + list(self.cost_critic.parameters()))
+        if self.cost_history_encoder is not None:
+            critic_parameters += list(self.cost_history_encoder.parameters())
         self.critic_optimizer = Adam(
-            list(self.reward_critic.parameters()) + list(self.cost_critic.parameters()),
-            getattr(args, 'critic_lr', 1e-3), eps=1e-5)
+            critic_parameters, getattr(args, 'critic_lr', 1e-3), eps=1e-5)
 
         # GAE/PPO 模式额外维护 V_r(s)。cost critic、budget 与 dual 均保持原实现，
         # 因此短实验只替换 reward advantage 来源，不偷偷改风险约束链路。
@@ -404,6 +440,10 @@ class DQCACBetaGPU(VecAgentBase):
         for it in range(self.num_iterations):
             # ===== 1. 采样 + DQCAC 专属后处理 (cost budget / n-step / d,e) =====
             batch = self._rollout_vec()
+            if self.cost_history_mode == 'cost_lstm':
+                # EMA constraint baseline 在 critic update 前就会查询 cost feature；
+                # 先用当前 encoder 刷新整段历史，后续每次 encoder step 后再刷新。
+                self._refresh_cost_history_features(batch)
 
             # ===== 1b. qcpo: 刷新 EMA 归一化器 (σ_R / σ_c) =====
             if self.advantage_norm == 'qcpo':
@@ -478,6 +518,86 @@ class DQCACBetaGPU(VecAgentBase):
         new_B = T * B // self.recurrent_seq_len
         return (tensor.transpose(0, 1).reshape(
             new_B, self.recurrent_seq_len, *rest).transpose(0, 1).contiguous())
+
+    def _normalize_cost_history_observation(self, actor_observation):
+        """
+        用 actor 的 augmented-observation RMS 标准化独立 cost encoder 输入。
+
+        RMS buffer 不含可训练参数；共享它只保证 actor/cost encoder 看到相同尺度，
+        不会让 cost QR loss 写入 actor MLP/LSTM。normalize_observation=False 时原样返回。
+        """
+        if not self.normalize_observation:
+            return actor_observation
+        return self.actor.obs_rms(actor_observation)
+
+    @torch.no_grad()
+    def _refresh_cost_history_features(self, batch):
+        """
+        用当前独立 encoder 重算 rollout 每个历史位置的 detach cost feature。
+
+        按 recurrent_seq_len 顺序扫过 episode，并在 chunk 间携带 hidden/cell；
+        no_grad 路径不需要截断反向图，但采用同一分块可与训练数值逐段对拍。
+        结果按时间主序展平到 [T*B,H]，供 actor risk、EMA 与日志查询复用。
+        """
+        if self.cost_history_mode != 'cost_lstm':
+            return
+        if self.cost_history_encoder is None:
+            raise RuntimeError("cost_lstm mode requires cost_history_encoder")
+
+        observations = batch['actor_obs']
+        prev_actions = batch['prev_action']
+        prev_rewards = batch['prev_reward']
+        T, B = observations.shape[:2]
+        hidden, cell = self.cost_history_encoder.initial_state(B, self.device)
+        feature_chunks = []
+
+        for begin in range(0, T, self.recurrent_seq_len):
+            finish = min(begin + self.recurrent_seq_len, T)
+            normalized_obs = self._normalize_cost_history_observation(
+                observations[begin:finish])
+            features, (hidden, cell) = self.cost_history_encoder(
+                normalized_obs,
+                prev_actions[begin:finish],
+                prev_rewards[begin:finish],
+                (hidden, cell))
+            feature_chunks.append(features)
+
+        batch['cost_feature'] = torch.cat(
+            feature_chunks, dim=0).reshape(T * B, -1).detach()
+
+    @torch.no_grad()
+    def _initial_cost_history_feature(self, states, actor_features=None):
+        """
+        返回 s0 对应的 cost 条件特征。
+
+        raw 不需要 feature；actor_feature 直接复用策略的零历史 feature；cost_lstm
+        则用独立编码器在 previous cost/action/reward 全零的协议下计算一次。
+        """
+        if self.cost_history_mode == 'raw':
+            return None
+        if self.cost_history_mode == 'actor_feature':
+            if actor_features is None:
+                raise RuntimeError("actor_feature mode requires policy feature at s0")
+            return actor_features
+        if self.cost_history_encoder is None:
+            raise RuntimeError("cost_lstm mode requires cost_history_encoder")
+
+        B = states.shape[0]
+        previous_cost = torch.zeros(B, 1, device=states.device)
+        previous_action = torch.zeros(
+            B, self.action_dim, device=states.device)
+        previous_reward = torch.zeros(B, device=states.device)
+        augmented_obs = torch.cat([states, previous_cost], dim=1)
+        normalized_obs = self._normalize_cost_history_observation(
+            augmented_obs.unsqueeze(0))
+        initial_state = self.cost_history_encoder.initial_state(
+            B, states.device)
+        features, _final_state = self.cost_history_encoder(
+            normalized_obs,
+            previous_action.unsqueeze(0),
+            previous_reward.unsqueeze(0),
+            initial_state)
+        return features[0]
 
     def _sample_initial_actions(self, states, return_features=False):
         """
@@ -714,9 +834,72 @@ class DQCACBetaGPU(VecAgentBase):
                 'boot_actions': boot_actions.detach(),
                 'boot_cost_features': boot_cost_features.detach(),
             })
+            if self.cost_history_mode == 'actor_feature':
+                # 统一 key 让后续调用不必猜测 feature 来源；仍保留 actor_feature
+                # 供行为策略诊断，且两者都已 detach。
+                batch['cost_feature'] = batch['actor_feature']
         return batch
 
     # ============================================================ Critic 更新 (双 QR-TD) ============================================================
+    def _backward_recurrent_cost_loss(self, batch, cost_target):
+        """
+        对独立 cost MLP+LSTM 做一次按时间顺序的 truncated-BPTT QR 更新。
+
+        每个 chunk 包含 recurrent_seq_len 个连续 timestep 和全部 B 条 episode。
+        chunk loss 乘元素占比后立即 backward；hidden/cell 只向后携带数值并 detach，
+        因而优化目标仍是整批 transition mean，而反向图最多跨一个 chunk。
+        """
+        if self.cost_history_encoder is None:
+            raise RuntimeError("cost_lstm update requires cost_history_encoder")
+
+        observations = batch['actor_obs']
+        prev_actions = batch['prev_action']
+        prev_rewards = batch['prev_reward']
+        actions = batch['actions'].reshape(
+            self.n, self.num_envs, self.action_dim)
+        states = batch['states'].reshape(
+            self.n, self.num_envs, self.state_dim)
+        steps = batch['steps'].reshape(self.n, self.num_envs)
+        targets = cost_target.reshape(
+            self.n, self.num_envs, self.num_quantiles)
+        hidden, cell = self.cost_history_encoder.initial_state(
+            self.num_envs, self.device)
+        total_size = float(self.n * self.num_envs)
+        loss_value = 0.0
+
+        for begin in range(0, self.n, self.recurrent_seq_len):
+            finish = min(begin + self.recurrent_seq_len, self.n)
+            normalized_obs = self._normalize_cost_history_observation(
+                observations[begin:finish])
+            features, (next_hidden, next_cell) = self.cost_history_encoder(
+                normalized_obs,
+                prev_actions[begin:finish],
+                prev_rewards[begin:finish],
+                (hidden, cell))
+
+            # 展平顺序仍是 time-major 的 t*B+j，与 target/action 原批索引一致。
+            chunk_states = states[begin:finish].reshape(-1, self.state_dim)
+            chunk_steps = steps[begin:finish].reshape(-1)
+            chunk_features = features.reshape(-1, features.shape[-1])
+            chunk_inputs = self._cost_inputs(
+                chunk_states, chunk_steps, chunk_features)
+            chunk_actions = actions[begin:finish].reshape(-1, self.action_dim)
+            chunk_targets = targets[begin:finish].reshape(
+                -1, self.num_quantiles)
+
+            prediction = self.cost_critic(chunk_inputs, chunk_actions)
+            chunk_loss = self._cost_quantile_huber_loss(
+                prediction, chunk_targets)
+            chunk_weight = float((finish - begin) * self.num_envs) / total_size
+            (chunk_weight * chunk_loss).backward()
+            loss_value += chunk_weight * float(chunk_loss.item())
+
+            # 先保存数值再释放当前 chunk 图；下个 chunk 继承历史但不跨边界反传。
+            hidden = next_hidden.detach()
+            cell = next_cell.detach()
+
+        return loss_value
+
     def update_critic(self, batch):
         """
         更新 reward/cost 两个 QR-TD critic；可选 transition chunking 降低 N² 峰值显存。
@@ -736,8 +919,6 @@ class DQCACBetaGPU(VecAgentBase):
                 batch['boot_actions'] if self.recurrent_policy
                 else self._sample_actions(boot_states))
             reward_boot_inputs = self._aug(boot_states, boot_steps)
-            cost_boot_inputs = self._cost_inputs(
-                boot_states, boot_steps, batch.get('boot_cost_features'))
 
             # 两条 target 都完整保存为 [T*B,N]；真正的 N² 张量只在下面 chunk 内产生。
             reward_next = self.reward_target_critic(reward_boot_inputs, boot_actions)
@@ -746,6 +927,10 @@ class DQCACBetaGPU(VecAgentBase):
                 + (self.gamma ** self.n_step)
                 * boot_mask.unsqueeze(1) * reward_next)
             if self.cost_target_mode == 'nstep':
+                # cost_lstm 首轮被参数校验限制为 MC；这里的 boot feature 仍只服务
+                # raw/actor_feature 两条历史兼容路线。
+                cost_boot_inputs = self._cost_inputs(
+                    boot_states, boot_steps, batch.get('boot_cost_features'))
                 cost_next = self.cost_target_critic(cost_boot_inputs, boot_actions)
                 cost_target = (
                     batch['nstep_cost'].unsqueeze(1)
@@ -759,14 +944,40 @@ class DQCACBetaGPU(VecAgentBase):
                     -1, self.num_quantiles)
 
         reward_state_inputs = self._aug(states, steps)
-        cost_state_inputs = self._cost_inputs(
-            states, steps, batch.get('actor_feature'))
+        recurrent_cost = self.cost_history_mode == 'cost_lstm'
+        cost_state_inputs = (
+            None if recurrent_cost else self._cost_inputs(
+                states, steps, batch.get('cost_feature')))
         total_size = int(states.shape[0])
         chunk_size = self.critic_minibatch_size
         use_chunks = 0 < chunk_size < total_size
         self.critic_optimizer.zero_grad(set_to_none=True)
 
-        if not use_chunks:
+        if recurrent_cost:
+            # reward critic 仍按 transition chunk 配置更新；cost loss 另按连续时间
+            # chunk 做 TBPTT，二者梯度累积后只执行一次 joint optimizer step。
+            reward_loss_value = 0.0
+            if not use_chunks:
+                reward_pred = self.reward_critic(
+                    reward_state_inputs, actions)
+                reward_loss = self._quantile_huber_loss(
+                    reward_pred, reward_target)
+                reward_loss.backward()
+                reward_loss_value = float(reward_loss.item())
+            else:
+                for begin in range(0, total_size, chunk_size):
+                    finish = min(begin + chunk_size, total_size)
+                    weight = float(finish - begin) / float(total_size)
+                    reward_pred = self.reward_critic(
+                        reward_state_inputs[begin:finish], actions[begin:finish])
+                    reward_loss_chunk = self._quantile_huber_loss(
+                        reward_pred, reward_target[begin:finish])
+                    (weight * reward_loss_chunk).backward()
+                    reward_loss_value += (
+                        weight * float(reward_loss_chunk.item()))
+            cost_loss_value = self._backward_recurrent_cost_loss(
+                batch, cost_target)
+        elif not use_chunks:
             # 默认历史路径：构造完整 [T*B,N,N] pairwise error，一次 backward。
             reward_pred = self.reward_critic(reward_state_inputs, actions)
             cost_pred = self.cost_critic(cost_state_inputs, actions)
@@ -794,9 +1005,12 @@ class DQCACBetaGPU(VecAgentBase):
                 cost_loss_value += weight * float(cost_loss_chunk.item())
 
         # 分开记录两个 critic 的裁剪前梯度范数，诊断 MC 大 target 是否让
-        # joint clip 长期由 cost 分支主导。这里只读取 .grad，不建立二阶计算图。
+        # joint clip 长期由 cost 分支主导。C-H1 的 cost norm 包含 encoder，
+        # 才能识别究竟是 quantile head 还是历史表示导致 joint clip。
         reward_parameters = list(self.reward_critic.parameters())
         cost_parameters = list(self.cost_critic.parameters())
+        if self.cost_history_encoder is not None:
+            cost_parameters += list(self.cost_history_encoder.parameters())
 
         def gradient_norm(parameters):
             squared_norm = torch.zeros((), dtype=torch.float32, device=self.device)
@@ -812,10 +1026,14 @@ class DQCACBetaGPU(VecAgentBase):
         if self.critic_grad_clip and self.critic_grad_clip > 0:
             nn.utils.clip_grad_norm_(joint_parameters, self.critic_grad_clip)
         self.critic_optimizer.step()
+        if recurrent_cost:
+            # actor risk 与 rollout 日志必须使用 optimizer.step 后的当前 encoder。
+            self._refresh_cost_history_features(batch)
         return {
             'critic/reward_qr_loss': reward_loss_value,
             'critic/cost_qr_loss': cost_loss_value,
             'critic/chunked_update': float(use_chunks),
+            'critic/cost_recurrent_tbptt': float(recurrent_cost),
             'critic/cost_target_mean': float(
                 self._cost_quantile_moments(cost_target)[0].mean().item()),
             'critic/cost_target_is_mc': float(self.cost_target_mode == 'mc'),
@@ -1026,7 +1244,7 @@ class DQCACBetaGPU(VecAgentBase):
             steps = batch['steps']
             if '_risk_weight' not in batch:
                 cost_inputs = self._cost_inputs(
-                    states, steps, batch.get('actor_feature'))
+                    states, steps, batch.get('cost_feature'))
                 psi_c = self.cost_critic(cost_inputs, batch['actions'])
                 psi_cdf = self._cost_tail_probability(psi_c, budgets)
 
@@ -1303,9 +1521,11 @@ class DQCACBetaGPU(VecAgentBase):
         if self.dual_update_mode == 'critic_adam':
             with torch.no_grad():
                 s0 = batch['s0']
-                a0, feature0 = self._sample_initial_actions(
+                a0, actor_feature0 = self._sample_initial_actions(
                     s0, return_features=True)
-                cost_input0 = self._cost_inputs(s0, 0, feature0)
+                cost_feature0 = self._initial_cost_history_feature(
+                    s0, actor_feature0)
+                cost_input0 = self._cost_inputs(s0, 0, cost_feature0)
                 psi0 = self.cost_critic(cost_input0, a0)       # [B,N]
                 p = float(
                     self._cost_tail_probability(
@@ -1406,7 +1626,7 @@ class DQCACBetaGPU(VecAgentBase):
             (quantiles - mean.unsqueeze(-1)).pow(2) * weights).sum(dim=-1)
         return mean, variance.clamp_min(0.0).sqrt()
 
-    def _cost_inputs(self, states, steps, actor_features=None):
+    def _cost_inputs(self, states, steps, history_features=None):
         """
         构造 cost distribution critic 的条件输入。
 
@@ -1416,10 +1636,14 @@ class DQCACBetaGPU(VecAgentBase):
         """
         if self.cost_history_mode == 'raw':
             return self._aug(states, steps)
-        if actor_features is None:
+        if history_features is None:
             raise RuntimeError(
-                "cost_history_mode='actor_feature' requires aligned recurrent features")
-        features = actor_features.detach()
+                f"cost_history_mode={self.cost_history_mode!r} requires aligned history features")
+        # actor_feature 必须截断到策略的梯度；cost_lstm 则保留独立 encoder
+        # 的计算图，使 cost QR loss 能通过 quantile head 反传到历史表示。
+        features = (
+            history_features.detach()
+            if self.cost_history_mode == 'actor_feature' else history_features)
         if not self.critic_step_feature:
             return features
         if not torch.is_tensor(steps):
@@ -1502,7 +1726,7 @@ class DQCACBetaGPU(VecAgentBase):
             s, b = batch['states'], batch['budgets']
             a = batch['actions']
             steps = batch['steps']
-            cost_features = batch.get('actor_feature')
+            cost_features = batch.get('cost_feature')
             cost_inputs = self._cost_inputs(s, steps, cost_features)
             cost_quantiles = self.cost_critic(cost_inputs, a)
             psi_cdf = self._cost_tail_probability(cost_quantiles, b)
@@ -1521,19 +1745,27 @@ class DQCACBetaGPU(VecAgentBase):
                          float(adv_c.mean().item()), float(adv_c.var(unbiased=False).item()))
 
     def _soft_update_target(self):
-        """Polyak: target ← (1-τ)·target + τ·online (两 critic 同步)。"""
+        """Polyak 同步 reward/cost critic 与可选的独立 cost history encoder。"""
         with torch.no_grad():
             for tp, op in zip(self.reward_target_critic.parameters(), self.reward_critic.parameters()):
                 tp.data.lerp_(op.data, self.target_tau)
             for tp, op in zip(self.cost_target_critic.parameters(), self.cost_critic.parameters()):
                 tp.data.lerp_(op.data, self.target_tau)
+            if self.cost_target_history_encoder is not None:
+                for target_parameter, online_parameter in zip(
+                        self.cost_target_history_encoder.parameters(),
+                        self.cost_history_encoder.parameters()):
+                    target_parameter.data.lerp_(
+                        online_parameter.data, self.target_tau)
 
     def _initial_cdf_estimate(self, s0):
         """cost-critic 在 s0 上的 P(C≥d)/E[C]/std(C) 估计 (校准诊断)。"""
         with torch.no_grad():
-            a0, feature0 = self._sample_initial_actions(
+            a0, actor_feature0 = self._sample_initial_actions(
                 s0, return_features=True)
-            cost_input0 = self._cost_inputs(s0, 0, feature0)
+            cost_feature0 = self._initial_cost_history_feature(
+                s0, actor_feature0)
+            cost_input0 = self._cost_inputs(s0, 0, cost_feature0)
             psi = self.cost_critic(cost_input0, a0)           # [B, N]
             self.last_cdf_initial = float(
                 self._cost_tail_probability(
@@ -1586,6 +1818,8 @@ class DQCACBetaGPU(VecAgentBase):
             'dual/sum_norm_enabled': float(self.sum_norm),
             'debug/cost_history_actor_feature': float(
                 self.cost_history_mode == 'actor_feature'),
+            'debug/cost_history_cost_lstm': float(
+                self.cost_history_mode == 'cost_lstm'),
             'debug/cost_cdf_is_sigmoid': float(
                 self.cost_cdf_mode == 'sigmoid'),
             'debug/cost_cdf_temperature': self.cost_cdf_temperature,
@@ -1671,8 +1905,10 @@ class DQCACBetaGPU(VecAgentBase):
             # cost critic 校准使用同一评估批真实 s0 与循环策略零历史下的 a0。
             s0 = torch.cat(initial_states, dim=0)
             a0 = torch.cat(initial_actions, dim=0)
-            feature0 = torch.cat(initial_features, dim=0)
-            cost_input0 = self._cost_inputs(s0, 0, feature0)
+            actor_feature0 = torch.cat(initial_features, dim=0)
+            cost_feature0 = self._initial_cost_history_feature(
+                s0, actor_feature0)
+            cost_input0 = self._cost_inputs(s0, 0, cost_feature0)
             psi0 = self.cost_critic(cost_input0, a0)
             cost_cdf_initial = float(
                 self._cost_tail_probability(

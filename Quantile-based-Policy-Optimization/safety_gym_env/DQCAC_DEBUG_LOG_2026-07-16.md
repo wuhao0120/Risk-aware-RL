@@ -541,3 +541,16 @@
 - 三条 run 的 reward/真实 cost/PPO 逐点相同；local grid 两种 loss 都只有小幅校准收益。停止 fraction/window/N 小网格，不跑 local+T2 300k。
 - profile：'_runs/profiles/dqc_local_quantiles_q4ab_100k_2026-07-16/'；export：'_runs/wandb_export/dqc_local_quantiles_q4ab_100k_2026-07-16/'。
 - local τ 实现保留为正消融（查询步长更细但校准收益有限）；下一核心路线 C-H1 独立 recurrent cost encoder。C-Q2 adaptive bandwidth、IQN、P-M1 safety setpoint 与 checkpoint/eval-only 仍保留。
+
+### E30：C-H1 独立 recurrent cost encoder 实现与 100k 校准门
+
+- 新增默认关闭的 cost_history_mode=cost_lstm；raw 与 actor_feature 的默认/历史语义不变。C-H1 输入与 QCPO_refs recurrent policy 相同：augmented observation=[state, previous_cost]，MLP feature 再拼 previous_action/previous_reward，经过独立 LSTM。
+- 关键区别：它不复用漂移的 actor feature。cost MLP+LSTM 只由 cost quantile regression loss 更新；与 actor 只共享无参数的 augmented-observation running mean/variance，保证输入尺度一致但不共享可学习表示。
+- cost quantile head 继续显式接 action，因此模型是 Z_c(history,a)，没有退化成 QCPO_refs 的 state-value cost head。reward critic、GAE、PPO old probability、actor 和 PID 均未改。
+- 训练使用 recurrent_seq_len=100 的 truncated BPTT：每个 chunk 包含连续 100 步和全部并行环境；hidden/cell 数值向后传递、chunk 边界 detach。各 chunk loss 按 transition 数占比累积，一次 joint gradient clip 和 optimizer step，避免隐式放大 critic 学习率。
+- 每次 encoder optimizer step 后都重算并 detach 当前 rollout 的 cost feature；constraint RMS、risk actual/baseline、actor 与日志由同一版本 feature 查询。s0 critic-dual、训练日志和 recurrent eval 使用 previous cost/action/reward 全零的独立 cost feature，不会误用 actor feature。
+- online/target cost encoder 同步创建并 Polyak 更新。首轮 C-H1 刻意限制为 finite-horizon MC target；recurrent n-step target 需要单独构造 t+N history，是另一条算法变量，不能混入本轮。
+- 静态检查与独立梯度测试通过：feature shape=(20,3,32)，encoder gradient L1=5.48。持久化全链路 smoke dqc_ch1_cost_lstm_smoke_20260716 训练 6.4s、exit 0；旧 actor_feature 回归 dqc_ch05_regression_postch1_20260716 训练 6.3s、exit 0。
+- 100k C-H1A 配方保持 N32+C20+MC+lambda0+hard CDF 与 raw C20 相同，唯一算法变量是 cost_history_mode=cost_lstm。预计训练约 2～4 分钟、70 条评估约 1 分钟。
+- 通过门沿用预注册标准：相对 raw C20 的 CDF bias 0.0978 至少下降 25%（即不高于 0.0734），或 predicted mean relative error 从 22.1% 进入 15%，且另一指标不恶化超过 10%、reward/PPO 正常。明显失败就不扩 300k。
+- 分歧路线全部保留：C-H1B 为独立 encoder 自有 RMS；C-H1C 为 256 hidden 的容量/速度控制；C-H1N 为 recurrent n-step online/target history；C-H0.6 直接使用 actor (h,c)；C-Q2 adaptive bandwidth；uniform/query-mixture IQN；P-M1 safety setpoint；C-E1 checkpoint/eval-only。双向 LSTM 因使用未来信息违反在线因果性，不列为合法主路线。

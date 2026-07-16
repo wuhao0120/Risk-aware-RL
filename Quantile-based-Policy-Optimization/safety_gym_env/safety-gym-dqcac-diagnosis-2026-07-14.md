@@ -1032,3 +1032,24 @@ A 还暴露了 prediction objective 的尺度混杂：cost grad norm '14.04'、j
 阶段结论是：查询点局部 quantile 加密在工程和概率语义上可行，能把局部 CDF 步长约缩小 3 倍，也带来约 7～8% 的校准改善；但它没有修复约 20% 的 mean-cost 低估，说明主要误差不只是 hard CDF 分辨率。停止 local fraction/window/N 小网格，不跑 'local+T2,300k'。该实现保留为论文正消融和未来 IQN query-mixture 的权重基础。
 
 下一核心路线按预案转 C-H1：独立 online/target recurrent cost encoder，让 critic 条件变量包含完整 cost/history，而不是 reward actor 的漂移 feature。仍保留的分歧路线包括：C-Q2 adaptive sigmoid bandwidth（只改 actor 查询核）、C-H0.6 直接 actor (h,c)、P-M1 controller safety setpoint、uniform-IQN/query-mixture-IQN、以及 C-E1 checkpoint/eval-only。C-H1 先做 100k lambda0 校准门，通过才与 T2/PI 组合。
+
+### 13.21 C-H1 实现：独立 cost MLP+LSTM，而不是复用 actor 表示（2026-07-16）
+
+C-Q4 说明局部分辨率只解释小部分误差，因此按预案进入 C-H1。代码新增默认关闭的 cost_history_mode=cost_lstm；raw 与 actor_feature 两条旧路径保持兼容。独立 cost encoder 使用与 QCPO_refs policy 相同的历史输入协议：observation 追加 previous_cost，经过 [512,512] MLP 后再拼 previous_action 与 previous_reward，送入 512 hidden LSTM。输出 feature 与当前 action 一起进入原 action-conditioned quantile head，所以它估计的是 Z_c(history,a)，没有把 DQCAC 偷换成 state-only cost value。
+
+这项实现解决 C-H0.5 的核心混杂：actor_feature 同时被 reward PPO 和 value loss 更新，cost critic 只能追逐一个不断变化、且未必保留 cost 信息的表示；C-H1 的 MLP/LSTM 则只接收 cost QR loss。两者只共享 augmented observation 的 running mean/variance buffer，用于保持数值尺度相同；没有共享可学习权重，cost loss 也不会进入 actor。
+
+训练采用 100-step truncated BPTT。每个 chunk 沿真实 episode 时间顺序编码全部并行环境，hidden/cell 传到下一 chunk 但在边界 detach；chunk QR loss 按 transition 比例加权，和 reward QR 梯度累积后只做一次 joint clip/Adam step。每次 step 后重新编码当前 rollout，constraint RMS、actor risk actual/baseline 与日志都读取同一个当前 encoder 的 detach feature。critic-dual、initial calibration 与 recurrent evaluation 在 s0 显式使用 previous cost/action/reward 全零的独立 feature。
+
+online/target cost encoder 都已建立并做 Polyak 同步，但当前 C-H1 首轮强制 cost_target_mode=mc。原因很直接：MC 有完整 episode 真实 return，不需要 target history；n-step 若要正确 bootstrap，必须为 t+N 重建 target encoder 的历史状态。把这个额外变量同时加入会破坏 C-H1 是否有效的归因。后续 C-H1N 可以作为 recurrent n-step 消融单独实现。
+
+验证结果：
+
+- Python 静态检查与 diff check 通过。
+- 合成张量检查得到 feature shape (20,3,32)，cost loss 回传到 encoder 的 gradient L1 为 5.48，排除误 detach。
+- 持久化 dqc_ch1_cost_lstm_smoke_20260716 完成 rollout、2 次 critic/TBPTT、2 次 PPO、critic-dual、recurrent eval 与 JSON，训练 6.4s、exit code 0。
+- 持久化 dqc_ch05_regression_postch1_20260716 对旧 actor_feature 路径回归，训练 6.3s、exit code 0，说明统一 cost_feature 接口没有破坏 C-H0.5。
+
+下一条 C-H1A 是 lambda=0 的 100k 校准门，保持 N32、C20、MC、hard CDF、actor lr 3e-4 与 raw C20 相同，只改变 cost_history_mode。预计训练约 2～4 分钟，70 条终评约 1 分钟。门槛仍是 CDF bias 从 0.0978 降到不高于 0.0734，或 mean relative error 从 22.1% 进入 15%，且另一指标不恶化超过 10%。失败则不跑 300k；通过后才与 sigmoid T2 和 window50 PI 组合。
+
+合理分歧均保留为可执行消融：独立 RMS（C-H1B）、256 hidden 容量控制（C-H1C）、recurrent n-step target（C-H1N）、actor hidden/cell 直接条件化（C-H0.6）、adaptive sigmoid bandwidth（C-Q2）、uniform-IQN/query-mixture-IQN、PID safety setpoint（P-M1）和 checkpoint/eval-only（C-E1）。双向 LSTM 会利用未来 observation/cost，违反部署时的因果信息集，因此不作为合法提升路线。

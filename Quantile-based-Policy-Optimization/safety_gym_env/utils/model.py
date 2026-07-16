@@ -242,3 +242,83 @@ class RecurrentActorValue(nn.Module):
         """在 rollout 边界批量合并 augmented observation moments。"""
         if self.normalize_observation:
             self.obs_rms.update(augmented_observation)
+
+
+class RecurrentCostEncoder(nn.Module):
+    """
+    DQCAC cost distribution critic 的独立 MLP+LSTM 历史编码器。
+
+    输入协议与 QCPO_refs/RecurrentActorValue 完全相同：observation 已追加
+    previous_cost，MLP 特征再拼 previous_action 与 previous_reward 后送入 LSTM。
+    与 actor_feature 消融的关键区别是本编码器由 cost quantile loss 独立训练，
+    因而 cost 表示不会随 PPO actor/value 的联合更新被动漂移。
+
+    observation 的 running mean/variance 不在本类重复维护。Agent 在调用前使用
+    actor.obs_rms 做同一数值变换；这只共享输入尺度统计，不共享任何可学习表示。
+    """
+
+    def __init__(self, observation_dim, action_dim, hidden=None, lstm_size=512,
+                 lstm_skip=True, hidden_nonlinearity='tanh'):
+        """
+        构造与参考策略同形的 MLP+LSTM，但不创建 policy/value 输出头。
+
+        Args:
+            observation_dim: raw state 加 previous_cost 后的输入维度。
+            action_dim:      previous_action 的维度。
+            hidden:          MLP 隐层宽度，公平消融默认 [512,512]。
+            lstm_size:       LSTM hidden/cell 宽度，公平消融默认 512。
+            lstm_skip:       是否把 MLP feature 残差加到 LSTM output。
+        """
+        super().__init__()
+        hidden = [512, 512] if hidden is None else list(hidden)
+        nonlinearities = {'tanh': nn.Tanh, 'relu': nn.ReLU}
+        if hidden_nonlinearity not in nonlinearities:
+            raise ValueError("hidden_nonlinearity must be 'tanh' or 'relu'")
+        nonlinearity = nonlinearities[hidden_nonlinearity]
+
+        # 保留 QCPO_refs 的 PyTorch 默认 Linear 初始化，避免额外初始化差异。
+        layers = []
+        last_size = int(observation_dim)
+        for width in hidden:
+            layers.append(nn.Linear(last_size, int(width)))
+            layers.append(nonlinearity())
+            last_size = int(width)
+        self.body = nn.Sequential(*layers)
+
+        # previous_cost 已在 observation；这里只再拼 previous action/reward。
+        self.lstm_size = int(lstm_size)
+        lstm_input_size = last_size + int(action_dim) + 1
+        self.lstm = nn.LSTM(lstm_input_size, self.lstm_size)
+        self.lstm_skip = bool(lstm_skip)
+        if self.lstm_skip and last_size != self.lstm_size:
+            raise ValueError("lstm_skip requires last MLP width == lstm_size")
+
+    def initial_state(self, batch_size, device):
+        """返回 episode 起点的零 (hidden, cell)，形状均为 [1,B,H]。"""
+        hidden = torch.zeros(
+            1, int(batch_size), self.lstm_size, device=device)
+        cell = torch.zeros(
+            1, int(batch_size), self.lstm_size, device=device)
+        return hidden, cell
+
+    def forward(self, observation, prev_action, prev_reward,
+                init_rnn_state=None):
+        """
+        把 [T,B,*] 历史输入编码成 [T,B,H] cost feature。
+
+        observation 必须已经用共享 RMS 标准化；返回 final_state 供相邻 TBPTT
+        chunk 继续传播，Agent 会在 chunk 边界 detach，限制反向图长度。
+        """
+        T, B = observation.shape[:2]
+        mlp_feature = self.body(observation.reshape(T * B, -1))
+        recurrent_input = torch.cat([
+            mlp_feature.view(T, B, -1),
+            prev_action.reshape(T, B, -1),
+            prev_reward.reshape(T, B, 1),
+        ], dim=2)
+        recurrent_output, final_state = self.lstm(
+            recurrent_input, init_rnn_state)
+        recurrent_flat = recurrent_output.reshape(T * B, self.lstm_size)
+        feature = (
+            mlp_feature + recurrent_flat if self.lstm_skip else recurrent_flat)
+        return feature.view(T, B, -1), final_state
