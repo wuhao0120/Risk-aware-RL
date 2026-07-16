@@ -1360,3 +1360,16 @@ target-KL确实删除了相当数量的更新：三个seed分别完成`321/308/3
 默认仍为online。提交前后80环境步CPU回归中，6个module、lambda、RMS/runtime、训练指标和评估逐位一致；模块身份/故意扰动测试证明target查询不受online即时改动；target smoke正常退出并记录非零query gap。新增gap指标会告诉我们正式训练中两网是否真的分离，而不是仅凭配置名称推断有效。
 
 首个正式C-X1只在P-M3失败seed1上改这一项，target-KL关闭，simple replay关闭，完整跑1M而非100k。520门为outage不高于0.22且至少改善0.08、reward不低于0.75，并检查成熟阶段gap和末段周期。预计总墙钟12～14分钟。若通过再扩seed0/2；若失败，不扫tau，进入两折cross-fit或独立ensemble critic，因为那才提供更强的训练样本隔离。
+
+
+### 13.54 C-X1 seed1长跑结论：100k会产生false negative，但长跑不是万能药（2026-07-16）
+
+C-X1相对P-M3 seed1只把actor的cost CDF查询从刚接受当前批监督的online critic换成上一批形成的Polyak target。它完整跑满1M步，纯训练393.9秒。40–80k的reward仍为负，200k才到0.471，260–400k从0.634升到0.933，64–72万达到0.831–1.031；因此若把100k的坏表现当作算法结论，会明确误杀这个方案。
+
+这条曲线同时说明“继续跑”不能替代稳定性分析。400k附近风险升高把lambda推到约0.29，reward随后回落；最终1M单批reward/outage又是0.747/0.35。末20%均值比baseline表现为reward `0.8253→0.9002`、outage `0.180→0.210`，即较高回报伴随略松的训练约束。真正应该看的不是单个最好点或最后点，而是多个阶段、冻结checkpoint评估和闭环振幅。
+
+同一个post-update final checkpoint的fresh 520条结果为reward `0.9661±0.5244`、outage `113/520=0.2173`；baseline为`0.8622±0.5809`、`159/520=0.3058`。reward增加0.1039（约12.1%），outage降低0.0885；outage差的保守Newcombe 95%区间为`[-0.1627,-0.0130]`。它通过了预注册单seed门，而140条的0.2214只作为screen，未被用来替代正式样本量。
+
+target-online查询差不是装饰：末20%平均absolute gap为0.0521、末点为0.1024。机制上，慢target切断了“当前批cost标签→online critic一步更新→同批actor risk advantage”的即时反馈，结果支持同批off-distribution/overfitting反馈确实是先前振荡的一部分。不过online critic的520条CDF仍为0.3608，对真实0.2173高估0.1435；baseline则低估0.1984。故当前证据是闭环改善，不是distributional critic已经准确。
+
+预算策略据此固定下来：bug/尺度和冻结局部机制可以100k筛；actor–critic–PID组合至少跨过300k冷启动，有持续趋势就跑满1M；贴边界配置用520条；普适结论依赖多个训练seed。C-X1 seed1通过后不在这个seed上继续1.5M或调target tau，而是原配置串行扩seed0/2各1M+520。只有跨seed回报和outage方向仍一致，才进入主推荐及与QCPO_refs对齐的更长预算；否则它与target-KL一样只保留为压力seed消融。

@@ -893,3 +893,16 @@
 - 数值测试确认online helper返回online模块、target helper返回target模块、初始两者逐tensor相等；故意修改online末层后target查询保持不变，非法mode被ValueError拒绝。target完整80步smoke训练`8.6s`、exit0，summary正确为`target`，末次target-online gap为`1.05e-9`；由于两批均零cost且只有4个critic step，该极小值只证明链路分离，正式run必须观察成熟阶段gap。
 - C-X1正式实验以P-M3失败seed1为压力基线，只改`cost_actor_query_mode=target`；`ppo_target_kl=0`、s0 aux=0、target tau=.05、interval=1、B20/C20/N32/T1/PID和1M预算全部不变。预计独占GPU训练约7～8分钟，140与520评估约5～6分钟，总计12～14分钟，持久化后台运行。
 - 520晋级门沿用压力seed标准：outage `≤0.22`且相对0.3058至少下降0.08，reward `≥0.75`；同时要求成熟阶段target-online gap非零、末20%不形成比baseline更大的周期。通过才扩seed0/2；失败则不扫target tau，转真正的两折cross-fit/双critic ensemble。该路线与target-KL保持正交，不在首轮混合。
+
+
+### E65：C-X1 seed1完整1M结果——早停到100k会误杀，520条门通过（2026-07-16）
+
+- 持久化job `DQCAC_DynamicButton_cx1_targetquery_timew995_pi_target015_smoothT1_b20_ckpt100k_1m_s1`、W&B `3oogqkf5`正常完成；纯训练`393.9s`，每100k保存pre-update rollout checkpoint，最终另存post-update checkpoint。相对P-M3 seed1只把`cost_actor_query_mode=online→target`，target-KL与s0 aux均关闭。
+- 这条曲线给出“短跑会误杀”的直接例子：40k/80k训练reward仍为`-0.040/-0.083`，200k才到`0.471`，260k/300k升到`0.634/0.807`，400k达到`0.933`；64–72万为`0.831–1.031`，82–98万多数为`0.781–1.135`。若100k按性能停掉，会错过后续学习。
+- 但它不是单调慢收敛。400k附近outage升高后lambda到约`0.29`，44–48万reward回落到`0.504–0.667`；末个1M训练批又是reward/outage `0.747/0.35`。因此延长训练的价值是看清策略—critic—PID周期，不能把“多跑”当作自动稳定化手段，也不能用最后一个小批替代冻结策略评估。
+- 对齐1M history后，baseline→C-X1的末20%训练均值为reward `0.8253→0.9002`、outage `0.180→0.210`、lambda `0.2206→0.1535`、KL `0.00246→0.00245`、clip `0.1293→0.1293`。成熟阶段target-online风险查询absolute gap末20%均值`0.0521`、末点`0.1024`，证明开关实际改变了actor监督而非数值上等同online。
+- 内置140条final为reward/outage `1.058/31/140=0.2214`，online critic CDF为`0.3616`。它只作screen；同一个post-update final checkpoint的fresh eval-only 520条为reward `0.9661±0.5244`、outage `113/520=0.21731`、Q80 cost `16`、mean cost `10.0135`，Wilson 95%区间`[0.1840,0.2548]`。
+- 同协议P-M3 seed1 baseline为reward `0.8622±0.5809`、outage `159/520=0.30577`。C-X1使reward增加`0.1039`（相对`+12.1%`，近似95%区间`[+0.0366,+0.1712]`），outage降低`0.08846`；保守Newcombe差值95%区间为`[-0.16267,-0.01296]`。它通过预注册的`≤0.22`、改善至少0.08、reward≥0.75三项门。
+- critic仍未解决：C-X1的online smooth CDF `0.3608`相对truth `0.2173`高估`0.1435`；baseline则为`0.1074`相对`0.3058`低估`0.1984`。absolute error有所下降但偏差符号翻转，说明慢target查询改善了闭环反馈，不等于distributional critic已经校准。
+- 按规则不在seed1上续1.5M或扫target tau，而是原样扩展seed0/2各1M+520。机器只有一张A100，改为串行持久化后台运行以避免GPU争用；独占训练实测约6.6分钟，含140 screen约8分钟，单个520复评约5分钟。seed0已启动，只有三seed方向和reward都可接受时才将C-X1列为主候选。
+- 正式数据：`_runs/wandb_export/dqc_pm3_seed1_vs_cx1_targetquery_1m_2026-07-16/`、`_runs/profiles/dqc_pm3_seed1_vs_cx1_targetquery_1m_2026-07-16/`；520结果为`_runs/DQCAC_DynamicButton_cx1_targetquery_1m_s1_final_eval520_s1.json`。
