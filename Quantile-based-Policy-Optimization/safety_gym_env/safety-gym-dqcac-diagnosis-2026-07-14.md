@@ -924,3 +924,23 @@ raw/actor-feature 的末期 hard-CDF action advantage 标准差仅约 `0.005～0
 持久化 smoke `dqc_cq1_sigmoid_cdf_smoke_20260716` 训练 `6.3s`、exit code 0，覆盖 MC、chunked critic、smooth actor、hard/smooth eval 与 JSON。下一条 P-S1 逐项复用 P-B3，只设 `cost_cdf_mode=sigmoid,T=1`；300k 训练预计约 `160s`，128 条终评约 `25～45s`。通过门槛是终评 outage `≤0.22` 且 reward 明显高于 E9 seed0 的 `0.658`；若 outage 仍高于 `0.3` 或 reward 前 150k 已明显崩坏，则不再扩 temperature 网格。
 
 分歧路线继续保留：固定温度 `{0.5,1,2}` 只在 T=1 有正信号时展开；C-Q2 用查询附近 quantile spacing 自适应温度；C-Q3 为 N=64/128；C-Q4 为 uniform τ + 查询点局部加密并做 importance weighting；C-Q5 为 uniform-IQN/query-mixture-IQN。C-H1 独立 cost RNN 与 C-B 大 `num_envs` 仍是正交消融，不和首条平滑 run 同时改变。
+
+### 13.15 P-S1 结果：平滑查询有效，但 T=1 尚未满足约束（2026-07-16）
+
+P-S1 job `DQCAC_DynamicButton_recur_mc_c20_pi_kp1_w50_smoothT1_300k_s0`（W&B `iisf2230`）从 commit `6926fb8` 启动，训练 `161.4s`、exit code 0。它严格复用 P-B3 的 recurrent+MC+C20+PI-window50 配置，只把 actor 查询 CDF 改为 `sigmoid,T=1`。
+
+130 条终评 reward 为 `0.8296`、empirical outage 为 `0.2692`；hard/smooth critic CDF 分别为 `0.3474/0.3509`，predicted mean cost `15.63` 对真实 `11.08`。对比 hard P-B3 的 `reward=1.132,outage=0.315`，T=1 确实沿正确方向降低了约束违反，但尚未达到 `0.2`。对比旧 E9 seed0 的 `0.658/0.200`，它保留了更高 reward，却还不能称为可行且优于基线。
+
+最有诊断价值的证据不是单个终点评分，而是 smooth 后 `risk_adv_nonzero_fraction` 在最后 12 个记录点达到 `0.865～0.999`、多数高于 `0.92`，risk-adv std 也提高到约 `0.008～0.021`。这说明 N=32 hard count 的确曾让大量候选动作 risk difference 精确为零；平滑 CDF 恢复了局部动作排序。最终 hard/smooth s0 CDF 只差 `0.0036`，所以这不是通过篡改 empirical outage 或整体风险标尺得到的假改善。最终 λ 反而从 hard 的 `0.307` 降到 `0.256`，却获得更低 outage，进一步说明每单位 dual penalty 的 actor 信号更有效。
+
+同时也要记录反证与代价：reward 比 hard P-B3 低约 `0.302`，终评 critic 从轻微低估变成了 mean-cost 明显高估；尽管 PPO KL `0.00549`、clip fraction `0.248`、无 NaN/Inf，温度过大仍可能把远离查询点的 quantiles 也纳入梯度，造成不必要的保守性。因此不能只沿“温度越大越好”单一路线外推。
+
+接下来做一条 P-S2 `T=2` 单变量门控：若 outage `≤0.22` 且 reward `>0.658`，再进入多 seed；若 outage 不优于 T=1 或 reward `≤0.658`，停止固定温度网格。另一合理分歧 `T=0.5` 记录为反向消融，用来识别 T=1 是否已经过平滑，但当前不优先消耗全量预算。若 T=2 未通过，保留并分开验证以下路线：
+
+1. C-Q2：温度随查询点附近 quantile spacing 自适应，避免全局固定 cost unit。
+2. C-Q3：N=64/128，提高 hard-CDF 原生分辨率；用已有 transition chunking 控制显存。
+3. C-Q4：uniform quantiles + 查询点局部加密；训练时对非均匀 τ 采样做 importance weighting，防止改变隐含目标分布。
+4. C-Q5a/C-Q5b：uniform-IQN 与 query-mixture-IQN 分开报告；IQN 仍估计 quantile function，CDF 通过反演/采样近似，不能把它描述成直接监督 CDF。
+5. C-H1：独立 online/target recurrent cost encoder；若增加 quantile 分辨率后 risk advantage 仍弱，再优先处理 history sufficient-state 问题。
+
+完整对齐结果位于 `_runs/profiles/dqc_smooth_cdf_ps1_300k_2026-07-16/`，原始 W&B 导出位于 `_runs/wandb_export/dqc_smooth_cdf_ps1_300k_2026-07-16/`。所有未选路线保留为轻量验证或论文消融，不因当前主路线选择而删除。

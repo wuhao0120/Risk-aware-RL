@@ -479,3 +479,14 @@
 - 持久化 smoke `dqc_cq1_sigmoid_cdf_smoke_20260716`：训练 `6.3s`、exit code 0，hard/smooth eval 和 JSON 全链路通过。
 - P-S1 只在 P-B3 上打开 `sigmoid,T=1`；预计训练约 160s、总计约 3～3.5min。门：outage `≤0.22` 且 reward `>0.658`；outage>0.3 或前半段 reward 明显崩坏则停止 temperature 网格。
 - 备选消融：T=.5/2、自适应 local spacing、N=64/128、local-τ importance weighting、uniform/query-mixture IQN；C-H1 与大 B 不在 P-S1 同时打开。
+
+### E24：P-S1 `sigmoid,T=1` 结果与温度分歧路线
+
+- P-S1：job `DQCAC_DynamicButton_recur_mc_c20_pi_kp1_w50_smoothT1_300k_s0`，W&B `iisf2230`，启动 commit `6926fb8`，训练 `161.4s`、exit code 0；相对 P-B3 唯一变化为 actor risk CDF 从 hard count 改成 `sigmoid,T=1`。
+- 130 条终评：reward `0.8296`、empirical outage `0.2692`、hard critic CDF `0.3474`、smooth critic CDF `0.3509`；predicted mean cost `15.63` 对 truth `11.08`，此时 critic 已由 P-B3 的轻微低估转为偏保守高估。
+- 与 hard P-B3 的 reward/outage `1.132/0.315` 相比，平滑以约 `0.302` reward 换来 `0.046` outage 改善；与旧 E9 可行边界 `0.658/0.200` 相比，reward 仍高 `0.172`，但约束尚差 `0.069`。因此它是明确正信号，不是最终可行解，也不扩 seed。
+- smooth 路线末段 `risk_adv_nonzero_fraction` 为 `0.865～0.999`、多数点高于 `0.92`，risk-adv std 约 `0.008～0.021`；这直接支持“hard N=32 查询导致动作差值稀疏/量化”的诊断。终评 hard/smooth s0 CDF 很接近，说明收益主要来自候选动作之间的局部连续排序，而不是简单把初始状态风险整体抬高。
+- 最终 `lambda=0.256`，低于 hard P-B3 的 `0.307`，却取得更低 outage；说明 smooth actor risk advantage 对单位 λ 更有效。末期 PPO KL `0.00549`、clip fraction `0.248`，无 NaN/Inf，不能用策略更新崩坏解释 reward 损失。
+- profile：`_runs/profiles/dqc_smooth_cdf_ps1_300k_2026-07-16/`；export：`_runs/wandb_export/dqc_smooth_cdf_ps1_300k_2026-07-16/`。
+- **当前单变量路线 P-S2**：只把温度 `1→2`。通过门为 outage `≤0.22` 且 reward `>0.658`；若 outage 不优于 T=1，或 reward 降到 `≤0.658`，立即停止固定温度网格。
+- **保留但不混跑的分歧路线**：`T=.5` 用于检验 T=1 是否过度平滑；自适应温度按查询附近 quantile spacing 定标；N=64/128 直接提高 hard-CDF 分辨率；uniform+local τ mixture 用 importance weight 保持目标分布；IQN 分 uniform-IQN 与 query-mixture-IQN 两条。若 T=2 失败，优先在 C-Q2/C-Q3 与 C-H1 中按诊断证据选择，不把多个变化塞进同一 run。
