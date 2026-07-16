@@ -1,0 +1,241 @@
+# -*- coding: utf-8 -*-
+"""
+VecAgentBase (safety_gym_env · CMDP 版) —— QCPO / DQC-AC-β 共享基类。
+
+与 portfolio_env_inf/agents/vec_base.py 逐块对齐, 三处 CMDP 适配 (数学骨架不变):
+    1. **环境**: SafetyVecEnv (CPU mujoco 同步 rollout) 替换 PortfolioVecTorch;
+       rollout 额外收集 **cost 流** (目标用 reward, 约束用 cost — 两条不同回报流)。
+    2. **策略**: tanh-μ 高斯 (动作 ∈(-1,1)+噪声, env clip); actor 看【全 obs】(无 portfolio
+       的 'weights' 切片 —— lidar/传感器全维度都有用)。logπ 仍是普通对角高斯。
+    3. **日志**: wandb 用与 risk_sensitive 相同的下尾口径记约束 —
+       Z=-C, q=-d, P(Z≤q)=P(C≥d); 任务回报 R 放 disc_reward/*。
+
+优化问题 (CMDP):  max_θ E[R]   s.t.   P_θ(C ≥ d) ≤ ω
+    R = Σ_t γ^t r_t        (奖励折扣回报, 目标; γ=0.99)
+    C = Σ_t γc^t c_t       (cost 折扣回报, 约束变量; γc 默认=γ)
+    d = cost_limit (约束阈值, 对 C 校准)   ω = q_alpha (目标 outage 概率)
+    日志等价: Z=-C, q=-d, α=ω → P(Z≤q)≤α 与上尾同值。
+"""
+import numpy as np
+import torch
+import wandb
+
+from utils import Actor                                       # tanh-μ 高斯策略 (MLP)
+from envs import make_vec_env                                 # CPU 向量化工厂 (mp 多进程 / sync 串行)
+
+
+class VecAgentBase(object):
+    """QCPO/DQCAC 共享: 环境/策略/采样(含cost)/日志(outage)/评估接口 (更新逻辑在子类)。"""
+
+    def __init__(self, args, env):
+        """
+        Args:
+            args: 超参命名空间 (device/gamma/cost_gamma/q_alpha(=ω)/cost_limit(=d)/horizon/
+                  num_envs/num_iterations/init_std/actor_hidden/wandb_*/algo_name/seed)
+            env:  SafetyEnv 实例 (env_id 来源 + 维度 + 备用评估环境)
+        """
+        # -------------------- 统一基础参数 --------------------
+        self.device = args.device                             # 计算设备 (网络在 GPU)
+        self.gamma = args.gamma                               # 奖励折扣 γ (目标)
+        self.cost_gamma = float(getattr(args, 'cost_gamma', args.gamma))  # cost 折扣 γc (默认=γ)
+        self.q_alpha = args.q_alpha                           # ω: 目标 outage 概率 P(C≥d)≤ω
+        # 约束阈值 d (对折扣 cost 回报 C 生效)。字段名沿用 quantile_threshold/cost_limit 兼容。
+        self.cost_limit = float(getattr(args, 'cost_limit',
+                                        getattr(args, 'quantile_threshold', 25.0)))
+        self.log_interval = args.log_interval                 # 控制台打印间隔 (按迭代)
+        self.num_envs = max(1, int(getattr(args, 'num_envs', 8)))              # 并行 env 数 B (CPU!)
+        self.num_iterations = max(1, int(getattr(args, 'num_iterations', 100)))
+        self.horizon = int(getattr(args, 'horizon', getattr(args, 'env_n', env.n)))  # 段长 T
+        self.algo_name = getattr(args, 'algo_name', self.__class__.__name__)
+
+        # -------------------- 环境与维度 --------------------
+        self.env_name = getattr(args, 'env_name', env.env_id)
+        self.eval_env = env                                   # SafetyEnv (备用 numpy 评估)
+        # vec_backend: 'mp' 多进程并行 (默认, CPU 多核仿真) / 'sync' 单进程串行 (调试/对拍)
+        self.vec_env = make_vec_env(env.env_id, num_envs=self.num_envs,
+                                    horizon=self.horizon, device=self.device,
+                                    ref_env=env, seed=int(getattr(args, 'seed', 0)),
+                                    backend=getattr(args, 'vec_backend', 'mp'))
+        self.n = self.vec_env.n                               # 一段 rollout 步长 T
+        self.state_dim = self.vec_env.obs_dim                 # 观测维度 (60/76)
+        self.action_dim = self.vec_env.act_dim                # 动作维度 (2)
+        self._log_2pi = float(np.log(2.0 * np.pi))            # 高斯 logπ 常量项
+
+        # -------------------- 统一高斯策略 (tanh-μ MLP) --------------------
+        hidden = getattr(args, 'actor_hidden', [256, 256])    # 默认 MLP (观测高维)
+        if isinstance(hidden, str):
+            hidden = [int(x) for x in hidden.split(',') if x.strip()]
+        self.actor = Actor(self.state_dim, self.action_dim,
+                           init_std=getattr(args, 'init_std', 0.5),
+                           hidden=hidden,
+                           learn_std=bool(getattr(args, 'learn_std', False))).to(self.device)
+
+        # -------------------- wandb (独立 project, env-step 为默认 x 轴) --------------------
+        tags = [t.strip() for t in str(getattr(args, 'wandb_tags', '') or '').split(',')
+                if t.strip()]
+        self._wandb_run = wandb.init(
+            project=getattr(args, 'wandb_project', 'safety_gym_qcrl'),
+            name=getattr(args, 'wandb_name', None) or f"{self.algo_name}_{args.seed}",
+            config={k: str(v) if not isinstance(v, (int, float, bool, str, type(None)))
+                    else v for k, v in vars(args).items()},
+            reinit=True,
+            group=getattr(args, 'wandb_group', None) or self.algo_name,
+            notes=getattr(args, 'wandb_notes', None),
+            tags=tags or None,
+            dir=getattr(args, 'wandb_dir', None))
+        if self._wandb_run is not None:
+            self._wandb_run.define_metric("progress/env_steps")
+            self._wandb_run.define_metric("*", step_metric="progress/env_steps")
+
+        self.last_outage_prob = 0.0                           # = last empirical P(Z≤q)=P(C≥d)
+        self.last_empirical_prob = 0.0                        # 与 risk_sensitive 同名
+
+    # ============================================================ 高斯策略工具 ============================================================
+    def _sample_actions(self, states):
+        """从当前高斯策略采样 a=μ(s)+σ·ε, μ=tanh(net(s))∈(-1,1)。返回 [*,ad] (env 会 clip 越界)。"""
+        means = self.actor(states)                            # μ(s), [*, ad] (已 tanh)
+        std = torch.exp(self.actor.log_std).view(1, -1).expand_as(means)
+        return means + torch.randn_like(means) * std          # a = μ + σ·ε
+
+    def _compute_log_probs(self, states, actions):
+        """对角高斯 logπ(a|s)=Σ_dim[-0.5((a-μ)²/σ²+2logσ+log2π)], 对 θ 可导。返回 [*]。
+        注: 不做 tanh 变量替换修正 (动作越界由 env clip, 与 NIPS QCPO 同口径)。"""
+        means = self.actor(states)
+        std = torch.exp(self.actor.log_std).view(1, -1).expand_as(means)
+        var = std.pow(2)
+        log_probs = -0.5 * (((actions - means) ** 2) / var
+                            + 2.0 * torch.log(std) + self._log_2pi)
+        return log_probs.sum(dim=-1)
+
+    def _entropy(self, states):
+        """高斯熵 (log_std 固定时为常数, 仅接口完整)。"""
+        ent = (0.5 * (1.0 + self._log_2pi) + self.actor.log_std).sum()
+        return ent.expand(states.shape[0])
+
+    # ============================================================ 向量化 rollout 骨架 (含 cost 流) ============================================================
+    def _rollout_core(self, keep_logp=False):
+        """
+        冻结策略并行采 B 条轨迹 (n 步锁步, 物理在 CPU, 张量在 device)。
+
+        Returns dict:
+            S [n,B,sd] / A [n,B,ad] / R [n,B] (reward) / C [n,B] (cost)  —— 原始堆叠
+            S2_last [B,sd]                          —— 截断次态 s_T (DQCAC bootstrap 用)
+            disc_return [B]   = Σ γ^t r_t           —— 奖励回报 R (目标)
+            disc_cost   [B]   = Σ γc^t c_t          —— cost 折扣回报 C (约束变量)
+            undisc_cost [B]   = Σ c_t               —— 未折扣累计 cost (报告/对论文口径)
+            logp [n,B] (keep_logp=True 时)          —— 采集时 logπ_old
+        """
+        n, B = self.n, self.num_envs
+        s = self.vec_env.reset()                              # [B, sd]
+        S, A, R, C, LP = [], [], [], [], []
+        disc_return = torch.zeros(B, dtype=torch.float32, device=self.device)   # R
+        disc_cost = torch.zeros(B, dtype=torch.float32, device=self.device)     # C (折扣)
+        undisc_cost = torch.zeros(B, dtype=torch.float32, device=self.device)   # Σc
+        dr, dc = 1.0, 1.0                                     # γ^t, γc^t
+        s2 = s
+        for t in range(n):
+            with torch.no_grad():                             # 冻结策略采集, 不建图
+                a = self._sample_actions(s)                   # [B, ad]
+                if keep_logp:
+                    LP.append(self._compute_log_probs(s, a))  # logπ_old, [B]
+            s2, r, c, done = self.vec_env.step(a)             # [B,sd],[B],[B],bool
+            S.append(s); A.append(a); R.append(r); C.append(c)
+            disc_return = disc_return + dr * r; dr *= self.gamma      # 累计 R
+            disc_cost = disc_cost + dc * c; dc *= self.cost_gamma     # 累计 C (折扣)
+            undisc_cost = undisc_cost + c                            # 累计 Σc
+            s = s2
+        out = {
+            'S': torch.stack(S, dim=0),                       # [n,B,sd]
+            'A': torch.stack(A, dim=0),                       # [n,B,ad]
+            'R': torch.stack(R, dim=0),                       # [n,B] reward
+            'C': torch.stack(C, dim=0),                       # [n,B] cost
+            'S2_last': s2,                                     # [B,sd]
+            'disc_return': disc_return,                       # [B] R
+            'disc_cost': disc_cost,                           # [B] C (折扣)
+            'undisc_cost': undisc_cost,                       # [B] Σc
+        }
+        if keep_logp:
+            out['logp'] = torch.stack(LP, dim=0)              # [n,B]
+        return out
+
+    # ============================================================ 统一日志 (下尾口径, 对齐 risk_sensitive) ============================================================
+    def _env_action_stats(self):
+        """从 vec_env.stats 取本迭代环境侧统计 (只走 stats, 避免与 render 重复记 avg_step_cost)。"""
+        out = {}
+        st = self.vec_env.stats() if hasattr(self.vec_env, 'stats') else {}
+        for k, v in st.items():
+            out[f'action/{k}'] = float(v)
+        return out
+
+    def _log_core(self, it, R_np, Zc_np, undiscC_np, extra=None):
+        """
+        统一 wandb 日志 (与 risk_sensitive 同键名的下尾口径)。
+
+        约束流: Z=-C, q=-d, α=ω  →  P(Z≤q)=P(C≥d); Q_α(Z)=-Q_{1-α}(C)。
+        任务流: disc_reward/{discounted,aver}_reward / return_std = 任务回报 R。
+
+        Args:
+            it:        当前迭代
+            R_np:      本迭代 B 条轨迹的奖励回报 R (numpy [B])
+            Zc_np:     本迭代 B 条轨迹的折扣 cost 回报 C (numpy [B]) —— 内部仍是 C
+            undiscC_np:未折扣累计 cost Σc (numpy [B]) —— debug 用
+            extra:     算法专属补充指标 dict
+        """
+        d, alpha = self.cost_limit, self.q_alpha
+        q = -d                                                # 下尾阈值
+        Z = -np.asarray(Zc_np, dtype=np.float64)              # Z = -C
+        empirical_prob = float(np.mean(Z <= q))               # = P(C≥d)
+        mean_R = float(np.mean(R_np))
+        std_R = float(np.std(R_np))
+        quantile_return = float(np.percentile(Z, alpha * 100))  # Q_α(Z)
+        margin = alpha - empirical_prob
+        self.last_empirical_prob = empirical_prob
+        self.last_outage_prob = empirical_prob                # 兼容旧 summary 字段名
+
+        env_steps = (it + 1) * self.num_envs * self.n
+        log_dict = {
+            'disc_reward/discounted_reward': mean_R,
+            'disc_reward/aver_reward': mean_R,
+            'disc_reward/quantile_reward': quantile_return,   # Q_α(Z)=-Q_{1-α}(C)
+            'disc_reward/return_std': std_R,
+            'quantile/q_est': quantile_return,
+            'quantile/margin_to_threshold': quantile_return - q,
+            'constraint/empirical_prob': empirical_prob,
+            'constraint/margin': margin,
+            'progress/iteration': it,
+            'progress/trajectories': (it + 1) * self.num_envs,
+            'progress/env_steps': env_steps,
+            # 原始 cost 诊断 (不进主面板命名空间)
+            'debug/cost_mean': float(np.mean(Zc_np)),
+            'debug/undisc_cost_mean': float(np.mean(undiscC_np)),
+            'debug/cost_limit': d,
+        }
+        log_dict.update(self._env_action_stats())
+        if extra:
+            log_dict.update(extra)
+        if self._wandb_run is not None:
+            self._wandb_run.log(log_dict, step=it)
+
+        if it % self.log_interval == 0 and it != 0:
+            lam = log_dict.get('lambda/value', None)
+            lam_s = f' lambda:{lam:.04f}' if isinstance(lam, (int, float)) else ''
+            ghat = log_dict.get('constraint/cdf_estimate_initial', None)
+            ghat_s = f' Ghat:{ghat:.03f}' if isinstance(ghat, (int, float)) else ''
+            print(f'Iter:{it:05d} (env_step:{env_steps}) || disc_a_r:{mean_R:.03f} '
+                  f'disc_q_r:{quantile_return:.03f}{lam_s}')
+            print(f'Iter:{it:05d} || P(Z<=q):{empirical_prob:.03f} '
+                  f'alpha:{alpha:.03f} margin:{margin:.03f}{ghat_s}\n')
+        return log_dict
+
+    # ============================================================ 评估接口 (统一) ============================================================
+    def choose_action(self, state):
+        """输入扁平 numpy 状态 → (ad,) float32 numpy 动作 (随机策略采样)。"""
+        s = torch.as_tensor(np.asarray(state, dtype=np.float32).reshape(1, -1),
+                            device=self.device)
+        with torch.no_grad():
+            a = self._sample_actions(s)
+        return a.squeeze(0).cpu().numpy().astype(np.float32)
+
+    def select_action(self, state):
+        """评估采样动作。"""
+        return self.choose_action(state)
