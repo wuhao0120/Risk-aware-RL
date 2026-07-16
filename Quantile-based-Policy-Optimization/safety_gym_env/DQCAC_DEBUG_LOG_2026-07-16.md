@@ -613,3 +613,21 @@
 - C-W4 与 C-W2 唯一差异是 temperature `2→1`；与 C-W3 相比则只把 hard 查询换成较窄 sigmoid。目标是在 hard 的高 reward/高 outage 与 T2 的低 reward/低 outage 之间寻找可行 Pareto 点。
 - 仍用 300k seed0、130 条终评，预计训练约160秒、总计约4分钟。硬门不变：outage `≤0.22` 且 reward `>0.658`；同时记录 CDF calibration、risk-adv nonzero fraction、PPO KL/clip。
 - 若 T1 不通过，停止固定 `.5/1/2/hard` 主线网格：若仍不安全，说明需要介于 T1/T2 的自适应/连续增益；若过安全，则说明策略对温度非常敏感，应显式引入 risk gain 或按 local quantile spacing 自适应带宽，而不是用温度碰运气。T=.5/1.5 只保留为论文温度曲线，不作为无止境主线调参。
+
+### E37：C-W4 结果——训练曲线看似通过，但 final PPO 后安全性瞬间失效（2026-07-16）
+
+- C-W4 job `DQCAC_DynamicButton_recur_mc_c20_timew995_pi_kp1_w50_smoothT1_300k_s0`（W&B `5lfdb3hn`）从 commit `03f8ddd` 启动，训练 `157.9s`、exit code 0；相对 C-W2 唯一变化是 temperature `2→1`。
+- 训练后60k 的 reward/outage/lambda 为 `0.973/0.143/0.0308`，最后两个 rollout 为 reward `1.220/1.218`、outage `0.10/0.10`，最后 lambda `0`。仅看训练日志，它会同时通过 reward 和 outage 门。
+- 但 130 条 final evaluation 为 reward `1.1999`、outage `0.5308`、mean cost `18.315`、cost quantile `29.2`；critic CDF `0.1454`、predicted mean `8.536`。最终策略高回报但严重不安全，CDF bias达到 `-0.385`。
+- 代码时序解释了表面矛盾：每条训练日志描述本轮 rollout 的更新前策略；随后 PID 根据 safe window 把 lambda 从 `0.0202→0`，再执行8次 PPO。final evaluation 描述这8次更新后的策略。最后一次 reward-only PPO 的 KL仅 `0.00236`、clip fraction `0.124`，但 Safety-Gym 的风险边界对小策略位移高度敏感，outage可从0.1跃迁到0.53。
+- 这不是“多跑130条后发现B=10噪声”可以完全解释：critic predicted mean/CDF 与训练前策略分布一致，却对更新后的 final policy 严重低估；训练数据和最终动作分布已经发生闭环 distribution shift。固定温度主网格停止。
+- 六条 CDF/time-weight 对齐 profile：`_runs/profiles/dqc_cost_time_weight_cw234_300k_2026-07-16/`；完整 history：`_runs/wandb_export/dqc_cost_time_weight_cw234_300k_2026-07-16/`。
+
+### E38：C-E1 评估 checkpoint/eval-only 实现与验证
+
+- 新增默认关闭的 `checkpoint_dir` 和 `checkpoint_interval`。DQCAC 在 rollout 完成后、dual/critic/PPO 任何更新前保存 `pre_update_rollout_policy`；统一入口在训练结束后另存 `post_update_final`。phase、iteration、env_steps和rollout reward/outage均写入payload，禁止把两个相位混为一谈。
+- checkpoint 保存 agent 直接持有的全部 `nn.Module`（actor、reward/cost critic、targets、obs RMS）、lambda/PID运行时标量和完整结构配置；不保存optimizer/scheduler动量，格式明确命名为 `safety-gym-eval-checkpoint-v1`，用途是严格恢复评估而非声称无损续训。
+- 写盘采用同目录 `.tmp` + `os.replace` 原子替换；SSH中断不会把半文件当成有效快照。`--eval_only <path>` 自动从payload恢复algo/env/seed/网络结构，默认关闭W&B，允许用`--set num_envs=...`调整评估并行度。
+- 持久化 smoke `dqc_checkpoint_eval_smoke_train_20260716`：2×2×100=400 env steps，训练 `6.1s`、exit 0；生成step200/400两个pre-update和一个post-update final，各326KB。两个独立eval-only job均严格加载、评估、写JSON并回收worker，exit 0。
+- step400 pre/post actor SHA256前16位分别为 `5a39d09395733a38` 与 `fa4f4d591309a5b5`，证明phase确实保存不同策略而非重复文件。JSON正确记录`checkpoint_loaded/phase/env_steps`。
+- 下一验证 C-E2：复跑 C-W4 且每20k保存一次，先用 rollout 指标筛选 2～3 个快照，再用统一512条评估确认是否存在 reward>0.658 且outage≤0.22 的真实策略。预计训练约160秒；15个快照的空间在 /vepfs 项目盘，不使用20G根目录。若只有pre-update安全而下一次update立即失效，则主修正应是lambda hysteresis/floor或安全setpoint，不是best-checkpoint掩盖训练不稳定。

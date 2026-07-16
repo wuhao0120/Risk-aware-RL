@@ -478,6 +478,10 @@ class DQCACBetaGPU(VecAgentBase):
             norm_warmup = self.obs_norm_warmup_iters if self.normalize_observation else 0
             in_warmup = it < max(self.warmup_iters, norm_warmup)
 
+            # 此时 actor/critic/obs RMS 都仍是产生本批 rollout 的版本。若启用 checkpoint，
+            # 必须在 dual、critic、PPO 任一步之前保存，保证快照与本批 reward/outage 对应。
+            self._maybe_save_rollout_checkpoint(it, batch)
+
             # 经验 PID 不依赖尚未校准的 critic，并在 actor epochs 前更新，逐位对齐 QCPO_refs 时序。
             dual_updated = False
             if (not in_warmup and self.dual_update_mode == 'empirical_pid'

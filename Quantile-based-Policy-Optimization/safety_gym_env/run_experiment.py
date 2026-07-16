@@ -103,6 +103,10 @@ def base_args(algo, seed, device, env_key):
     a.device = device
     a.wandb_dir = BASE_DIR
     a.wandb_project = 'safety_gym_qcrl'
+    # 默认不保存 checkpoint；显式给目录后，final 总会保存，正 interval 还会
+    # 由 DQCAC 在对应 rollout 的任何参数更新前保存评估快照。
+    a.checkpoint_dir = None
+    a.checkpoint_interval = 0
 
     if algo == 'QCPO':
         # MC 轨迹级约束版。safety-gym 观测信息量足 → θ 默认 adam (非 portfolio 噪声特征情形)。
@@ -324,8 +328,31 @@ def main():
     parser.add_argument('--num_eval', type=int, default=64, help="训练后评估轨迹数 (CPU 慢, 别太大)")
     parser.add_argument('--wandb_mode', type=str, default=None, help="online/offline/disabled")
     parser.add_argument('--tag', type=str, default='run')
+    parser.add_argument(
+        '--eval_only', type=str, default=None,
+        help="加载 safety-gym-eval-checkpoint-v1 并跳过训练；algo/env/seed/结构取自快照")
     parser.add_argument('--set', nargs='*', default=[], metavar='K=V', help="覆盖任意超参")
     cli = parser.parse_args()
+
+    # eval-only 先读轻量元数据，再构造同形 agent。文件由本仓库原子保存，
+    # weights_only=False 是因为 payload 还包含配置与标量字典，不只有 tensor。
+    checkpoint_payload = None
+    if cli.eval_only is not None:
+        checkpoint_payload = torch.load(
+            os.path.abspath(cli.eval_only), map_location='cpu', weights_only=False)
+        if checkpoint_payload.get('format') != 'safety-gym-eval-checkpoint-v1':
+            raise ValueError(
+                f"unsupported eval checkpoint: {checkpoint_payload.get('format')!r}")
+        cli.algo = str(checkpoint_payload['algo'])
+        cli.env = str(checkpoint_payload['env'])
+        cli.seed = int(checkpoint_payload['seed'])
+        if cli.algo not in {'QCPO', 'DQCAC', 'QCPO_REF'}:
+            raise ValueError(f"unsupported checkpoint algo: {cli.algo!r}")
+        if cli.env not in PAPER_ENVS:
+            raise ValueError(f"unsupported checkpoint env: {cli.env!r}")
+        # 独立复评默认不创建同名线上 run；用户显式传 online/offline 时仍尊重。
+        if cli.wandb_mode is None:
+            cli.wandb_mode = 'disabled'
 
     if cli.wandb_mode:
         os.environ['WANDB_MODE'] = cli.wandb_mode
@@ -335,6 +362,23 @@ def main():
 
     algo_for_args = 'DQCAC' if cli.algo == 'CALIB' else cli.algo
     args = base_args(algo_for_args, cli.seed, device, cli.env)
+
+    # checkpoint config 先覆盖默认值，命令行 --set 最后覆盖非结构性评估参数
+    #（例如 num_envs）。device/wandb 路径始终使用当前机器，checkpoint 保存开关清零。
+    if checkpoint_payload is not None:
+        for key, value in checkpoint_payload.get('config', {}).items():
+            if key not in {'device', 'wandb_dir', 'checkpoint_dir', 'checkpoint_interval'}:
+                setattr(args, key, value)
+        args.device = device
+        args.seed = cli.seed
+        args.algo_name = cli.algo
+        args.env_name = cli.env
+        args.env_id = PAPER_ENVS[cli.env]['env_id']
+        args.checkpoint_dir = None
+        args.checkpoint_interval = 0
+        previous_name = str(getattr(args, 'wandb_name', cli.algo))
+        args.wandb_name = f"{previous_name}_eval_{cli.tag}"
+
     overrides = {}
     for kv in cli.set:
         k, v = kv.split('=', 1)
@@ -366,9 +410,28 @@ def main():
           f"device={device} overrides={overrides}")
     t0 = time.time()
     agent = AgentCls(args, env)
-    agent.train()
-    train_t = time.time() - t0
-    print(f"\ntrain_time {train_t:.1f}s")
+    saved_checkpoint_path = None
+    if checkpoint_payload is None:
+        agent.train()
+        train_t = time.time() - t0
+        print(f"\ntrain_time {train_t:.1f}s")
+
+        # checkpoint_dir 非空时总保存 post-update final；正 interval 的 DQCAC
+        # 还已保存 pre-update rollout 策略，两种相位写在 payload 中，禁止混淆。
+        if getattr(agent, 'checkpoint_dir', None) is not None:
+            final_metrics = getattr(agent, 'get_training_summary', lambda: {})()
+            saved_checkpoint_path = agent.save_evaluation_checkpoint(
+                os.path.join(agent.checkpoint_dir, 'final_post_update.pt'),
+                iteration=int(args.num_iterations) - 1,
+                phase='post_update_final',
+                metrics=final_metrics)
+    else:
+        agent.load_evaluation_checkpoint(checkpoint_payload)
+        train_t = 0.0
+        print(
+            f"\neval_only checkpoint={os.path.abspath(cli.eval_only)} "
+            f"phase={checkpoint_payload.get('phase')} "
+            f"step={checkpoint_payload.get('env_steps')}")
 
     # ---- 统一评估 (同协议; QCPO_REF 为 LSTM 策略, 用其自管状态的同口径评估器) ----
     eval_vec = make_vec_env(args.env_id, num_envs=args.num_envs, horizon=args.horizon,
@@ -419,14 +482,28 @@ def main():
         run.log(eval_log)
         try:
             run.summary['eval/constraint_ok'] = bool(ok)
-            run.summary['budget/total_env_steps'] = int(args.num_envs) * int(args.num_iterations) * int(args.horizon)
+            if checkpoint_payload is None:
+                total_env_steps = (
+                    int(args.num_envs) * int(args.num_iterations) * int(args.horizon))
+            else:
+                total_env_steps = int(checkpoint_payload.get('env_steps', 0))
+            run.summary['budget/total_env_steps'] = total_env_steps
         except Exception as e:
             print(f"[warn] wandb summary 写入失败: {e}")
         run.finish()
     summary = getattr(agent, 'get_training_summary', lambda: {})()
-    out = {'tag': cli.tag, 'algo': cli.algo, 'env': cli.env, 'seed': args.seed,
-           'overrides': {k: str(v) for k, v in overrides.items()},
-           'train_seconds': train_t, 'eval': res, 'summary': summary}
+    out = {
+        'tag': cli.tag, 'algo': cli.algo, 'env': cli.env, 'seed': args.seed,
+        'overrides': {k: str(v) for k, v in overrides.items()},
+        'train_seconds': train_t, 'eval': res, 'summary': summary,
+        'checkpoint_loaded': (
+            os.path.abspath(cli.eval_only) if cli.eval_only is not None else None),
+        'checkpoint_phase': (
+            checkpoint_payload.get('phase') if checkpoint_payload is not None else None),
+        'checkpoint_env_steps': (
+            checkpoint_payload.get('env_steps') if checkpoint_payload is not None else None),
+        'checkpoint_saved': saved_checkpoint_path,
+    }
     os.makedirs(os.path.join(BASE_DIR, '_runs'), exist_ok=True)
     fp = os.path.join(BASE_DIR, '_runs', f"{cli.algo}_{cli.env}_{cli.tag}_s{args.seed}.json")
     with open(fp, 'w', encoding='utf-8') as f:

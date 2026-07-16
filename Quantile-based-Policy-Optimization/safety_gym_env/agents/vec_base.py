@@ -16,8 +16,10 @@ VecAgentBase (safety_gym_env · CMDP 版) —— QCPO / DQC-AC-β 共享基类�
     d = cost_limit (约束阈值, 对 C 校准)   ω = q_alpha (目标 outage 概率)
     日志等价: Z=-C, q=-d, α=ω → P(Z≤q)≤α 与上尾同值。
 """
+import os
 import numpy as np
 import torch
+import torch.nn as nn
 import wandb
 
 from utils import Actor, ObservationNormalizer                # 策略网络 + 可选逐维观测归一化
@@ -47,6 +49,30 @@ class VecAgentBase(object):
         self.num_iterations = max(1, int(getattr(args, 'num_iterations', 100)))
         self.horizon = int(getattr(args, 'horizon', getattr(args, 'env_n', env.n)))  # 段长 T
         self.algo_name = getattr(args, 'algo_name', self.__class__.__name__)
+        self.seed = int(getattr(args, 'seed', 0))              # checkpoint 元数据使用的训练 seed
+
+        # -------------------- 可选评估 checkpoint（默认完全关闭） --------------------
+        # checkpoint_interval=0 时不触碰磁盘，保持所有历史实验的时序与开销。
+        # 正数表示每隔多少个 rollout 保存一次“更新前策略”；该快照与本批真实
+        # reward/outage 严格对应，专门避免最后一次 PPO 后策略与训练日志错位。
+        checkpoint_dir = getattr(args, 'checkpoint_dir', None)
+        self.checkpoint_dir = None if checkpoint_dir in {None, '', 'none'} else str(checkpoint_dir)
+        self.checkpoint_interval = max(
+            0, int(getattr(args, 'checkpoint_interval', 0)))
+        if self.checkpoint_interval > 0 and self.checkpoint_dir is None:
+            raise ValueError("checkpoint_interval>0 requires checkpoint_dir")
+        if self.checkpoint_dir is not None and not os.path.isabs(self.checkpoint_dir):
+            checkpoint_root = str(getattr(args, 'wandb_dir', os.getcwd()))
+            self.checkpoint_dir = os.path.join(checkpoint_root, self.checkpoint_dir)
+
+        # 保存原始配置而不是从运行中对象反推网络结构。torch.device 等非基础类型
+        # 转为字符串；list/dict 保持原形，eval-only 可直接重建同形 agent。
+        self._checkpoint_config = {}
+        for key, value in vars(args).items():
+            if isinstance(value, (type(None), bool, int, float, str, list, tuple, dict)):
+                self._checkpoint_config[key] = value
+            else:
+                self._checkpoint_config[key] = str(value)
 
         # -------------------- 环境与维度 --------------------
         self.env_name = getattr(args, 'env_name', env.env_id)
@@ -98,6 +124,163 @@ class VecAgentBase(object):
 
         self.last_outage_prob = 0.0                           # = last empirical P(Z≤q)=P(C≥d)
         self.last_empirical_prob = 0.0                        # 与 risk_sensitive 同名
+
+    # ============================================================ 评估 checkpoint ============================================================
+    def _evaluation_checkpoint_state(self, iteration, phase, metrics=None):
+        """
+        构造仅用于恢复评估的轻量 checkpoint。
+
+        保存范围:
+            1. agent 直接持有的全部 nn.Module（actor、critic、target、obs RMS）；
+            2. lambda_dual 及 PID/window 等会影响诊断解释的运行时状态；
+            3. 原始结构配置、保存相位和与该策略对应的 rollout 指标。
+
+        不保存 optimizer/scheduler 动量，因此该格式不声称支持无损续训。这样可把
+        每个快照控制在模型权重规模，允许短实验按迭代保存并用大样本统一复评。
+        """
+        modules = {}
+        for name, value in vars(self).items():
+            if isinstance(value, nn.Module):
+                # 显式搬到 CPU，使 checkpoint 可跨 GPU 序号加载，也避免保存 device 依赖。
+                modules[name] = {
+                    key: tensor.detach().cpu()
+                    for key, tensor in value.state_dict().items()
+                }
+
+        # lambda 不是 Module parameter；单独复制以保留快照的约束强度解释。
+        tensors = {}
+        if hasattr(self, 'lambda_dual') and torch.is_tensor(self.lambda_dual):
+            tensors['lambda_dual'] = self.lambda_dual.detach().cpu().clone()
+
+        # 这些量不影响纯评估动作，但恢复后写 summary 时必须对应原快照，而不是初始化值。
+        runtime_names = (
+            'learning_steps', 'pid_i', 'last_empirical_prob', 'last_outage_prob',
+            'last_dual_prob', 'last_dual_raw_prob', 'last_dual_window_prob',
+            'last_dual_cost_quantile', 'last_dual_prob_gap', 'last_dual_quantile_gap',
+            'last_dual_control_error', 'last_dual_filtered_error',
+            'last_pid_episode_scale', 'last_pid_effective_leak', 'last_pid_delta',
+            'last_pid_actual_delta', 'last_pid_proportional', 'last_pid_output',
+        )
+        runtime = {
+            name: getattr(self, name)
+            for name in runtime_names
+            if hasattr(self, name)
+        }
+        if hasattr(self, 'empirical_cost_window'):
+            runtime['empirical_cost_window'] = list(self.empirical_cost_window)
+
+        env_steps = max(0, int(iteration) + 1) * self.num_envs * self.n
+        return {
+            'format': 'safety-gym-eval-checkpoint-v1',
+            'algo': self.algo_name,
+            'env': self.env_name,
+            'seed': self.seed,
+            'iteration': int(iteration),
+            'env_steps': int(env_steps),
+            'phase': str(phase),
+            'metrics': dict(metrics or {}),
+            'config': dict(self._checkpoint_config),
+            'modules': modules,
+            'tensors': tensors,
+            'runtime': runtime,
+        }
+
+    def save_evaluation_checkpoint(self, path, iteration, phase, metrics=None):
+        """
+        原子写入评估 checkpoint，返回绝对路径。
+
+        先写同目录 .tmp，再用 os.replace 原子替换目标；SSH 中断最多留下 .tmp，
+        不会把半个文件误当成可加载 checkpoint。
+        """
+        checkpoint_path = os.path.abspath(str(path))
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        temporary_path = checkpoint_path + '.tmp'
+        payload = self._evaluation_checkpoint_state(
+            iteration=iteration, phase=phase, metrics=metrics)
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, checkpoint_path)
+        print(
+            f"[checkpoint] saved phase={phase} step={payload['env_steps']} "
+            f"path={checkpoint_path}")
+        return checkpoint_path
+
+    def load_evaluation_checkpoint(self, checkpoint):
+        """
+        严格恢复评估权重与诊断状态。
+
+        checkpoint 可为 torch.load 后的 dict 或文件路径。Module 名称和 tensor shape
+        必须逐项匹配；结构不一致直接报错，避免静默部分加载产生不可解释结果。
+        """
+        if isinstance(checkpoint, (str, os.PathLike)):
+            payload = torch.load(
+                os.fspath(checkpoint), map_location='cpu', weights_only=False)
+        else:
+            payload = checkpoint
+        if payload.get('format') != 'safety-gym-eval-checkpoint-v1':
+            raise ValueError(f"unsupported checkpoint format: {payload.get('format')!r}")
+        if str(payload.get('algo')) != str(self.algo_name):
+            raise ValueError(
+                f"checkpoint algo={payload.get('algo')!r} != agent algo={self.algo_name!r}")
+        if str(payload.get('env')) != str(self.env_name):
+            raise ValueError(
+                f"checkpoint env={payload.get('env')!r} != agent env={self.env_name!r}")
+
+        for name, state in payload.get('modules', {}).items():
+            module = getattr(self, name, None)
+            if not isinstance(module, nn.Module):
+                raise KeyError(f"checkpoint module {name!r} is absent from reconstructed agent")
+            module.load_state_dict(state, strict=True)
+
+        for name, saved_tensor in payload.get('tensors', {}).items():
+            current = getattr(self, name, None)
+            if not torch.is_tensor(current):
+                raise KeyError(f"checkpoint tensor {name!r} is absent from reconstructed agent")
+            with torch.no_grad():
+                current.copy_(saved_tensor.to(device=current.device, dtype=current.dtype))
+
+        for name, value in payload.get('runtime', {}).items():
+            if name == 'empirical_cost_window' and hasattr(self, name):
+                window = getattr(self, name)
+                window.clear()
+                window.extend(value)
+            elif hasattr(self, name):
+                setattr(self, name, value)
+
+        print(
+            f"[checkpoint] loaded phase={payload.get('phase')} "
+            f"step={payload.get('env_steps')} algo={payload.get('algo')} "
+            f"env={payload.get('env')}")
+        return payload
+
+    def _maybe_save_rollout_checkpoint(self, iteration, batch):
+        """
+        按 interval 保存“产生当前 rollout 的策略”，必须在任何参数更新前调用。
+
+        batch 的 reward/outage 是该 actor 的直接观测证据；后续可先按这些便宜指标
+        筛选少量快照，再用同一 512/1024-episode 协议复评，避免保存后策略错配。
+        """
+        if self.checkpoint_dir is None or self.checkpoint_interval <= 0:
+            return None
+        if (int(iteration) + 1) % self.checkpoint_interval != 0:
+            return None
+
+        rewards = batch['disc_return'].detach().cpu().numpy()
+        costs = batch['disc_cost'].detach().cpu().numpy()
+        metrics = {
+            'rollout_reward_mean': float(np.mean(rewards)),
+            'rollout_reward_std': float(np.std(rewards)),
+            'rollout_outage': float(np.mean(costs >= self.cost_limit)),
+            'rollout_cost_mean': float(np.mean(costs)),
+            'lambda_before_update': float(
+                self.lambda_dual.detach().item()) if hasattr(self, 'lambda_dual') else 0.0,
+        }
+        env_steps = (int(iteration) + 1) * self.num_envs * self.n
+        filename = f"rollout_step{env_steps:09d}.pt"
+        return self.save_evaluation_checkpoint(
+            os.path.join(self.checkpoint_dir, filename),
+            iteration=iteration,
+            phase='pre_update_rollout_policy',
+            metrics=metrics)
 
     # ============================================================ 高斯策略工具 ============================================================
     def _normalize_states(self, states):

@@ -1119,3 +1119,19 @@ C-W2/C-W3 形成清楚的两端：T2 为 `reward/outage=0.480/0.131`，hard 为 
 五条关键曲线的完整对齐 profile 位于 `_runs/profiles/dqc_cost_time_weight_cw23_300k_2026-07-16/`，history 位于 `_runs/wandb_export/dqc_cost_time_weight_cw23_300k_2026-07-16/`。
 
 下一条 C-W4 只把 C-W2 的 temperature `2→1`，保留 time weighting、window50 PI、beta=.995 与全部其余配置。它是最小的中间强度验证，硬门仍为 outage `≤0.22` 且 reward `>0.658`。若失败，固定温度主线停止：后续优先按查询附近 quantile spacing 自适应 bandwidth，或引入显式 risk gain 将 critic校准与actor约束强度解耦；T=.5/1.5只作为温度曲线消融记录。
+
+### 13.26 C-W4：T=1 暴露 rollout 日志与 post-update final 策略错位（2026-07-16）
+
+C-W4（W&B `5lfdb3hn`）训练 `157.9s`、exit code 0。后60k reward/outage/lambda为 `0.973/0.143/0.0308`，最后两批 rollout都是约 `reward=1.22,outage=0.10`，末点lambda降到0。可是紧随其后的130条终评为 `reward=1.1999,outage=0.5308`，真实mean cost `18.315`、Q80 cost `29.2`；critic CDF/mean仅 `0.1454/8.536`。
+
+根因是精确的策略相位错位。训练循环先由旧策略采rollout并计算经验窗口，再更新PID和执行8次PPO；日志仍写刚采到的旧rollout，而final evaluation评估8次更新后的新策略。最后安全窗口使 `pid_i=0.026`、P项 `-0.06`，输出lambda被clip到0；随后reward-only更新虽只有KL `0.00236`，却跨过Safety-Gym的风险边界。critic仍拟合旧on-policy状态动作分布，对新策略产生严重distribution shift，CDF bias达到 `-0.385`。
+
+因此固定温度网格停止。T1不是简单的高方差失败，而是证明只看每轮pre-update rollout和最后post-update评估会把控制器相位混在一起。六条对齐profile位于 `_runs/profiles/dqc_cost_time_weight_cw234_300k_2026-07-16/`，完整history位于 `_runs/wandb_export/dqc_cost_time_weight_cw234_300k_2026-07-16/`。
+
+### 13.27 C-E1：原子评估 checkpoint 与 eval-only 恢复（2026-07-16）
+
+代码新增默认关闭的 `checkpoint_dir/checkpoint_interval`。DQCAC按interval在每轮rollout后、dual/critic/PPO前保存 `pre_update_rollout_policy`；统一入口另存 `post_update_final`。payload包含全部直接持有的nn.Module、obs RMS、lambda/PID诊断状态、结构配置、iteration/env_steps/phase及对应rollout指标。不保存optimizer动量，因此明确是评估快照，不冒充无损resume。
+
+写盘用同目录临时文件加原子replace。`--eval_only`从checkpoint自动重建algo/env/seed/网络，strict加载所有Module，并允许只覆盖num_envs等评估参数。持久化400-step smoke训练6.1秒，生成两个pre-update和一个final；两个独立恢复job均exit0。step400的pre/post actor hash分别为 `5a39d09395733a38/fa4f4d591309a5b5`，JSON也正确保存phase/env_steps。
+
+下一条C-E2复跑C-W4并每20k保存，共15个评估快照。先用便宜rollout门筛选，再对少量快照做512条同协议复评。若pre-update候选确实安全，说明策略空间中已有优于旧E9/QCPOrefs匹配预算的点；若下一次PPO立刻失效，则后续必须用lambda floor/hysteresis、safety setpoint或update-level安全回退稳定闭环，不能把best checkpoint当成算法已经稳定。
