@@ -667,3 +667,25 @@
 - 最终论文结论不得依赖单seed短跑。候选配置需要至少3个seed、每个至少1.5M；与QCPO_refs做完全公平最终比较时应使用相同环境步数，优先补到其`5M`预算，并报告均值、方差和约束置信区间。
 - 随机初始化确实可能制造短期false negative，特别是LSTM、更大的quantile critic和PID闭环；但它不能推翻确定性的代码/目标证据，例如N64旧实现梯度随N翻倍、uniform-transition目标不对齐initial outage、rollout与post-update final相位错位。这三类问题无需靠长跑“等它自己好”。
 - 下一实验P-M1-L1保持P-M1全部参数不变，只把训练从300k延长到1M并每50k保存checkpoint。按当前吞吐估计纯训练约`8.7min`，加130条终评约`10min`；全程由`launch_background.sh`持久化运行。
+
+
+### E43：P-M1-L1 延长到1M——600k曾改善，但1M回退，确认闭环极限环（2026-07-16）
+
+- job `DQCAC_DynamicButton_pm1_timew995_pi_target015_smoothT1_ckpt50k_1m_s0`，W&B `p4hbaqtv`，启动commit `ad1c042`（算法代码仍为`ce0262f`）；训练`508.4s`、exit code 0。100个iteration完整记录，无NaN/Inf；每50k保存，共20个pre-update加1个final，约221MB，均位于/vepfs项目盘。
+- 1M post-update final 130条为 reward `0.6279±0.7048`、outage `0.2462`、mean cost `11.592`、Q80 cost `16.2`；critic hard/smooth CDF `0.2839/0.2851`，predicted mean `14.284`，lambda `0.4181`。相对300k final的`0.7223/0.2462`，outage没有改善、reward反而下降。
+- 分段训练均值揭示非单调动态：0–300k reward/outage/window/lambda为`0.580/0.217/0.191/0.105`；300–600k为`0.702/0.197/0.213/0.213`；600k–1M变成`0.750/0.303/0.298/0.417`。后200k raw/window outage均约`0.305/0.300`，lambda均值已到`0.455`，仍未把策略稳定拉回约束内。
+- phase-aligned 520条独立评估为：
+  - 300k：reward `0.7764±0.4346`，outage `129/520=0.2481`，Wilson 95% `[0.2129,0.2870]`；critic CDF `0.3214`，bias `+0.0733`。
+  - 600k：reward `0.8143±0.6583`，outage `117/520=0.2250`，Wilson 95% `[0.1912,0.2628]`；critic CDF `0.1053`，bias `-0.1197`。
+  - 1M：reward `0.6325±0.6478`，outage `127/520=0.2442`，Wilson 95% `[0.2093,0.2829]`；critic CDF `0.2801`，bias `+0.0359`。
+- 600k确实优于300k，证明“短跑会漏掉后期改善”不是空想；但1M又回退，且三个点的critic bias在正/负之间大幅翻转。它不是单调慢收敛，而是critic分布漂移、B=10窗口噪声、PID延迟和PPO策略步长耦合形成的极限环。
+- 不能直接把raw risk-advantage与reward advantage比较：代码实际会除以`constraint_sigma_ema`。按真实归一化后，risk/reward有效std比值从0–300k的约`0.60`升到600k–1M的`1.47`，末200k约`1.65`；所以后期不安全不是“risk项绝对太小”。更可能是动作风险排序噪声/critic漂移使方向不够可靠，增大lambda只会放大这个非平稳信号。
+- 完整history：`_runs/wandb_export/dqc_pm1_1m_2026-07-16/`；profile与图：`_runs/profiles/dqc_pm1_1m_2026-07-16/`；三个520条JSON均保留在`_runs/`。
+
+### E44：P-M2 预注册——actor LR与QCPO_refs对齐到1e-4（2026-07-16）
+
+- P-M2相对P-M1-L1只把`theta_lr0=3e-4→1e-4`。QCPO_refs同样使用8 PPO epochs、clip=.1，但optimizer LR是`1e-4`；当前DQCAC末200k KL/clip均值已到约`0.00519/0.241`，终点为`0.00661/0.323`，对风险边界来说更新偏激进。
+- 因更小LR早期必然更慢，本实验不再用300k否决，直接跑1M、每50k保存phase checkpoint；预计训练约8.5–9分钟，final 130条约1分钟。
+- 预注册判断：final 130条只做便宜screen；若reward `>0.658`且outage `≤0.27`，或600k–1M末段呈持续安全改善，则扩520条。正式通过仍要求520条点估计outage `≤0.22`且reward `>0.658`，并要求300k/600k/1M不存在P-M1那样的大幅回退。
+- 若LR降低能明显压低KL/clip却仍有risk周期，下一正交变量是`num_envs=20`（降低outage/PID和critic batch方差）；若KL稳定但action risk方向仍噪声，测试`num_action_samples=16`；若单次更新偶发越界，新增默认关闭的PPO target-KL early stop。三条路线不混入P-M2。
+- 当前仍只做seed0配置选择。随机初始化false negative的可能性保留；任何最终候选必须在3个seed复现，不能用P-M1-L1 seed0否定整个算法族。

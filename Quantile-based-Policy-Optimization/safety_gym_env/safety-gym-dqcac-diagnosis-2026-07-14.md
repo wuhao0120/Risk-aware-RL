@@ -1165,3 +1165,22 @@ P-M1（W&B `tkrudpbq`）训练`156.6s`并正常结束。130条final evaluation�
 另一方面，长跑不能被用来模糊已经确定的问题：旧N64 loss归一化使梯度随quantile数量改变，uniform transition QR目标被大量后期低return-to-go样本支配，pre-update rollout与post-update final策略相位错位。这些结论由公式、配对运行或checkpoint复评直接支持，不依赖“也许以后会好”。N64/reference scaling、local quantile和cost-LSTM的算法效果则仍只是在100k无早期收益，长期结论保持开放。
 
 后续采用四级预算：100k机制筛选；300k闭环晋级；1M稳定性验证并在300k/600k/1M做phase-aligned复评；最终候选至少3 seeds×1.5M，与QCPO_refs的正式公平比较补到相同5M环境步数。P-M1-L1保持P-M1参数完全不变，只训练到1M，每50k保存checkpoint，预计纯训练约8.7分钟、含终评约10分钟。若1M仍呈大周期振荡，再把lambda hysteresis/floor、actor LR/PPO epoch和PID增益作为互不混杂的单变量路线。
+
+
+### 13.32 1M长跑回答了“实验是否太短”：会漏掉中期好点，但不会自动解决不稳定（2026-07-16）
+
+P-M1-L1（W&B `p4hbaqtv`）把完全相同的seed0轨迹从300k延长到1M，训练`508.4s`、exit0。post-update 130条终评为reward `0.6279`、outage `0.2462`；300k对应值是`0.7223/0.2462`，因此简单延长700k没有改善最终约束，还损失了reward。
+
+更有说服力的是三个同协议、同相位、各520条的checkpoint评估。300k为`reward/outage=0.7764/0.2481`，600k改善到`0.8143/0.2250`，1M又退到`0.6325/0.2442`。对应outage Wilson 95%区间分别为`[0.2129,0.2870]`、`[0.1912,0.2628]`、`[0.2093,0.2829]`。所以用户提出的可能性成立：如果只看300k，会漏掉600k的更好工作点；但这个改善没有保持到1M，不能解释为普通的“初始化慢、后面自然收敛”。
+
+训练分段同样显示极限环。300–600k raw outage均值为`0.197`，600k–1M却升到`0.303`，同时lambda均值从`0.213`升到`0.417`。critic CDF bias又从300k的`+0.073`翻到600k的`-0.120`，再到1M的`+0.036`。这说明策略风险、critic校准与dual控制存在相位差和分布漂移；长跑把问题暴露得更清楚，但本身不是修复。
+
+风险尺度也重新按实际代码核算。raw CDF action-advantage会除以EMA constraint std，不能直接和reward GAE数值比较。归一化后，600k–1M risk/reward有效std比约`1.47`，末200k约`1.65`。后期不安全不是惩罚项完全没力度，而是risk方向的可靠性和更新时序不足；继续无条件增大lambda可能放大噪声并进一步牺牲reward。
+
+完整导出、profile和图分别位于`_runs/wandb_export/dqc_pm1_1m_2026-07-16/`与`_runs/profiles/dqc_pm1_1m_2026-07-16/`。
+
+### 13.33 下一步采用长预算单变量稳定化，而不是回到100k碰运气（2026-07-16）
+
+P-M2只把actor初始LR从`3e-4`降到QCPO_refs的`1e-4`。两者均为8 PPO epochs和clip=.1；P-M1-L1末200k KL/clip均值`0.00519/0.241`、终点`0.00661/0.323`，说明DQCAC的三倍LR可能放大风险边界附近的策略跃迁。因为小LR学习更慢，P-M2直接给1M预算，不允许用300k早期reward偏低否决。
+
+final 130条只用于screen，正式门仍是520条outage点估计不高于0.22且reward高于0.658，并检查300k/600k/1M是否维持而非只出现单个好checkpoint。下一分歧路线按证据排序：`num_envs=20`降低tail/PID批方差；`num_action_samples=16`降低每个状态action baseline的Monte-Carlo噪声；PPO target-KL early stop限制偶发大更新。它们分别测试，不和LR同时改。seed0用于选配置，最终必须至少3 seeds；100k的N64/local quantile/LSTM负结果继续只解释为“无早期收益”，不升级成长期定论。
