@@ -25,6 +25,53 @@ def init_weights(module, gain=1.0):
     return module
 
 
+class ObservationNormalizer(nn.Module):
+    """
+    逐维 observation running mean/variance，与 QCPO_refs 的 RunningMeanStdModel 同公式。
+
+    rollout 内统计保持冻结；rollout 完成后由 agent 批量调用 update()。这样采样期间的
+    行为策略是固定分布，同时 actor、value 与 distributional critics 可共享同一输入尺度。
+    """
+
+    def __init__(self, state_dim, var_clip=1e-6, value_clip=10.0):
+        """初始化均值=0、方差=1、样本数=0；三个量注册为 buffer，自动跟随 device。"""
+        super().__init__()
+        self.var_clip = float(var_clip)                         # 防止近常数维除以接近 0 的标准差
+        self.value_clip = float(value_clip)                     # 对齐 QCPO_refs 的 [-10,10] 截断
+        self.register_buffer('mean', torch.zeros(state_dim))
+        self.register_buffer('var', torch.ones(state_dim))
+        self.register_buffer('count', torch.zeros(()))
+
+    @torch.no_grad()
+    def update(self, observations):
+        """把 [*,state_dim] 扁平化后，用 Chan 并行方差公式合并当前批统计。"""
+        x = observations.reshape(-1, self.mean.numel())
+        batch_mean = x.mean(dim=0)                              # 当前 rollout 各观测维均值
+        batch_var = x.var(dim=0, unbiased=False)                # population variance，与 ref 一致
+        batch_count = x.shape[0]
+
+        if self.count.item() == 0:
+            self.mean.copy_(batch_mean)
+            self.var.copy_(batch_var)
+            self.count.fill_(batch_count)
+            return
+
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        m_a = self.var * self.count                             # 历史平方离差和
+        m_b = batch_var * batch_count                           # 当前批平方离差和
+        m2 = m_a + m_b + delta.pow(2) * self.count * batch_count / total
+        self.mean.copy_(self.mean + delta * batch_count / total)
+        self.var.copy_(m2 / total)
+        self.count.copy_(total)
+
+    def forward(self, observations):
+        """返回 clip((obs-mean)/sqrt(var), -value_clip, value_clip)，不修改统计。"""
+        variance = self.var.clamp_min(self.var_clip)
+        normalized = (observations - self.mean) / variance.sqrt()
+        return torch.clamp(normalized, -self.value_clip, self.value_clip)
+
+
 class Actor(nn.Module):
     """
     高斯策略网络: π(a|s)=N(μ(s), σ²I), 动作 ∈ (-1,1) (tanh 压缩均值)。

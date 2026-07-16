@@ -80,6 +80,9 @@ class DQCACBetaGPU(VecAgentBase):
         valid_reward_modes = {'distributional', 'gae', 'gae_ppo'}
         if self.reward_actor_mode != 'gae_ppo' and self.actor_updates_per_episode > 1:
             raise ValueError("multiple actor updates on one rollout require gae_ppo importance ratio + clip")
+        if self.normalize_observation and self.reward_actor_mode != 'gae_ppo':
+            raise ValueError(
+                "post-rollout observation normalization requires gae_ppo importance correction")
         if self.reward_actor_mode not in valid_reward_modes:
             raise ValueError(f"reward_actor_mode must be one of {sorted(valid_reward_modes)}, "
                              f"got {self.reward_actor_mode!r}")
@@ -173,7 +176,9 @@ class DQCACBetaGPU(VecAgentBase):
             # GAE 与 value target 每个 rollout 固定一次，供后续多个 epoch 共同使用。
             if self.reward_actor_mode != 'distributional':
                 self._prepare_reward_gae(batch)
-            in_warmup = it < self.warmup_iters
+            # obs norm 首批只建立 moments；随后 PPO ratio 才比较同一批的 old/current policy。
+            norm_warmup = self.obs_norm_warmup_iters if self.normalize_observation else 0
+            in_warmup = it < max(self.warmup_iters, norm_warmup)
 
             # ===== 2. 内层更新 (双 critic + actor) =====
             critic_info, actor_info = {}, {}
@@ -217,6 +222,9 @@ class DQCACBetaGPU(VecAgentBase):
         keep_logp = self.reward_actor_mode == 'gae_ppo'
         roll = self._rollout_core(keep_logp=keep_logp)        # S,A,R,C,S2_last,(可选 logp)
         Smat, Amat, Rmat, Cmat = roll['S'], roll['A'], roll['R'], roll['C']
+        if self.normalize_observation:
+            # 采样期间 moments 冻结；整段完成后一次合并，随后 actor/value/critic 共用新统计。
+            self.obs_normalizer.update(Smat)
 
         # ---- cost budget 后处理递推: b[t+1]=(b[t]-c[t])/γc, b[0]=d ----
         Bud = torch.empty(n, B, dtype=torch.float32, device=self.device)
@@ -508,7 +516,8 @@ class DQCACBetaGPU(VecAgentBase):
 
     # ============================================================ 辅助 (与模板同语义) ============================================================
     def _aug(self, states, steps):
-        """critic step 增广 (critic_step_feature=False 时原样; 截断 bootstrap → 默认关闭)。"""
+        """先共享观测归一化，再按需追加 critic/value 的 t/T step feature。"""
+        states = self._normalize_states(states)
         if not self.critic_step_feature:
             return states
         if not torch.is_tensor(steps):
@@ -524,7 +533,9 @@ class DQCACBetaGPU(VecAgentBase):
         不改变 cost advantage 数值，可显著减少长 rollout 的 GPU 计算。
         """
         b_col = budgets.unsqueeze(1)
-        s_aug = self._aug(states, steps) if steps is not None else states
+        # 所有 critic 前向都必须与 actor 共享 observation 统计；steps=None 仅表示
+        # 不追加 t/T，不能跳过归一化，否则该兼容分支会混用两套输入尺度。
+        s_aug = self._aug(states, steps) if steps is not None else self._normalize_states(states)
         q_list, c_list = [], []
         for _ in range(self.num_action_samples):
             a = self._sample_actions(states)
@@ -619,6 +630,13 @@ class DQCACBetaGPU(VecAgentBase):
         if self.advantage_norm == 'qcpo':
             extra['norm/return_sigma_ema'] = float(self.return_rms.std)
             extra['norm/constraint_sigma_ema'] = float(self.constraint_rms.std)
+        if self.normalize_observation:
+            obs_std = self.obs_normalizer.var.detach().clamp_min(0.0).sqrt()
+            extra['obs_norm/count'] = float(self.obs_normalizer.count.item())
+            extra['obs_norm/mean_abs'] = float(self.obs_normalizer.mean.detach().abs().mean().item())
+            extra['obs_norm/std_min'] = float(obs_std.min().item())
+            extra['obs_norm/std_median'] = float(obs_std.median().item())
+            extra['obs_norm/std_max'] = float(obs_std.max().item())
 
         self._log_core(it, R_np, Zc_np, Cu_np, extra=extra)  # 控制台两行由 _log_core 统一打
 

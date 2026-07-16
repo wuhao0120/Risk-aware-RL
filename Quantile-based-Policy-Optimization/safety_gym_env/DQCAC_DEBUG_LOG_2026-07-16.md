@@ -125,10 +125,24 @@
 
 ### E4：相同 PPO 主干，移除 reward-only warmup
 
-- 状态：待启动；不改 loss、网络或学习率，只令 `warmup_iters=0`。
+- 状态：已完成（exit code 0）；不改 loss、网络或学习率，只令 `warmup_iters=0`。
+- job：`DQCAC_DynamicButton_dbg_e4_gaeppo8_nowarmup_300k_s0`；W&B run id：`6y5i04cr`；启动 commit：`81af9de`。
 - 设置保持 E3：GAE+PPO、actor epochs=8、critic/value epochs=10、`lambda_max=0`、固定 std=1.0。
-- 预算：30 iterations = 30 万 env steps，恰好提供 30 个 actor rollouts，与 E3 在 60 万步时累计的 actor rollout 数相同；评估 64 条轨迹，预计总计约 3 分钟。
-- 判据：按 actor-rollout 数与 E3 对齐，并与 QCPO_refs 的前 30 万步比较；若仍有数量级差距，再进入 observation normalization 与 learnable std 的逐项消融。
+- 实际训练耗时 `140.3s`；评估 70 条轨迹 mean reward `0.2577`、outage `0.10`。
+- 30 万步 profile：late reward mean `0.2146`、slope `+0.9341/百万步`；同预算 QCPO_refs 为 `1.355/+5.431`，有 warmup 的 DQC 变体仍约 `-0.051`。
+- actor-rollout 对齐：E4 的前 30 个 actor rollouts late mean `0.2146`，高于 E3 第 31~60 个 rollout 的 `0.1550`；去掉 warmup 不只节省 env steps，也略改善相同更新次数下的结果。
+- 终点 PPO：ratio std `0.0738`、clip fraction `0.1653`、approx KL `0.00271`；仍有限且无 NaN/Inf。
+- 结论：旧 30-iteration warmup 在 reward 主干上是明确的样本浪费；恢复约束时应只延迟 dual/risk 分支，不应冻结 reward PPO actor。
+- 最终导出：`_runs/wandb_export/final_e4_dynamicbutton_2026-07-16/`；profile：`_runs/profiles/final_e4_dynamicbutton_2026-07-16/`。
+
+### E5：在 E4 上只增加逐维 observation normalization
+
+- 状态：实现与验证已完成，待启动短预算训练；保持 MLP、固定 std=1.0、GAE/PPO、epochs、学习率和 `lambda_max=0` 不变。
+- 选择顺序依据：QCPO_refs 与 E4 都从 `σ=1` 开始，30 万步 entropy 仅为 `2.809` vs `2.838`，可学习 std 变化很小；而 QCPO_refs 明确使用 running mean/variance、clip 到 [-10,10]。
+- 实现要求：actor、reward value、reward/cost critics 共用同一份逐维统计；rollout 期间统计冻结，rollout 后更新；首次仅刷统计、不更新 actor，避免新旧归一化导致虚假 PPO ratio。
+- 实现验证：Chan 合并公式与 QCPO_refs `RunningMeanStdModel` 数值逐项对拍，`mean/var/output` 最大绝对误差均为 `0`；持久化后台端到端烟测正常退出，覆盖首次统计 warmup、GAE、PPO 两轮 actor update 和训练后评估。
+- 预算：30 万步、评估 64 条轨迹，预计总计约 3 分钟；与 E4/QCPO_refs 做同预算和 actor-rollout 双重对齐。
+- 判据：若 late reward/斜率没有明显超过 E4，则保留开关但不默认启用，下一项才测试 learnable std 或 LSTM/prev-action-reward。
 
 ## 4. 分阶段改进路线
 

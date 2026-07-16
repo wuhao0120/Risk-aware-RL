@@ -151,6 +151,10 @@ def base_args(algo, seed, device, env_key):
         a.critic_grad_clip = 10.0
         # reward actor 主干消融：默认保持旧 distributional；实验按 gae → gae_ppo 逐项打开。
         a.reward_actor_mode = 'distributional'
+        a.normalize_observation = False                  # 可选 QCPO_refs 逐维 running mean/variance
+        a.obs_norm_var_clip = 1e-6                       # 方差下限，防止常数维数值爆炸
+        a.obs_norm_clip = 10.0                           # 归一化 observation 截断到 [-10,10]
+        a.obs_norm_warmup_iters = 1                      # 首个 rollout 只刷统计，不更新 actor
         a.gae_lambda = 0.97
         a.reward_advantage_norm = False                 # QCPO_refs 默认不标准化 reward advantage
         a.ppo_ratio_clip = 0.1

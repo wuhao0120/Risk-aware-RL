@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import wandb
 
-from utils import Actor                                       # tanh-μ 高斯策略 (MLP)
+from utils import Actor, ObservationNormalizer                # 策略网络 + 可选逐维观测归一化
 from envs import make_vec_env                                 # CPU 向量化工厂 (mp 多进程 / sync 串行)
 
 
@@ -60,6 +60,15 @@ class VecAgentBase(object):
         self.state_dim = self.vec_env.obs_dim                 # 观测维度 (60/76)
         self.action_dim = self.vec_env.act_dim                # 动作维度 (2)
         self._log_2pi = float(np.log(2.0 * np.pi))            # 高斯 logπ 常量项
+        # 可选 QCPO_refs 风格的逐维观测归一化；默认关闭，保证旧实验可精确复现。
+        self.normalize_observation = bool(getattr(args, 'normalize_observation', False))
+        self.obs_norm_var_clip = float(getattr(args, 'obs_norm_var_clip', 1e-6))
+        self.obs_norm_clip = float(getattr(args, 'obs_norm_clip', 10.0))
+        self.obs_norm_warmup_iters = max(
+            0, int(getattr(args, 'obs_norm_warmup_iters', 1)))
+        self.obs_normalizer = ObservationNormalizer(
+            self.state_dim, var_clip=self.obs_norm_var_clip,
+            value_clip=self.obs_norm_clip).to(self.device)
 
         # -------------------- 统一高斯策略 (tanh-μ MLP) --------------------
         hidden = getattr(args, 'actor_hidden', [256, 256])    # 默认 MLP (观测高维)
@@ -91,16 +100,24 @@ class VecAgentBase(object):
         self.last_empirical_prob = 0.0                        # 与 risk_sensitive 同名
 
     # ============================================================ 高斯策略工具 ============================================================
+    def _normalize_states(self, states):
+        """用 rollout 间共享且当前冻结的 running moments 归一化；关闭开关时原样返回。"""
+        if not self.normalize_observation:
+            return states
+        return self.obs_normalizer(states)
+
     def _sample_actions(self, states):
         """从当前高斯策略采样 a=μ(s)+σ·ε, μ=tanh(net(s))∈(-1,1)。返回 [*,ad] (env 会 clip 越界)。"""
-        means = self.actor(states)                            # μ(s), [*, ad] (已 tanh)
+        policy_states = self._normalize_states(states)        # actor 与 logπ 必须使用同一输入变换
+        means = self.actor(policy_states)                     # μ(s), [*, ad] (已 tanh)
         std = torch.exp(self.actor.log_std).view(1, -1).expand_as(means)
         return means + torch.randn_like(means) * std          # a = μ + σ·ε
 
     def _compute_log_probs(self, states, actions):
         """对角高斯 logπ(a|s)=Σ_dim[-0.5((a-μ)²/σ²+2logσ+log2π)], 对 θ 可导。返回 [*]。
         注: 不做 tanh 变量替换修正 (动作越界由 env clip, 与 NIPS QCPO 同口径)。"""
-        means = self.actor(states)
+        policy_states = self._normalize_states(states)        # 与采样路径共用相同 running moments
+        means = self.actor(policy_states)
         std = torch.exp(self.actor.log_std).view(1, -1).expand_as(means)
         var = std.pow(2)
         log_probs = -0.5 * (((actions - means) ** 2) / var
