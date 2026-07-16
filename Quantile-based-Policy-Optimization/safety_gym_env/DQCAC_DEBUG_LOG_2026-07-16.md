@@ -114,10 +114,21 @@
 
 ### E3：纯奖励门——GAE + PPO clip 多 actor epochs
 
-- 状态：待启动；只在 E2 上增加固定行为策略 ratio、PPO clip 与多 actor epochs。
+- 状态：已完成（exit code 0）；只在 E2 上增加固定行为策略 ratio、PPO clip 与多 actor epochs。
+- job：`DQCAC_DynamicButton_dbg_e3_gaeppo8_rewardonly_600k_s0`；W&B run id：`d2rfqck2`；启动 commit：`1970fa5`。
 - 设置：`reward_actor_mode=gae_ppo`、actor epochs=8（对齐 QCPO_refs）、critic/value epochs=10、`ppo_ratio_clip=0.1`；`lambda_max=0`、std、warmup、B/T 与 E2 保持一致。
-- 预算：60 iterations = 60 万 env steps，评估 64 条轨迹；预计训练约 4~5 分钟，含评估约 5~6 分钟。
-- 判据：reward late mean/slope 至少超过同预算 E1；同时 ratio、clip fraction、approx KL 和 actor grad 必须有限。若未通过，再单独测试去掉 reward-only 无意义的 30-iteration warmup，不把两个变量混为一次改动。
+- 实际训练耗时 `272.3s`；评估 70 条轨迹 mean reward `0.2179`、outage `0.0714`。
+- 60 万步严格对齐：late reward mean `0.1291`、slope `+0.3058/百万步`，超过 E1 的 `0.0451/+0.1728` 和旧 DQC 的 `0.0943/+0.2828`，但仍远低于 QCPO_refs 的 `1.574/+2.711`。
+- PPO late health：ratio std `0.0449`、clip fraction `0.0425`、approx KL `0.00106`、actor grad norm `0.00992`；无 NaN/Inf。reward value explained variance late mean `0.257`、终点 `0.375`。
+- 结论：固定 old log-prob 的 importance ratio + PPO clip 是关键改进，能够把更大的 GAE 信号转化为 reward 增长；但 QCPO_refs 的剩余优势还来自无 warmup 的样本效率、obs normalization、可学习 std/策略结构等候选因素。
+- 最终导出：`_runs/wandb_export/final_e3_dynamicbutton_2026-07-16/`；profile：`_runs/profiles/final_e3_dynamicbutton_2026-07-16/`。
+
+### E4：相同 PPO 主干，移除 reward-only warmup
+
+- 状态：待启动；不改 loss、网络或学习率，只令 `warmup_iters=0`。
+- 设置保持 E3：GAE+PPO、actor epochs=8、critic/value epochs=10、`lambda_max=0`、固定 std=1.0。
+- 预算：30 iterations = 30 万 env steps，恰好提供 30 个 actor rollouts，与 E3 在 60 万步时累计的 actor rollout 数相同；评估 64 条轨迹，预计总计约 3 分钟。
+- 判据：按 actor-rollout 数与 E3 对齐，并与 QCPO_refs 的前 30 万步比较；若仍有数量级差距，再进入 observation normalization 与 learnable std 的逐项消融。
 
 ## 4. 分阶段改进路线
 
