@@ -568,3 +568,15 @@
 - T=1000、discount=.995、floor=0 时归一化权重范围为 0.0337～5.033，ESS fraction=0.3937（每条轨迹约 394 个等效 transition）；比 beta=.95 的极端约 39 个等效 transition 更稳健，也与最终 constrained 配方 beta=.995 对齐。
 - 持久化 smoke dqc_cost_time_weight_smoke_20260716 训练 6.4s、exit 0，覆盖加权 QR、PPO、评估和 JSON。
 - 下一门 C-W1：raw+C20+MC+lambda0，设置 beta=.995 与 risk_discount/.995；lambda=0 时 beta 不影响 actor，所以真实 reward/cost 应与 raw C20 逐点相同。仍用 CDF bias不高于0.0734或 mean error不高于15%的门；失败则不扫 discount 小网格，转 s0/early stratified replay 或 direct initial-distribution auxiliary loss。
+
+### E32：C-W1 100k 通过，时间目标错配是主瓶颈
+
+- job DQCAC_DynamicButton_recur_mc_c20_timew995_100k_s0，W&B cojepq8r，commit 0d33c8a，训练 58.8s、exit 0。
+- 与 raw C20 的 reward、真实 cost/PPO 逐点相同；固定终评 truth 都是 reward 0.5527、outage 0.2286、mean cost 8.957，单变量隔离成立。
+- predicted mean cost 从 6.974 提升到 9.003，relative error 从 22.1% 降到 0.51%；hard CDF 从 0.1308 提升到 0.1701，absolute bias 从 0.0978 降到 0.0585，改善约 40.2%。同时通过 mean-error 15% 与 CDF-bias 改善25%两条预注册门。
+- 最后训练 rollout truth outage为0.30；raw CDF 0.1844，C-W1为0.2094，误差从0.1156降到0.0906。收益不是终评随机抽样偶然。
+- T=1000、discount=.995 的 weight min/max/ESS 与预期一致：0.0337/5.033/0.3937；loss 总尺度维持mean weight=1。训练时间比 raw 59.4s 还少0.6s，差异属噪声，可认为无额外 wall-time成本。
+- profile：_runs/profiles/dqc_cost_time_weight_100k_2026-07-16/；export：_runs/wandb_export/dqc_cost_time_weight_100k_2026-07-16/。
+- 结论：当前首要瓶颈是均匀 transition QR objective 与 initial-outage/β-risk 的时间分布错配，不是 N=32 分辨率，也不是缺少 LSTM history。C-H1、N64、local τ 的负/弱结果现在得到统一解释：它们没有改变监督质量在时间上的分配。
+- 下一门 C-W2：在当前最好 P-S2（T2 sigmoid + window50 PI）上只加入 risk_discount/.995，300k seed0。硬门：outage不高于0.22且reward高于E9的0.658；相对P-S2还要求校准不恶化。预计训练约160s、总计3～4min。
+- 保留消融：hard-CDF+C-W1（隔离平滑交互）、discount .99/.997（只做曲线消融，不在当前通过点继续扫）、direct s0 auxiliary、early stratified replay、C-H1+time-weight（检验history在正确目标下是否才有用）。

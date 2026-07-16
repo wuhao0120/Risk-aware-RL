@@ -1071,3 +1071,23 @@ C-H1 还在 70k/100k 出现 cost grad norm 20.7/17.6 和 joint clip；提高 cli
 C-W1 的100k配置保持 raw、N32、C20、MC、hard CDF、lambda0，只打开 risk_discount/.995 并设置 beta=.995。lambda=0 时 beta 不进入 actor objective，因此真实 reward/cost应逐点等于 raw C20。通过门仍是 CDF bias从0.0978至少下降25%（不高于0.0734），或 mean relative error进入15%，且另一量不恶化超过10%。若失败，不扫 .99/.997 discount 小网格；下一步应采用更直接的 s0/early stratified replay 或 initial-distribution auxiliary loss。C-H1A2/A3、adaptive CDF、IQN 和 controller setpoint继续作为独立消融保留。
 
 C-H1A 对齐图位于 _runs/profiles/dqc_cost_history_ch1_100k_2026-07-16/，原始导出位于 _runs/wandb_export/dqc_cost_history_ch1_100k_2026-07-16/。
+
+### 13.23 C-W1 结果：几乎零额外成本修复 mean cost，CDF bias 下降40%（2026-07-16）
+
+C-W1 job DQCAC_DynamicButton_recur_mc_c20_timew995_100k_s0（W&B cojepq8r）从 commit 0d33c8a 启动，训练58.8s、exit code 0。它保持raw cost critic、N32、C20、MC、hard CDF、lambda=0，只打开risk_discount且discount=.995；beta也设为.995，但lambda=0使risk项系数为0，因此不改变actor objective。
+
+单变量配对成立。C-W1与raw C20每个reward/真实cost/PPO记录点一致，固定70条终评都是reward0.5527、outage0.2286、mean cost8.957。差异只来自cost critic的transition objective。
+
+结果同时通过两条预注册门：
+
+- predicted mean从6.974提高到9.003，对truth8.957的relative error从22.1%降到约0.51%，远低于15%门。
+- hard CDF从0.1308提高到0.1701，absolute bias从0.0978降到0.0585，下降约40.2%，超过25%门。
+- 最后训练rollout的truth outage为0.30；raw CDF为0.1844，C-W1为0.2094，误差同样从0.1156降到0.0906，说明方向不依赖终评那一批随机样本。
+
+T=1000下实际归一化weight范围是0.0337到5.033，ESS fraction为0.3937；既没有把训练退化为只看10个s0，也显著降低了后期低remaining-cost样本的支配。训练wall time与raw的59.4s基本相同，没有增加网络、环境采样或quantile数量。
+
+这项结果重新排序了根因优先级。N64把全局分辨率翻倍但不改时间监督分布，所以无效；query-local τ只改quantile轴而不改大量后期transition的主导地位，所以只有7～8%收益；独立LSTM容量更强，却在错误的uniform objective下更容易牺牲早期状态以降低总体loss，所以反而变差。当前最重要的算法组件不是更大的critic，而是让critic的训练测度与actor真正使用的risk测度一致。
+
+完整对齐图位于 _runs/profiles/dqc_cost_time_weight_100k_2026-07-16/，原始history位于 _runs/wandb_export/dqc_cost_time_weight_100k_2026-07-16/。
+
+下一条C-W2以目前Pareto最好但尚未达约束门的P-S2为基线：保留sigmoid T=2、window50 PI、beta=.995、sum normalization，只加入cost risk-discount weighting。相对P-S2是一个变量。300k seed0硬门为outage不高于0.22且reward高于E9的0.658，并要求critic calibration不比P-S2恶化；通过后才进入多seed与更大评估。hard-CDF+C-W1、discount .99/.997、direct s0 auxiliary、early stratified replay、C-H1+time weighting都保留为独立消融，不与C-W2同时加入。
