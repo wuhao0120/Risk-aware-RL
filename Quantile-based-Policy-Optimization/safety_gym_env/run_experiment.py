@@ -221,6 +221,9 @@ def base_args(algo, seed, device, env_key):
         a.gae_lambda = 0.97
         a.reward_advantage_norm = False                 # QCPO_refs 默认不标准化 reward advantage
         a.ppo_ratio_clip = 0.1
+        # 0=完全关闭并逐式复现旧PPO；正数在当前policy相对behavior policy的
+        # approximate KL越界时跳过本epoch及剩余actor epochs，critic更新仍跑满。
+        a.ppo_target_kl = 0.0
         a.reward_value_lr = 3e-4
         a.reward_value_grad_clip = 10.0
         # 默认继续使用旧 MLP，保证历史实验可复现；mlp_lstm 显式开启 QCPO_refs

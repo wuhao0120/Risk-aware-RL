@@ -244,6 +244,13 @@ class DQCACBetaGPU(VecAgentBase):
         self.gae_lambda = float(getattr(args, 'gae_lambda', 0.97))
         self.reward_advantage_norm = bool(getattr(args, 'reward_advantage_norm', False))
         self.ppo_ratio_clip = float(getattr(args, 'ppo_ratio_clip', 0.1))
+        # target-KL 是默认关闭的PPO安全阀。clip限制单样本ratio，但无法保证整批
+        # policy displacement；正阈值在越界epoch反传前停止，避免再把policy推远。
+        self.ppo_target_kl = float(getattr(args, 'ppo_target_kl', 0.0))
+        if self.ppo_target_kl < 0.0:
+            raise ValueError("ppo_target_kl must be non-negative; 0 disables early stop")
+        if self.ppo_target_kl > 0.0 and self.reward_actor_mode != 'gae_ppo':
+            raise ValueError("ppo_target_kl requires reward_actor_mode=gae_ppo")
         self.reward_value_lr = float(getattr(args, 'reward_value_lr', 3e-4))
         self.reward_value_grad_clip = float(getattr(args, 'reward_value_grad_clip', 10.0))
         self.log_std_min = float(getattr(args, 'log_std_min', -5.0))
@@ -494,6 +501,7 @@ class DQCACBetaGPU(VecAgentBase):
               f"qr_target={self.quantile_target_reduction}/ref{self.quantile_loss_reference_samples}, "
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
               f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
+              f"ppo_target_kl={self.ppo_target_kl:g}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}"
               f"/target{self.pid_target_prob:g}, "
               f"sum_norm={self.sum_norm}, policy_frozen={self.freeze_policy_updates}, "
@@ -539,6 +547,8 @@ class DQCACBetaGPU(VecAgentBase):
             # ===== 2. 内层更新 (双 critic + actor) =====
             critic_info, actor_info = {}, {}
             actor_updated = False
+            actor_updates_completed = 0
+            actor_early_stopped = False
             for update_idx in range(self.updates_per_episode):
                 critic_info = self.update_critic(batch)
                 # 标量 reward value 在 warmup 中也训练；actor 仍由下面的 in_warmup 控制。
@@ -546,12 +556,28 @@ class DQCACBetaGPU(VecAgentBase):
                 if self.reward_actor_mode != 'distributional' and not self.recurrent_policy:
                     critic_info.update(self.update_reward_value(batch))
                 if (not self.freeze_policy_updates and not in_warmup
-                        and update_idx < self.actor_updates_per_episode):
+                        and update_idx < self.actor_updates_per_episode
+                        and not actor_early_stopped):
                     actor_info = self.update_actor(batch)
-                    actor_updated = True                       # scheduler 只能跟随真实 optimizer.step()
+                    # target-KL越界的probe epoch不执行optimizer.step；它和剩余epoch
+                    # 都不能推进actor scheduler，但20次critic更新继续完整执行。
+                    update_applied = bool(
+                        actor_info.get('ppo/update_applied', 1.0))
+                    if update_applied:
+                        actor_updated = True                   # scheduler 只能跟随真实 optimizer.step()
+                        actor_updates_completed += 1
+                    if bool(actor_info.get('ppo/early_stop', 0.0)):
+                        actor_early_stopped = True
                 if self.learning_steps % self.target_update_interval == 0:
                     self._soft_update_target()
                 self.learning_steps += 1
+
+            # configured epochs与实际optimizer steps必须同时记录；否则target-KL只看
+            # 最终KL会误以为仍执行了固定8次更新。
+            actor_info['training/actor_updates_completed'] = float(
+                actor_updates_completed)
+            actor_info['ppo/early_stop'] = float(actor_early_stopped)
+            actor_info['ppo/target_kl'] = self.ppo_target_kl
 
             # 旧 critic_adam 路径保留 actor 后更新时序，保证历史实验可复现。
             if (not self.freeze_policy_updates and not in_warmup
@@ -1581,15 +1607,25 @@ class DQCACBetaGPU(VecAgentBase):
         total_loss = policy_loss + self.recurrent_value_loss_coef * value_loss
 
         self.actor_optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-        if self.actor_grad_clip and self.actor_grad_clip > 0:
-            grad_norm = nn.utils.clip_grad_norm_(
-                self.actor.parameters(), self.actor_grad_clip)
-        else:
+        approx_kl = ((ratio.detach() - 1.0) - log_ratio.detach()).mean()
+        target_kl_hit = False
+        if self.ppo_target_kl > 0.0:
+            target_kl_hit = float(approx_kl.item()) > self.ppo_target_kl
+
+        if target_kl_hit:
+            # 当前forward已经测得behavior→current KL越界；本epoch不能再反传一步。
+            # zero_grad已清除上个epoch残留梯度，后续critic optimizer与actor独立。
             grad_norm = torch.zeros((), device=self.device)
-        self.actor_optimizer.step()
-        with torch.no_grad():
-            self.actor.log_std.clamp_(self.log_std_min, self.log_std_max)
+        else:
+            total_loss.backward()
+            if self.actor_grad_clip and self.actor_grad_clip > 0:
+                grad_norm = nn.utils.clip_grad_norm_(
+                    self.actor.parameters(), self.actor_grad_clip)
+            else:
+                grad_norm = torch.zeros((), device=self.device)
+            self.actor_optimizer.step()
+            with torch.no_grad():
+                self.actor.log_std.clamp_(self.log_std_min, self.log_std_max)
 
         # value explained variance 与 MLP 路径同定义；这里的 grad_norm 是共享骨干
         # policy+value 联合梯度，另用 joint 键明确标注，避免误读为纯 value 梯度。
@@ -1624,8 +1660,10 @@ class DQCACBetaGPU(VecAgentBase):
                 batch['_first_epoch_ratio_max_error']),
             'ppo/clip_fraction': float(
                 ((ratio.detach() - 1.0).abs() > self.ppo_ratio_clip).float().mean().item()),
-            'ppo/approx_kl': float(
-                ((ratio.detach() - 1.0) - log_ratio.detach()).mean().item()),
+            'ppo/approx_kl': float(approx_kl.item()),
+            'ppo/target_kl': self.ppo_target_kl,
+            'ppo/early_stop': float(target_kl_hit),
+            'ppo/update_applied': float(not target_kl_hit),
             'debug/reward_actor_is_gae': 1.0,
             'debug/reward_actor_is_ppo': 1.0,
             'debug/policy_is_recurrent': 1.0,
@@ -1685,6 +1723,7 @@ class DQCACBetaGPU(VecAgentBase):
         log_probs = self._compute_log_probs(s, a)             # 当前策略 logπθ(a|s)，对 θ 可导
         entropy = self._entropy(s).mean()
         ppo_info = {}
+        target_kl_hit = False
         if self.reward_actor_mode == 'gae_ppo':
             old_log_probs = batch['old_log_probs']            # rollout 时冻结的行为策略 logπ_old
             log_ratio = log_probs - old_log_probs
@@ -1698,24 +1737,35 @@ class DQCACBetaGPU(VecAgentBase):
             actor_loss = -reward_coef * reward_surr.mean() + risk_coef * risk_surr.mean() \
                 - self.entropy_coef * entropy
 
-            # approx_kl 采用 Schulman 常用近似 (ratio-1)-log_ratio。
+            # approx_kl 采用 Schulman 常用近似 (ratio-1)-log_ratio。正target
+            # 在当前epoch backward前检查，因此越界probe不会再把policy推远一步。
+            approx_kl = ((ratio.detach() - 1.0) - log_ratio.detach()).mean()
+            if self.ppo_target_kl > 0.0:
+                target_kl_hit = float(approx_kl.item()) > self.ppo_target_kl
             ppo_info = {
                 'ppo/ratio_mean': float(ratio.detach().mean().item()),
                 'ppo/ratio_std': float(ratio.detach().std(unbiased=False).item()),
                 'ppo/clip_fraction': float(
                     ((ratio.detach() - 1.0).abs() > self.ppo_ratio_clip).float().mean().item()),
-                'ppo/approx_kl': float(((ratio.detach() - 1.0) - log_ratio.detach()).mean().item()),
+                'ppo/approx_kl': float(approx_kl.item()),
+                'ppo/target_kl': self.ppo_target_kl,
+                'ppo/early_stop': float(target_kl_hit),
+                'ppo/update_applied': float(not target_kl_hit),
             }
         else:
             actor_loss = -(log_probs * combined_weight).mean() - self.entropy_coef * entropy
 
         self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward()
-        if self.actor_grad_clip and self.actor_grad_clip > 0:
-            actor_grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
-        else:
+        if target_kl_hit:
             actor_grad_norm = torch.zeros((), device=self.device)
-        self.actor_optimizer.step()
+        else:
+            actor_loss.backward()
+            if self.actor_grad_clip and self.actor_grad_clip > 0:
+                actor_grad_norm = nn.utils.clip_grad_norm_(
+                    self.actor.parameters(), self.actor_grad_clip)
+            else:
+                actor_grad_norm = torch.zeros((), device=self.device)
+            self.actor_optimizer.step()
 
         actor_info = {
             'actor/loss': float(actor_loss.item()),
@@ -2278,6 +2328,7 @@ class DQCACBetaGPU(VecAgentBase):
             'quantile_target_reduction': self.quantile_target_reduction,
             'quantile_loss_reference_samples': self.quantile_loss_reference_samples,
             'actor_updates_per_episode': self.actor_updates_per_episode,
+            'ppo_target_kl': self.ppo_target_kl,
             'freeze_policy_updates': self.freeze_policy_updates,
             'freeze_observation_stats': self.freeze_observation_stats,
             'num_envs': self.num_envs,

@@ -71,6 +71,11 @@ KEY_METRICS: Tuple[str, ...] = (
     "ppo/first_epoch_ratio_max_error",
     "ppo/clip_fraction",
     "ppo/approx_kl",
+    "ppo/target_kl",
+    "ppo/early_stop",
+    "ppo/update_applied",
+    "training/actor_updates_completed",
+    "training/actor_updates_per_iteration",
     "training/actor_lr",
     "critic/reward_qr_loss",
     "critic/cost_qr_loss",
@@ -165,6 +170,10 @@ PLOT_PANELS: Tuple[Tuple[str, Tuple[str, ...], bool], ...] = (
     ("predicted / sampled cost", ("critic/pred_cost_mean", "debug/cost_mean"), False),
     ("reward value", ("reward_value/loss", "reward_value/explained_variance"), True),
     ("PPO health", ("ppo/clip_fraction", "ppo/approx_kl"), True),
+    ("PPO epochs", (
+        "training/actor_updates_completed",
+        "training/actor_updates_per_iteration",
+        "ppo/early_stop"), False),
 )
 
 
