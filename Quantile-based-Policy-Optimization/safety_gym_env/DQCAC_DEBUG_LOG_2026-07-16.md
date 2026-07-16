@@ -315,3 +315,19 @@
 - 为保持 DQCAC 算法语义，通用骨干没有复制 QCPO_refs 的 state-value cost head；DQCAC 后续仍使用 action-conditioned `Z_c(history,a)` critic。网络公平性对齐 policy/reward-V backbone，constraint head 按各算法必要输出区分。
 - 数值对拍：将 `QcpoRefModel(constraint=False)` 的同名权重和 RMS buffer 加载到新适配器，在随机 `T=13,B=4` 序列及非零初始 hidden state 上，mu/log_std/reward value/h/c/obs mean/var 的最大绝对误差全部为 `0.0`。
 - 当前状态：适配器已验证但尚未接入训练 rollout/BPTT；下一步先接 Q-B，复现 MLP Q-B 的 100k/300k 结果，再复用同一 rollout adapter 接 DQCAC。
+
+#### Q-B 100k/300k 结果
+
+- Q-B 100k：job `QCPO_DynamicButton_qcal_b_gaeppo8_obsnorm_100k_s0`，W&B `pkyr3dub`，训练 `62.3s`，exit code 0。
+  - 共同 100k 后 20% reward `0.5574`、趋势 `+6.950/百万步`；Q-A2 仅 `0.0385/+0.649`。
+  - 同预算 DQCAC E5 为 `0.4441/+6.291`，QCPO_refs 为 `0.4776/+7.008`；Q-B 已进入相同样本效率量级。
+  - 70 条终评 reward `0.5410`、outage `0.2143`；lambda 固定 0。value explained variance `0.703`，PPO KL `0.00274`、clip fraction `0.1597`。
+- Q-B 独立 300k：job `QCPO_DynamicButton_qcal_b_gaeppo8_obsnorm_300k_s0`，W&B `ue1ye4kn`，训练 `148.3s`，exit code 0。
+  - 后 20% reward `1.317`、趋势 `+5.059/百万步`；与 QCPO_refs 同预算 `1.355/+5.431` 接近，显著优于 Q-A2 `0.230/+1.248`。
+  - 130 条终评 reward `1.621`，接近 DQCAC E5 `1.690` 与 QCPO_refs 全量终评 `1.670`；reward 主干可判为“表现正常”。
+  - reward-only 的自然 outage 为 `0.546`，不满足约束是预期现象，下一阶段再恢复统一 dual/PID，不能以此否定 reward 校准。
+  - value explained variance `0.641`；PPO ratio std `0.0497`、clip fraction `0.0587`、KL `0.00124`；无 NaN/Inf。
+- 完整 profile：
+  - `_runs/profiles/qcpo_qb_vs_key_100k_2026-07-16/`
+  - `_runs/profiles/qcpo_qb_vs_key_300k_2026-07-16/`
+- 最重要结论：QCPO 旧失败由两个层次叠加。未修正 rollout reuse 和未生效 obs RMS 是工程 bug；修完后 Q-A2 能学但慢。把 reward MC 换成 V+GAE 后才追平 QCPO_refs，说明低方差、逐时刻 reward credit assignment 是剩余主因。
