@@ -1295,3 +1295,12 @@ K16在300–600k有真实的阶段性收益：K4→K16使训练outage `0.237→0
 replay4把最后三批pre-CDF error从`0.19010`降到`0.15729`（改善17.3%），pre mean bias改善22.8%，post-CDF error改善21.9%；但pre-Brier只改善5.8%。更关键的是独立终评CDF error从`0.04464`恶化到`0.05603`，mean-cost relative error从13.63%恶化到16.76%。所以它未通过预注册门，不能进入PID闭环。
 
 由于只有100个s0标签且pre-CDF连续同向改善、距20%门很近，增加一次封顶的300k配对功效扩展，预计总墙钟约6分钟；这不是1M晋级。若最后三分之一pre误差和独立终评仍不能同时过门，simple replay路线永久停止，转direct event classifier、ensemble uncertainty或cross-fit。另需单独处理联合reward+cost global grad clip造成的优化器级耦合。
+
+
+### 13.47 300k证明simple replay是慢热组件，但仍需闭环验证（2026-07-16）
+
+300k配对共有89/300个训练超限事件，策略/RMS/真实评估exact。严格eval-only 520条truth为reward `0.83494`、outage `0.28077`、mean cost `11.0173`；baseline与replay4的CDF为`0.19964/0.26665`，absolute error降低82.6%，predicted mean为`9.4186/11.2476`，relative error从14.5%降到2.1%。所以100k的负结果确实是false negative：固定策略不变，增加s0数据后才出现跨初始布局泛化。
+
+最后五批B20 pre-CDF/Brier只改善10.0%/4.1%，没有通过小批门。它与520条结果的冲突来自逐批outage在0.15～0.45大幅波动，故结论保留为“大样本独立校准强改善，小批pre不稳定”。不能只汇报好看的520条而隐藏这点。
+
+下一实验使用原P-M3失败seed1，在live PID闭环中只加入`coef=.25,replay4`完整跑1M。原baseline的520条reward/outage为`0.8622/0.3058`、critic CDF仅0.1043。候选必须把outage降到0.22以内并保持reward>0.658，或至少下降0.08且reward≥0.75，同时critic CDF error减半、末200k不出现更大周期；否则不扩其他seed。

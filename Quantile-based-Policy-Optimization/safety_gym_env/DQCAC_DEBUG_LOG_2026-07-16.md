@@ -821,3 +821,13 @@
 - 额外发现：reward critic checkpoint并非exact。两组参数不共享，但当前`update_critic`对reward+cost参数做联合global grad clip；aux改变joint norm后会连带缩放reward critic梯度。这不影响冻结actor的真实策略比较，却说明“只改变cost监督”仍有优化器级耦合，后续应把separate clipping作为独立工程消融。
 - 因只有100个s0标签，且最后三批pre-CDF连续同向改善、仅差2.7个百分点，执行一次明确封顶的300k功效扩展：同source policy/rollout seed重新跑baseline与aux各15批，不改coef或任何其他参数。预计每条训练约2.3分钟、含评估约3分钟，总计约6分钟。
 - 300k终止门：至少约30个超限事件；最后三分之一pre-CDF/Brier须改善20%，独立终评CDF或mean relative error须改善25%。不通过即停止simple replay，不跑1M、不扫coef；通过也只进入一次PID 300k门，不直接宣称有效。
+
+
+### E58：C-S0B 300k大样本确认与live seed1压力测试预注册（2026-07-16）
+
+- baseline/aux训练`121.0/121.2s`、exit0，15批outage逐点exact，总事件`89/300`；actor、actor RMS与raw obs RMS逐tensor exact。140条终评truth exact为reward/outage/mean cost `0.8657/0.2643/10.7929`。
+- 140条critic结果从baseline CDF/mean `0.19799/9.4077`变为aux `0.27031/11.2698`，truth `0.26429/10.7929`；CDF absolute error约`0.0663→0.0060`，mean relative error约`12.8%→4.4%`。
+- 为消除训练长度消耗不同evaluation RNG的影响，从两个final checkpoint各做同构eval-only 520条。truth逐位exact为reward `0.83494`、outage `146/520=0.28077`、mean cost `11.0173`；baseline CDF/mean为`0.19964/9.4186`，aux为`0.26665/11.2476`。CDF error降低`82.6%`，mean relative error从`14.5%`降到`2.1%`（约降低`85.6%`），确认跨布局泛化而非同批记忆。
+- 最后五批pre-CDF/Brier只改善约`10.0%/4.1%`，未过原20%小批门；但B20逐批truth在0.15～0.45间变化，方差远高于520条固定协议。结论定级为“独立大样本强通过、小批pre门未通过”，不声称所有校准指标一致改善。
+- 下一步只在P-M3最差的seed1加入`cost_s0_aux_coef=.25,replay_batches=4`跑完整1M；其余网络、B20、C20、MC/time-weight.995、T1、PID target=.15、8 PPO epochs、LR和checkpoint周期完全不变。独占GPU预计训练约6.5～8分钟、含140条评估约8～9分钟，持久化后台运行。
+- live通过门：用相同eval-only 520协议比较原seed1 baseline `reward/outage=0.8622/0.3058`。候选需reward保持`>0.658`且outage`≤0.22`，或至少把outage降低0.08且reward保持≥0.75；同时critic CDF absolute error至少降低50%，末200k不能出现更严重极限环。未通过则说明校准改善未转化为policy控制，不扩seed0/2。
