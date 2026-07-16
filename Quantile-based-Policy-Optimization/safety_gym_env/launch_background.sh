@@ -55,6 +55,12 @@ if [[ -s "$pid_file" ]]; then
     fi
 fi
 
+# 同名 stale job 可以复用，但上一轮的完成标记不能保留到新进程启动之后。
+# 否则外部轮询器可能在新 worker 尚未结束时读到旧 exit_code，误判本轮已经失败
+# 或成功。只清理由本 launcher 生成的三个状态文件，不触碰旧日志与实验产物；
+# 新 run.sh 会分别在 worker 真正开始、结束时原子式重建这些文件。
+rm -f "$job_dir/worker_started_at" "$job_dir/finished_at" "$job_dir/exit_code"
+
 # ===== 3. 把 argv 安全地写入独立脚本，并让脚本自行记录真实退出状态 =====
 {
     printf '#!/usr/bin/env bash\n'
