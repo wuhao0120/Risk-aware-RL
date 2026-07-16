@@ -1201,3 +1201,20 @@ LR变化确实生效：终点PPO clip fraction从`0.3227`降到`0.2221`，末200
 B20使每轮约束尾部样本期望从2增到4、critic初始布局覆盖翻倍，并将每1M步policy/control更新次数减半。每个样本仍做8个PPO epoch，所以这是batch方差与更新频率的可解释消融，不是额外采样预算。硬件对B20+N32有充分余量；每100k保存checkpoint，预计总耗时约9–11分钟。
 
 若520条reward/outage不能达到`>0.658/≤0.22`，则不再盲目扩大B；下一步把每状态action baseline samples从4提高到16，检验冻结risk advantage的Monte-Carlo方差。再后面才加入PPO target-KL early stop。三者保持单变量顺序。
+
+
+### 13.36 P-M3：扩大num_envs是目前首个同时改善速度、稳定性和可行性的组件（2026-07-16）
+
+P-M3（W&B `ky7voxle`）固定1M总环境步，只把B从10增到20、iteration从100减到50。训练时间从P-M1的`508.4s`降到`390.6s`，吞吐提高约30.2%，证明当前硬件能负担且B20比B10更高效。
+
+算法结果也不是单纯“跑得快”。末200k reward只从P-M1的`0.7522`降到`0.7108`，raw outage从`0.305`降到`0.215`，KL/clip从`0.00519/0.2414`降到`0.00286/0.1557`。更大的trajectory batch降低tail统计、critic batch和PPO梯度方差，同时固定env-step下减少一半policy/control update次数，确实削弱了此前的闭环极限环。
+
+140条final为`0.7725/0.2286`；扩到预注册520条后为reward `0.7180`、outage `87/520=0.1673`、Wilson 95% `[0.1377,0.2018]`。这是首个通过`reward>0.658,outage≤0.22`的大样本1M配置。140与520的约0.061差异必须同时报告，它提醒我们单批/小评估仍可能改变结论。
+
+残留问题是critic：hard CDF只有`0.1058`，低估truth约`0.0615`。因此B20应被解释为方差与控制时钟改进，不应宣称distributional critic已经解决。下一步先做seed1/2，不立即叠加K16或replay。
+
+### 13.37 多seed晋级标准（2026-07-16）
+
+seed1/2各跑同一P-M3配置1M步，持久化后台并行；预计总墙钟约11–14分钟。built-in 140条只作screen，满足reward大于0.658且outage不高于0.27才扩520条，但失败seed仍保留并纳入报告。
+
+最终至少报告三项：每seed reward/outage与Wilson区间；三seedreward均值±标准差；三seed总outage计数及聚合置信区间。至少2/3 seed通过且聚合outage不高于0.2，才把B20列为主推荐。否则下一路线优先是action baseline K4→K16和recent-rollout critic replay/holdout calibration，而不是用seed0 best checkpoint包装成成功。

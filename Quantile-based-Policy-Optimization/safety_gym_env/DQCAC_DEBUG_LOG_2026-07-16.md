@@ -708,3 +708,23 @@
 - 当前128 CPU/A100 80GB资源对B20+N32安全；pairwise QR显存风险主要出现在B与N同时放大。本run每100k保存checkpoint，预计训练约8–10分钟，130条终评约1分钟。
 - screen与P-M2相同：final 130若reward `>0.658`且outage `≤0.27`则扩520；正式门为520条outage `≤0.22`且reward `>0.658`，并检查中后期是否比B10少一次完整风险周期。
 - 若B20失败，下一单变量为`num_action_samples=4→16`，直接降低冻结risk baseline在8个PPO epoch中被重复放大的Monte-Carlo噪声；随后才实现target-KL early stop。B20、K16和target-KL分别报告，不组合成无法归因的“trick包”。
+
+
+### E47：P-M3 B20 通过seed0长预算大样本门（2026-07-16）
+
+- job `DQCAC_DynamicButton_pm3_timew995_pi_target015_smoothT1_b20_ckpt100k_1m_s0`，W&B `ky7voxle`，训练`390.6s`、exit code 0；相对P-M1仅把B从10增至20、iteration从100减至50，总环境步仍严格为1M。
+- 训练吞吐从P-M1的约`1,966 env steps/s`提高到约`2,560 env steps/s`，steps/s提升约30.2%，同预算训练时间下降约23.3%。B20+N32在A100 80GB上无OOM/NaN，硬件可承受。
+- 末200k训练均值为 reward `0.7108`、raw/window outage `0.215/0.212`、lambda `0.2804`、KL/clip `0.00286/0.1557`。P-M1对应为`0.7522/0.305/0.300/0.4546/0.00519/0.2414`。B20只损失约0.041 reward，却把训练outage降低0.09并明显压低PPO位移。
+- built-in 140条final为 reward `0.7725±0.5300`、outage `32/140=0.2286`、critic CDF `0.1130`。按预注册扩到520条后，final为 reward `0.7180±0.5201`、outage `87/520=0.1673`、Q80 cost `13`、mean cost `7.940`。
+- 520条outage Wilson 95%区间为`[0.1377,0.2018]`：点估计明显低于0.2，上界仅比0.2高0.0018。它同时通过reward `>0.658`与outage `≤0.22`，是当前首个1M、520条大样本下通过的DQCAC配置。
+- 不能只报告更好看的520条而隐藏140条的0.2286。两者差异说明有限样本和并行评估seed集合仍能造成约0.06波动；因此seed0通过只是晋级依据，不是论文最终结论。
+- critic仍低估：520条hard/smooth CDF `0.1058/0.1086`，相对truth `0.1673`偏低`0.0615`，pred mean `6.241`也低于truth `7.940`。B20主要改善batch/control方差和更新频率，并未彻底解决critic跨批泛化。
+- 三条1M对齐导出与图：`_runs/wandb_export/dqc_pm123_1m_2026-07-16/`、`_runs/profiles/dqc_pm123_1m_2026-07-16/`。
+
+### E48：P-M3 seed1/2多seed复现计划（2026-07-16）
+
+- seed1/2完全复用P-M3 B20配置，各1M环境步、每100k checkpoint；不改target、LR、K、critic或CDF。两条持久化后台并行运行，CPU worker总数40、A100显存仍有充分余量。
+- 单条独占训练实测约6.5分钟；按此前双run共享GPU经验，并行后预计两条约9–12分钟完成，含各自140条built-in评估约11–14分钟。并行会影响wall time，不影响固定env-step算法比较；每条单独记录耗时。
+- 140条只作screen。每个新seed若reward `>0.658`且outage `≤0.27`，再串行做520条final确认；无论成败都报告，不以best seed替代三seed统计。
+- 最终汇总使用seed0/1/2每seed相同评估协议，报告reward跨seed均值/标准差、总outage计数、每seedWilson区间和三seed聚合区间。若至少2/3 seed通过且聚合outage≤0.2，B20进入主推荐；否则它只作为有益但不足的组件。
+- K16、PID uncertainty buffer/window和recent-rollout critic replay全部暂停到多seed结果后，避免在尚未确认B20泛化前继续叠加变量。
