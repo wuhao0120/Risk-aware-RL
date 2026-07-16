@@ -1151,3 +1151,17 @@ C-E2（W&B `4dd8zrqf`）逐点复现C-W4并保存15个pre-update快照加final�
 合成例中window outage=.3、pid_i=.1时，target=.2输出lambda `.1850000024`，target=.15输出`.2399999946`；两者真实gap都为.1。持久化400-step smoke训练6.1秒、exit0。
 
 P-M1相对C-W4只设target=.15，并继续每20k保存phase-aligned快照。300k seed0门为130条reward>0.658且outage≤0.22，通过后扩520条。若过保守测试target=.175或较小Kp；若仍不安全测试target=.10或lambda floor/hysteresis。T1.5、自适应bandwidth与显式risk gain仍作为独立actor路线，不混入本run。
+
+### 13.30 P-M1 300k：不是已收敛失败，而是控制器到预算末端才开始追回约束（2026-07-16）
+
+P-M1（W&B `tkrudpbq`）训练`156.6s`并正常结束。130条final evaluation得到reward `0.7223±0.4531`、outage `0.2462`、mean cost `9.131`、Q80 cost `17`；critic hard/smooth CDF为`0.2728/0.2734`，predicted mean为`10.970`，lambda为`0.4038`。它相对C-W4的`1.1999/0.5308`显著修复安全性，而且reward仍超过旧E9的`0.6576`，但outage没有通过预注册`≤0.22`门。
+
+不能把这个结果简单判成“target=.15失败”。lambda在110k才开始介入，240k至300k从`0.2313`总体升到`0.4038`；最后一个控制窗口outage仍为`0.4`，最后训练rollout已经回到`0.2`。这表示在300k截止时，PID还处于提高惩罚、把策略从高风险区拉回来的过渡段，而不是围绕某个稳态小幅波动。末点PPO KL `0.00704`、clip fraction `0.3059`偏高但有限，且无NaN/Inf。合理动作是延长同一配置观察闭环，而不是根据单个seed短预算立即换路线。
+
+### 13.31 训练预算与false-negative判断标准（2026-07-16）
+
+此前100k/300k实验的定位需要严格区分。100k是机制测试：它足以发现确定性的工程/目标问题，但只允许写“该配置在100k、seed0没有早期收益”。300k是闭环screen：只有当末段已经稳定且被基线支配时，才适合早停。对LSTM、大critic、缓慢TD分布传播和PID两时间尺度系统，随机初始化或早期采样确实可能造成false negative；P-M1末端仍在提高lambda，是最典型的应当晋级案例。
+
+另一方面，长跑不能被用来模糊已经确定的问题：旧N64 loss归一化使梯度随quantile数量改变，uniform transition QR目标被大量后期低return-to-go样本支配，pre-update rollout与post-update final策略相位错位。这些结论由公式、配对运行或checkpoint复评直接支持，不依赖“也许以后会好”。N64/reference scaling、local quantile和cost-LSTM的算法效果则仍只是在100k无早期收益，长期结论保持开放。
+
+后续采用四级预算：100k机制筛选；300k闭环晋级；1M稳定性验证并在300k/600k/1M做phase-aligned复评；最终候选至少3 seeds×1.5M，与QCPO_refs的正式公平比较补到相同5M环境步数。P-M1-L1保持P-M1参数完全不变，只训练到1M，每50k保存checkpoint，预计纯训练约8.7分钟、含终评约10分钟。若1M仍呈大周期振荡，再把lambda hysteresis/floor、actor LR/PPO epoch和PID增益作为互不混杂的单变量路线。

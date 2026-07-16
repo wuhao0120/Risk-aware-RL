@@ -649,3 +649,21 @@
 - 持久化 `dqc_pid_target015_smoke_20260716`：400 env steps，训练6.1s、完整评估exit0；启动摘要正确显示`target0.15`。
 - P-M1保持C-W4的N32/C20/MC/time-weight.995/sigmoidT1/window50 PI等全部配置，只设`pid_target_prob=.15`，每20k保存快照。预计训练约160秒，总计3～4分钟。
 - 通过门：优先看post-update final 130条；若reward>0.658且outage≤0.22，再用520条确认。若接近门则评phase-aligned候选；若明显过保守，下一单变量是target .175或降低Kp；若仍不安全，下一路线是target .10或lambda floor/hysteresis。T1.5、adaptive bandwidth与risk gain保留为actor查询核消融，不与P-M1同时改。
+
+### E41：P-M1 300k 结果——安全设点有效，但控制器在短预算末端仍未稳定（2026-07-16）
+
+- job `DQCAC_DynamicButton_pm1_timew995_pi_target015_smoothT1_ckpt20k_300k_s0`，W&B `tkrudpbq`，从 commit `ce0262f` 启动；训练 `156.6s`、exit code 0，共保存15个pre-update快照和1个post-update final。
+- 130条final evaluation为 reward `0.7223±0.4531`、outage `0.2462`、mean cost `9.131`、Q80 cost `17`；critic hard/smooth CDF为 `0.2728/0.2734`，predicted mean cost为 `10.970`，最终lambda为 `0.4038`。
+- 与无safety-setpoint的C-W4 final `reward/outage=1.1999/0.5308` 相比，outage下降约`0.2846`，reward仍高于旧E9的`0.6576`。但点估计仍高于预注册`≤0.22`门，因此不能宣称已经可行，也暂不扩多seed。
+- 这条run的末段不是稳定平台：lambda从110k开始介入，240k后由`0.231→0.290→0.309→0.349→0.325→0.405→0.404`；最后训练窗口outage为`0.4`，最后一批rollout outage为`0.2`。控制器在300k正处于追赶风险、牺牲reward的阶段，尚未完成闭环收敛。
+- PPO末点KL `0.00704`、clip fraction `0.3059`，数值有限但更新幅度偏大；cost grad norm `22.66`且触发clip。没有NaN/Inf或进程错误，所以当前没有“立即停止”的工程证据。
+- 结论定级：P-M1 300k是“接近约束且末段仍在改善/调整”，不是明确失败。它应进入1M稳定性验证；若1M仍持续大周期振荡，再单独测试lambda hysteresis/floor、较小actor LR/更少PPO epoch或PID增益，而不是在300k直接换掉算法。
+
+### E42：短跑证据的使用边界与长跑晋级规则（2026-07-16）
+
+- `100k`只用于机制筛选和查错：可以确认梯度尺度错误、目标测度错配、NaN、明显退化，但“没有早期提升”不能写成“长期无效”。N64、local-quantile和cost-LSTM当前结论严格限定为对应seed和100k预算下无早期收益。
+- `300k`用于闭环初筛：若末段指标已稳定且明显劣于基线，可以停止；若lambda、outage或reward仍呈系统性改善/补偿趋势，则必须晋级。P-M1属于后者。
+- `1M`用于判断controller与actor-critic能否形成稳定平台；至少在300k、600k、1M做phase-aligned checkpoint复评。只有灾难性数值错误，或多个连续窗口稳定落在无价值的支配区域，才提前停止。
+- 最终论文结论不得依赖单seed短跑。候选配置需要至少3个seed、每个至少1.5M；与QCPO_refs做完全公平最终比较时应使用相同环境步数，优先补到其`5M`预算，并报告均值、方差和约束置信区间。
+- 随机初始化确实可能制造短期false negative，特别是LSTM、更大的quantile critic和PID闭环；但它不能推翻确定性的代码/目标证据，例如N64旧实现梯度随N翻倍、uniform-transition目标不对齐initial outage、rollout与post-update final相位错位。这三类问题无需靠长跑“等它自己好”。
+- 下一实验P-M1-L1保持P-M1全部参数不变，只把训练从300k延长到1M并每50k保存checkpoint。按当前吞吐估计纯训练约`8.7min`，加130条终评约`10min`；全程由`launch_background.sh`持久化运行。
