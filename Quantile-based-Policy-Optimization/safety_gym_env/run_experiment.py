@@ -507,6 +507,13 @@ def main():
     if res['cost_cdf_initial'] is not None:                    # DQCAC: cost-critic 校准
         print(f"[cost-critic calibration] P(Z<=q): critic={res['cost_cdf_initial']:.3f} "
               f"truth={emp:.3f} bias={res['cost_cdf_initial']-emp:+.3f}")
+    if res.get('cost_cdf_crossfit_peer_abs_mean') is not None:
+        # crossfit的主/peer/ensemble必须一起打印；只报ensemble会掩盖模型不确定性。
+        print(
+            "[crossfit critic] "
+            f"primary={res['cost_cdf_primary_initial']:.3f} "
+            f"peer={res['cost_cdf_peer_initial']:.3f} "
+            f"mean_abs_disagreement={res['cost_cdf_crossfit_peer_abs_mean']:.3f}")
     ok = emp <= args.q_alpha + 0.02
     print(f"[{'OK ' if ok else 'BAD'}] P(Z<=q)<=alpha: {emp:.3f} (alpha={args.q_alpha})")
     eval_vec.close(); agent.vec_env.close()               # 回收 mp worker 进程
@@ -534,6 +541,11 @@ def main():
             eval_log['eval/pred_cost_mean'] = res['pred_cost_mean']
         if res.get('pred_cost_std') is not None:
             eval_log['eval/pred_cost_std'] = res['pred_cost_std']
+        for key in (
+                'cost_cdf_primary_initial', 'cost_cdf_peer_initial',
+                'cost_cdf_crossfit_peer_abs_mean'):
+            if res.get(key) is not None:
+                eval_log[f'eval/{key}'] = res[key]
         run.log(eval_log)
         try:
             run.summary['eval/constraint_ok'] = bool(ok)

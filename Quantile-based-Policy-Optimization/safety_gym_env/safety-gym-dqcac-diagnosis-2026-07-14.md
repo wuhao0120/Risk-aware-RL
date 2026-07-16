@@ -1386,3 +1386,11 @@ C-X1三条1M长跑和各520条fresh评估已经完成。baseline到target-query�
 对训练长度问题，C-X1是一个很干净的双重例子。100k时三个seed的reward都远低于后段，短跑会漏掉它稳定提高reward的真实作用；但若只延长一个seed到1M，又会把seed1的全面改善错误推广。只有3 seeds×1M+520揭示了真实结论：它是reward–safety trade-off，不是安全稳定器。因此不续1.5M、不扫target tau，也不把target-KL和target-query叠加试运气。
 
 下一步使用真正的两折cross-fit/双cost critic。环境轨迹按固定fold拆分；critic A只用fold A标签训练，critic B只用fold B标签训练；actor在fold A状态上查询未见A标签的critic B，在fold B上查询critic A。最终控制可同时记录两critic分歧，并在评估时比较平均CDF与保守上置信CDF。该设计比慢target更贵，但直接对应当前证据指向的“训练样本泄漏与初始状态泛化”问题；先做默认关闭回归、配对冻结机制门和轻量校准验证，通过后才给live PID长预算。
+
+### 13.56 C-X2：真正的out-of-fold风险查询，而不是再调一个滞后系数（2026-07-16）
+
+C-X2已实现两个独立cost distributional critics，并按环境轨迹而非transition拆成固定两折。主critic只看fold 0的MC标签，peer只看fold 1；actor对某一折的状态查询没有见过该折真实cost的另一个critic。这样切断的是当前样本级监督泄漏，而C-X1的Polyak target只是在时间上低通同一参数轨迹。评估时新状态没有fold身份，所以报告两CDF等权ensemble、两个单模型CDF及其分歧；不能先平均quantiles，因为“平均后过阈值”不等于“过阈值概率的平均”。
+
+首版有意只支持偶数B、MC、raw observation、full-batch和无recent-s0辅助。这些限制不是最终算法主张，而是保证第一条消融只回答cross-fit本身。默认online路径与改前提交在80环境步上6个module、lambda/runtime、41项summary和评估逐值exact；机制测试又证明两折路由正确、两个critic都更新、checkpoint/eval-only包含peer。后台launcher同时修复了同名stale job旧退出码可能污染轮询的问题。
+
+下一步不是用100k live reward裁决。先固定P-M3 seed1成熟高风险策略，以seed101采集与既有C-S0B完全配对的300k轨迹；每个critic约看150条，最终在独立520条初始布局上比较ensemble。既有单critic baseline的truth/CDF为0.28077/0.19964，mean cost truth/pred为11.0173/9.4186。只有CDF或mean error至少改善25%、另一项不恶化且peer分歧不发散，才值得投入seed1的完整1M闭环；否则停止该路线。即使冻结门通过，仍需1M看actor–PID周期、再用3 seeds×520排除初始化偶然性。

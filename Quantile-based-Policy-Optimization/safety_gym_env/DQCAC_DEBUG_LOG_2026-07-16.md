@@ -920,3 +920,13 @@
 - 训练长度结论要同时保留两面：100k会因三个seed尚未形成高reward而误杀C-X1的性能作用；但完整`3 seeds×1M+520`又证明它不是安全主配置。继续1.5M或扫描target tau更可能改变闭环相位，而没有跨seed定向安全证据，因此停止该小网格。
 - C-X1定级为“稳定提高reward、但平均放松约束”的机制消融，不与target-KL组合补丁式试错。下一条路线是两个独立cost critic的两折cross-fit：每个critic只在一半环境轨迹上训练，actor对该折状态查询未见该折标签的另一critic，提供比Polyak一步滞后更严格的样本隔离；先做默认兼容回归和冻结机制门，再决定是否进入live 1M。
 - 正式history、profile和训练图在`_runs/wandb_export/dqc_pm3_vs_cx1_targetquery_multiseed_1m_2026-07-16/`及`_runs/profiles/dqc_pm3_vs_cx1_targetquery_multiseed_1m_2026-07-16/`。后者含`eval_multiseed.csv`、`eval_multiseed_summary.json`与`eval_multiseed_comparison.png`（2084×755，PNG解码验证通过）。
+
+### E67：C-X2两折cross-fit实现、默认回归与冻结300k预注册（2026-07-16）
+
+- 新增默认关闭的`cost_actor_query_mode=crossfit`。按环境编号把完整轨迹固定拆成两折；主cost critic只接收fold-0标签，独立peer只接收fold-1标签。actor对fold-0样本查询peer、对fold-1查询主critic，所以当前样本的真实cost不能先训练查询它的critic再回灌同批actor。首版刻意限制为偶数`num_envs>=2`、`MC + raw history + full-batch + s0_aux=0`，避免一次实验混入n-step、history encoder、recent replay或chunk更新语义。
+- 新评估状态没有fold身份，最终CDF取两critic各自CDF的等权平均，不能先平均quantiles再计数；预测方差按两分布等权mixture计算。同时记录primary CDF、peer CDF、同输入absolute disagreement、两折QR loss和样本比例。checkpoint自动包含peer，eval-only严格恢复；profiler增加crossfit disagreement字段并对旧1M history回归通过。
+- 默认兼容回归以提交`5630741`为金样本，相同seed、CPU sync、`2×2×20=80`环境步。obs normalizer、actor、reward/cost critic及两个target共6个module逐tensor exact；lambda、20个runtime字段、41个训练summary字段和非时间/路径eval JSON逐值exact。module hash为obs `86520917b3438940`、actor `645e073e484d5c19`、reward `92f6207845224661`、reward-target `2520ac1ff50d334e`、cost `8e14fb7efcc15e30`、cost-target `5df9d8aa18b2a45c`。
+- 机制断言确认fold-0→peer、fold-1→primary路由逐tensor正确；两个critic都被optimizer更新，transition fraction严格`0.5/0.5`，末次fold loss为`0.41993/0.54391`，查询分歧为有限非零`2.62e-8`。完整入口smoke训练`8.7s`并完成checkpoint、双critic eval和JSON；独立eval-only严格加载peer后exit 0。临时脚本、checkpoint和profile只在验证期保留，记录完成后清理。
+- 测试还暴露后台launcher复用同名stale job时会暂时保留旧`exit_code`，使轮询器提前误判。本轮在新启动前仅删除该job旧的`worker_started_at/finished_at/exit_code`，不触碰日志与实验产物；`bash -n`和新job完整退出均通过。
+- 冻结机制门使用C-S0B完全相同的P-M3 seed1成熟actor、独立rollout seed101和`15×B20×T1000=300k`数据；唯一算法变量是`online→crossfit`。模块构造和policy-only恢复后重置RNG，故真实轨迹应与既有baseline逐批一致。既有520 baseline truth/CDF/mean为outage `146/520=0.28077`、CDF `0.19964`、mean cost truth/pred `11.0173/9.4186`。
+- crossfit每个critic只看约150条轨迹，检验的是out-of-fold泛化而非增加标签量。进入live 1M的门为：520条truth与baseline配对一致；ensemble CDF或mean-cost error至少改善25%，另一项不得恶化；primary/peer disagreement不持续扩大，最后五批prequential OOF误差无发散。若不过门，直接停止C-X2，不用短live策略曲线作结论；若通过，再在P-M3 seed1完整跑1M+520，之后仍需seed0/2复现。预计纯训练约2～3分钟、128内置评估约1分钟、520复评约4分钟，总墙钟约7～9分钟，全部持久化后台运行。

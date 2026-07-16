@@ -147,8 +147,9 @@ class DQCACBetaGPU(VecAgentBase):
         # critic，从而隔离“本批标签先训练 online critic、再立刻驱动本批 actor”的泄漏。
         self.cost_actor_query_mode = str(
             getattr(args, 'cost_actor_query_mode', 'online')).lower()
-        if self.cost_actor_query_mode not in {'online', 'target'}:
-            raise ValueError("cost_actor_query_mode must be 'online' or 'target'")
+        if self.cost_actor_query_mode not in {'online', 'target', 'crossfit'}:
+            raise ValueError(
+                "cost_actor_query_mode must be 'online', 'target', or 'crossfit'")
         self.n_step = max(1, int(getattr(args, 'n_step', 1)))
         # episodic (未折扣论文口径) 默认由 cost_gamma 推断: γc=1 → episode 末不 bootstrap
         self.episodic = bool(getattr(args, 'episodic', self.cost_gamma >= 1.0 - 1e-9))
@@ -317,6 +318,26 @@ class DQCACBetaGPU(VecAgentBase):
             if self.cost_history_mode != 'raw':
                 raise ValueError("cost_s0_aux_coef>0 currently requires cost_history_mode='raw'")
 
+        # C-X2 首轮只检验严格的两折样本隔离。按完整环境轨迹拆 fold，要求偶数 B；
+        # MC/raw/full-batch 限制把 n-step target、历史 encoder、recent replay 与
+        # transition chunking 都排除，避免一次实验混入四种尚未对拍的分支语义。
+        if self.cost_actor_query_mode == 'crossfit':
+            if self.num_envs < 2 or self.num_envs % 2 != 0:
+                raise ValueError(
+                    "cost_actor_query_mode='crossfit' requires an even num_envs >= 2")
+            if self.cost_target_mode != 'mc':
+                raise ValueError(
+                    "cost_actor_query_mode='crossfit' currently requires cost_target_mode='mc'")
+            if self.cost_history_mode != 'raw':
+                raise ValueError(
+                    "cost_actor_query_mode='crossfit' currently requires cost_history_mode='raw'")
+            if self.cost_s0_aux_coef > 0.0:
+                raise ValueError(
+                    "cost_actor_query_mode='crossfit' currently requires cost_s0_aux_coef=0")
+            if self.critic_minibatch_size != 0:
+                raise ValueError(
+                    "cost_actor_query_mode='crossfit' currently requires critic_minibatch_size=0")
+
         # dual 消融：旧 critic_adam 保持可复现；empirical_pid 用真实完成轨迹控制 λ。
         self.dual_update_mode = str(getattr(args, 'dual_update_mode', 'critic_adam')).lower()
         if self.dual_update_mode not in {'critic_adam', 'empirical_pid'}:
@@ -413,6 +434,15 @@ class DQCACBetaGPU(VecAgentBase):
             list(hidden)).to(self.device)
         self.cost_target_critic.load_state_dict(self.cost_critic.state_dict())
 
+        # C-X2 仅在显式 crossfit 模式构造独立 peer critic。默认 None 不消费任何
+        # RNG，保证 online/target 的网络初始化与首批动作逐位兼容。peer 使用独立
+        # 随机初始化并只接收 fold-1 标签；主 cost_critic 只接收 fold-0 标签。
+        self.cost_crossfit_critic = None
+        if self.cost_actor_query_mode == 'crossfit':
+            self.cost_crossfit_critic = DistributionalCritic(
+                cost_cdim, self.action_dim, self.num_quantiles,
+                list(hidden)).to(self.device)
+
         # C-H1 编码器放在 critic heads 初始化之后，保证 actor/reward critic 与
         # C-H0.5 在相同 seed 下不因额外网络提前消费 RNG 而改变初始参数。
         self.cost_history_encoder = None
@@ -438,6 +468,10 @@ class DQCACBetaGPU(VecAgentBase):
         critic_parameters = (
             list(self.reward_critic.parameters())
             + list(self.cost_critic.parameters()))
+        if self.cost_crossfit_critic is not None:
+            # 两个 fold critic 共用一个 Adam step；下面的 loss 按 fold 样本比例
+            # 聚合，保持总体 cost objective 仍是全批 transition mean。
+            critic_parameters += list(self.cost_crossfit_critic.parameters())
         if self.cost_history_encoder is not None:
             critic_parameters += list(self.cost_history_encoder.parameters())
         self.critic_optimizer = Adam(
@@ -468,7 +502,8 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_cdf_smooth_initial = 0.0                    # sigmoid CDF，仅作 surrogate 诊断
         self.last_pred_cost_mean = 0.0                        # cost-critic 估 E[C|s0]
         self.last_pred_cost_std = 0.0                         # cost-critic 估 std(C|s0)
-        self.last_risk_query_target_online_abs_mean = 0.0     # target/online actor风险CDF差
+        self.last_risk_query_target_online_abs_mean = 0.0     # actor查询网络间风险CDF差
+        self.last_cost_crossfit_peer_abs_mean = 0.0            # 两折critic同输入CDF分歧
         # replay 只保存少量 GPU tensor；原始 state 在使用时重新走当前 RMS，不能
         # 缓存旧归一化结果，否则 observation statistics 漂移会污染监督输入。
         self.cost_s0_replay = deque(maxlen=self.cost_s0_replay_batches)
@@ -933,6 +968,14 @@ class DQCACBetaGPU(VecAgentBase):
             batch['old_log_probs'] = roll['logp'].reshape(n * B).detach()  # rollout 固定行为策略
         if mc_cost is not None:
             batch['mc_cost'] = mc_cost.reshape(n * B).detach()
+        if self.cost_actor_query_mode == 'crossfit':
+            # index=t*B+j，因此 env j 的全部 T 个 transition 必须共享同一 fold。
+            # fold 0 标签只训练主 critic，fold 1 标签只训练 peer；actor 查询相反
+            # critic。不能逐 transition 随机拆分，否则同一轨迹标签会泄漏到两边。
+            s0_fold = torch.arange(B, device=self.device, dtype=torch.long) % 2
+            batch['_cost_crossfit_s0_fold'] = s0_fold
+            batch['_cost_crossfit_fold'] = (
+                s0_fold.unsqueeze(0).expand(n, B).reshape(n * B))
         if self.recurrent_policy:
             # 保留时间主序张量；actor update 再按 recurrent_seq_len 切块，保证每个
             # chunk 的初始 (h,c) 正是行为策略采样时进入该位置的状态。
@@ -982,7 +1025,14 @@ class DQCACBetaGPU(VecAgentBase):
         initial_inputs = self._cost_inputs(
             initial_states, 0, initial_features)
 
-        quantiles = self.cost_critic(initial_inputs, initial_actions)
+        if self.cost_actor_query_mode == 'crossfit':
+            # 当前s0属于哪个标签fold，就查询没有见过该fold标签的另一critic。
+            quantiles = self._cost_actor_query_quantiles(
+                initial_inputs, initial_actions,
+                label_folds=batch['_cost_crossfit_s0_fold'])
+        else:
+            # online/target实验的holdout历史定义始终评估online critic，保持可比。
+            quantiles = self.cost_critic(initial_inputs, initial_actions)
         predicted_probability = self._cost_tail_probability(
             quantiles, float(self.cost_limit), mode='hard')
         observed_event = (
@@ -1184,6 +1234,11 @@ class DQCACBetaGPU(VecAgentBase):
         chunk_size = self.critic_minibatch_size
         use_chunks = 0 < chunk_size < total_size
         self.critic_optimizer.zero_grad(set_to_none=True)
+        # 默认值只服务日志；crossfit 分支会分别填入两个独立 critic 的 fold mean loss。
+        crossfit_fold0_loss_value = 0.0
+        crossfit_fold1_loss_value = 0.0
+        crossfit_fold0_fraction = 0.0
+        crossfit_fold1_fraction = 0.0
 
         # 辅助目标只改变 cost 监督在 transition 与 recent-s0 间的质量分配。
         # coef=0 时 s0_aux_loss=None，下面保留历史 backward 表达式逐位不变。
@@ -1221,10 +1276,42 @@ class DQCACBetaGPU(VecAgentBase):
         elif not use_chunks:
             # 默认历史路径：构造完整 [T*B,N,N] pairwise error，一次 backward。
             reward_pred = self.reward_critic(reward_state_inputs, actions)
-            cost_pred = self.cost_critic(cost_state_inputs, actions)
             reward_loss = self._quantile_huber_loss(reward_pred, reward_target)
-            cost_loss = self._cost_quantile_huber_loss(
-                cost_pred, cost_target, cost_sample_weights)
+            if self.cost_actor_query_mode == 'crossfit':
+                # fold 0/1 都按完整环境轨迹划分。每个 critic 的 QR loss 只看自己
+                # fold 的标签；按样本占比加权后，二者之和仍等于全批 transition mean，
+                # 不会因为多一个网络把 cost objective 或 joint clip 尺度直接翻倍。
+                folds = batch['_cost_crossfit_fold']
+                fold0_mask = folds == 0
+                fold1_mask = folds == 1
+                if not bool(fold0_mask.any()) or not bool(fold1_mask.any()):
+                    raise RuntimeError("crossfit critic update requires two non-empty folds")
+                fold0_pred = self.cost_critic(
+                    cost_state_inputs[fold0_mask], actions[fold0_mask])
+                fold1_pred = self.cost_crossfit_critic(
+                    cost_state_inputs[fold1_mask], actions[fold1_mask])
+                fold0_loss = self._cost_quantile_huber_loss(
+                    fold0_pred, cost_target[fold0_mask],
+                    None if cost_sample_weights is None
+                    else cost_sample_weights[fold0_mask])
+                fold1_loss = self._cost_quantile_huber_loss(
+                    fold1_pred, cost_target[fold1_mask],
+                    None if cost_sample_weights is None
+                    else cost_sample_weights[fold1_mask])
+                crossfit_fold0_fraction = float(
+                    fold0_mask.float().mean().item())
+                crossfit_fold1_fraction = float(
+                    fold1_mask.float().mean().item())
+                cost_loss = (
+                    crossfit_fold0_fraction * fold0_loss
+                    + crossfit_fold1_fraction * fold1_loss)
+                crossfit_fold0_loss_value = float(fold0_loss.item())
+                crossfit_fold1_loss_value = float(fold1_loss.item())
+            else:
+                # 非crossfit分支保持单一cost critic、调用顺序与浮点表达式不变。
+                cost_pred = self.cost_critic(cost_state_inputs, actions)
+                cost_loss = self._cost_quantile_huber_loss(
+                    cost_pred, cost_target, cost_sample_weights)
             if s0_aux_loss is None:
                 # 默认关闭路径保持历史 autograd 图和浮点运算顺序。
                 (reward_loss + cost_loss).backward()
@@ -1267,6 +1354,9 @@ class DQCACBetaGPU(VecAgentBase):
         # 才能识别究竟是 quantile head 还是历史表示导致 joint clip。
         reward_parameters = list(self.reward_critic.parameters())
         cost_parameters = list(self.cost_critic.parameters())
+        if self.cost_crossfit_critic is not None:
+            # peer 参数也参与同一次joint norm/clip；否则日志会低报真实optimizer输入。
+            cost_parameters += list(self.cost_crossfit_critic.parameters())
         if self.cost_history_encoder is not None:
             cost_parameters += list(self.cost_history_encoder.parameters())
 
@@ -1327,6 +1417,14 @@ class DQCACBetaGPU(VecAgentBase):
                 cost_base_scale * cost_loss_value
                 + s0_aux_info['critic/cost_s0_aux_scaled_loss']),
         }
+        if self.cost_actor_query_mode == 'crossfit':
+            critic_info.update({
+                'critic/cost_crossfit_enabled': 1.0,
+                'critic/cost_crossfit_fold0_loss': crossfit_fold0_loss_value,
+                'critic/cost_crossfit_fold1_loss': crossfit_fold1_loss_value,
+                'critic/cost_crossfit_fold0_fraction': crossfit_fold0_fraction,
+                'critic/cost_crossfit_fold1_fraction': crossfit_fold1_fraction,
+            })
         critic_info.update(s0_aux_info)
         return critic_info
 
@@ -1553,10 +1651,11 @@ class DQCACBetaGPU(VecAgentBase):
             budgets = batch['budgets']
             steps = batch['steps']
             if '_risk_weight' not in batch:
-                actor_cost_critic = self._cost_actor_query_critic()
                 cost_inputs = self._cost_inputs(
                     states, steps, batch.get('cost_feature'))
-                psi_c = actor_cost_critic(cost_inputs, batch['actions'])
+                query_folds = batch.get('_cost_crossfit_fold')
+                psi_c = self._cost_actor_query_quantiles(
+                    cost_inputs, batch['actions'], label_folds=query_folds)
                 psi_cdf = self._cost_tail_probability(psi_c, budgets)
                 # target模式额外查询同刻online网络只作诊断，不采样、不参与梯度；
                 # online默认直接返回0，保证历史路径不增加任何critic forward。
@@ -1570,7 +1669,8 @@ class DQCACBetaGPU(VecAgentBase):
                 for _sample_idx in range(self.num_action_samples):
                     baseline_action = self._sample_from_params(
                         behavior_mean, behavior_log_std)
-                    baseline_psi = actor_cost_critic(cost_inputs, baseline_action)
+                    baseline_psi = self._cost_actor_query_quantiles(
+                        cost_inputs, baseline_action, label_folds=query_folds)
                     baseline_cdfs.append(
                         self._cost_tail_probability(baseline_psi, budgets))
                 baseline_cdf = torch.stack(baseline_cdfs, dim=0).mean(dim=0)
@@ -1699,15 +1799,18 @@ class DQCACBetaGPU(VecAgentBase):
             # PPO 的行为分母与 advantage 都必须相对同一 rollout 固定；首次 actor epoch
             # 查询 cost critic 后缓存，后续 epochs 不再因 critic 更新而移动 risk target。
             if '_risk_weight' not in batch:
-                actor_cost_critic = self._cost_actor_query_critic()
                 cost_inputs = self._aug(s, steps)
-                psi_c = actor_cost_critic(cost_inputs, a)             # [T·B,N]
+                query_folds = batch.get('_cost_crossfit_fold')
+                psi_c = self._cost_actor_query_quantiles(
+                    cost_inputs, a, label_folds=query_folds)           # [T·B,N]
                 psi_cdf = self._cost_tail_probability(psi_c, b)
                 batch['_risk_query_target_online_abs_mean'] = (
                     self._cost_actor_query_disagreement(
                         cost_inputs, a, b, psi_cdf).detach())
                 v_m, v_c = self._estimate_baselines(
-                    s, b, steps, need_reward=self.reward_actor_mode == 'distributional')
+                    s, b, steps,
+                    need_reward=self.reward_actor_mode == 'distributional',
+                    cost_query_folds=query_folds)
                 raw_adv_c = psi_cdf - v_c
                 if self.advantage_norm == 'qcpo':
                     a_c = raw_adv_c / self.constraint_rms.std          # EMA σ_c 归一化
@@ -2018,16 +2121,50 @@ class DQCACBetaGPU(VecAgentBase):
 
     def _cost_actor_query_critic(self):
         """
-        返回生成 actor 风险优势的 cost critic，而不改变训练/评估 critic。
+        返回单网络actor-query critic；crossfit必须改用逐样本路由helper。
 
-        online 是历史路径。target 使用 Polyak 网络；训练循环在首个 actor epoch
-        之后才同步 target，且风险优势随后缓存，所以当前 rollout 的真实 cost
-        标签不会先进入查询网络再反过来更新同一批动作。校准、QR loss与最终评估
-        仍使用 online critic，保证该开关只检验 actor-query feedback。
+        online 是历史路径。target 使用 Polyak 网络。crossfit的每行样本可能需要
+        不同网络，若误调用本函数会把整批送入一个critic并破坏out-of-fold语义，
+        因此显式报错而不静默选择主网络。
         """
         if self.cost_actor_query_mode == 'target':
             return self.cost_target_critic
+        if self.cost_actor_query_mode == 'crossfit':
+            raise RuntimeError(
+                "crossfit actor query requires _cost_actor_query_quantiles")
         return self.cost_critic
+
+    def _cost_actor_query_quantiles(self, inputs, actions, label_folds=None):
+        """
+        返回actor使用的cost quantiles；crossfit按标签fold查询相反critic。
+
+        label_folds=0表示该行真实标签训练主critic，所以查询peer；fold=1反之。
+        online/target忽略fold并保持原来的一次完整forward。函数只用于无梯度的
+        actor/normalizer/校准查询，不参与critic参数反向传播。
+        """
+        if self.cost_actor_query_mode != 'crossfit':
+            return self._cost_actor_query_critic()(inputs, actions)
+        if self.cost_crossfit_critic is None:
+            raise RuntimeError("crossfit peer critic is not initialized")
+        if label_folds is None:
+            raise RuntimeError("crossfit actor query requires aligned label_folds")
+        folds = label_folds.reshape(-1).to(device=inputs.device)
+        if folds.numel() != inputs.shape[0]:
+            raise ValueError("crossfit label_folds must align with query rows")
+        fold0_mask = folds == 0
+        fold1_mask = folds == 1
+        if not bool(fold0_mask.any()) or not bool(fold1_mask.any()):
+            raise RuntimeError("crossfit actor query requires two non-empty folds")
+
+        # 先分配最终[T*B,N]，再把两个半批forward写回原time-major位置。
+        quantiles = torch.empty(
+            inputs.shape[0], self.num_quantiles,
+            dtype=inputs.dtype, device=inputs.device)
+        quantiles[fold0_mask] = self.cost_crossfit_critic(
+            inputs[fold0_mask], actions[fold0_mask])
+        quantiles[fold1_mask] = self.cost_critic(
+            inputs[fold1_mask], actions[fold1_mask])
+        return quantiles
 
     @torch.no_grad()
     def _cost_actor_query_disagreement(self, inputs, actions, budgets, queried_cdf):
@@ -2038,6 +2175,17 @@ class DQCACBetaGPU(VecAgentBase):
         复算CDF，并记录平均绝对差；它回答Polyak查询是否真的形成了非零时间隔离，
         避免把数值上几乎相同的网络误报成有效cross-batch机制。
         """
+        if self.cost_actor_query_mode == 'crossfit':
+            # 同一输入同时过两个模型，只用于诊断模型不确定性；优化仍严格使用
+            # 上面按fold选择的out-of-fold queried_cdf，不取均值也不取最大值。
+            primary_cdf = self._cost_tail_probability(
+                self.cost_critic(inputs, actions), budgets)
+            peer_cdf = self._cost_tail_probability(
+                self.cost_crossfit_critic(inputs, actions), budgets)
+            disagreement = (primary_cdf - peer_cdf).abs().mean()
+            self.last_cost_crossfit_peer_abs_mean = float(disagreement.item())
+            self.last_risk_query_target_online_abs_mean = float(disagreement.item())
+            return disagreement
         if self.cost_actor_query_mode != 'target':
             self.last_risk_query_target_online_abs_mean = 0.0
             return torch.zeros((), device=queried_cdf.device)
@@ -2049,7 +2197,7 @@ class DQCACBetaGPU(VecAgentBase):
 
     def _estimate_baselines(self, states, budgets, steps=None, need_reward=True,
                             policy_mean=None, policy_log_std=None,
-                            cost_features=None):
+                            cost_features=None, cost_query_folds=None):
         """
         用 K 个策略动作近似 V_c(s,b)，仅在 distributional reward 模式下同时近似 V_m(s)。
 
@@ -2064,7 +2212,6 @@ class DQCACBetaGPU(VecAgentBase):
         cost_aug = (
             s_aug if self.cost_history_mode == 'raw'
             else self._cost_inputs(states, 0 if steps is None else steps, cost_features))
-        actor_cost_critic = self._cost_actor_query_critic()
         q_list, c_list = [], []
         for _ in range(self.num_action_samples):
             if self.recurrent_policy:
@@ -2077,7 +2224,8 @@ class DQCACBetaGPU(VecAgentBase):
                 a = self._sample_actions(states)
             if need_reward:
                 q_list.append(self.reward_critic(s_aug, a).mean(dim=1))          # reward 均值
-            cost_quantiles = actor_cost_critic(cost_aug, a)
+            cost_quantiles = self._cost_actor_query_quantiles(
+                cost_aug, a, label_folds=cost_query_folds)
             c_list.append(self._cost_tail_probability(cost_quantiles, budgets))
         reward_baseline = torch.stack(q_list, dim=0).mean(dim=0) if need_reward else None
         cost_baseline = torch.stack(c_list, dim=0).mean(dim=0)
@@ -2114,8 +2262,9 @@ class DQCACBetaGPU(VecAgentBase):
             steps = batch['steps']
             cost_features = batch.get('cost_feature')
             cost_inputs = self._cost_inputs(s, steps, cost_features)
-            actor_cost_critic = self._cost_actor_query_critic()
-            cost_quantiles = actor_cost_critic(cost_inputs, a)
+            query_folds = batch.get('_cost_crossfit_fold')
+            cost_quantiles = self._cost_actor_query_quantiles(
+                cost_inputs, a, label_folds=query_folds)
             psi_cdf = self._cost_tail_probability(cost_quantiles, b)
             policy_mean = (
                 batch['actor_mean'].reshape(-1, self.action_dim)
@@ -2126,7 +2275,7 @@ class DQCACBetaGPU(VecAgentBase):
             _, v_c = self._estimate_baselines(
                 s, b, steps, need_reward=False,
                 policy_mean=policy_mean, policy_log_std=policy_log_std,
-                cost_features=cost_features)
+                cost_features=cost_features, cost_query_folds=query_folds)
             adv_c = psi_cdf - v_c
         self._ema_update(self.constraint_rms,
                          float(adv_c.mean().item()), float(adv_c.var(unbiased=False).item()))
@@ -2145,7 +2294,7 @@ class DQCACBetaGPU(VecAgentBase):
                     target_parameter.data.lerp_(
                         online_parameter.data, self.target_tau)
 
-    def _initial_cdf_estimate(self, s0):
+    def _initial_cdf_estimate(self, s0, label_folds=None):
         """cost-critic 在 s0 上的 P(C≥d)/E[C]/std(C) 估计 (校准诊断)。"""
         with torch.no_grad():
             a0, actor_feature0 = self._sample_initial_actions(
@@ -2153,7 +2302,21 @@ class DQCACBetaGPU(VecAgentBase):
             cost_feature0 = self._initial_cost_history_feature(
                 s0, actor_feature0)
             cost_input0 = self._cost_inputs(s0, 0, cost_feature0)
-            psi = self.cost_critic(cost_input0, a0)           # [B, N]
+            if self.cost_actor_query_mode == 'crossfit':
+                # 训练日志必须报告真正驱动该fold actor的out-of-fold critic，而不是
+                # 总用主critic。另在同一(s0,a0)上记录两模型hard-CDF分歧。
+                psi = self._cost_actor_query_quantiles(
+                    cost_input0, a0, label_folds=label_folds)
+                primary_cdf = self._cost_tail_probability(
+                    self.cost_critic(cost_input0, a0),
+                    self.cost_limit, mode='hard')
+                peer_cdf = self._cost_tail_probability(
+                    self.cost_crossfit_critic(cost_input0, a0),
+                    self.cost_limit, mode='hard')
+                self.last_cost_crossfit_peer_abs_mean = float(
+                    (primary_cdf - peer_cdf).abs().mean().item())
+            else:
+                psi = self.cost_critic(cost_input0, a0)       # [B,N] 历史exact路径
             self.last_cdf_initial = float(
                 self._cost_tail_probability(
                     psi, self.cost_limit, mode='hard').mean().item())
@@ -2171,7 +2334,8 @@ class DQCACBetaGPU(VecAgentBase):
         R_np = batch['disc_return'].detach().cpu().numpy()
         Zc_np = batch['disc_cost'].detach().cpu().numpy()
         Cu_np = batch['undisc_cost'].detach().cpu().numpy()
-        ghat = self._initial_cdf_estimate(batch['s0'])        # cost-critic 估 P(C≥d)=P(Z≤q)
+        ghat = self._initial_cdf_estimate(
+            batch['s0'], batch.get('_cost_crossfit_s0_fold'))  # OOF或online P(C≥d)
         budgets_np = batch['budgets'].detach().cpu().numpy()
         empirical_prob = float(np.mean(Zc_np >= self.cost_limit))  # = P(Z≤q)
 
@@ -2245,6 +2409,16 @@ class DQCACBetaGPU(VecAgentBase):
                         f'critic/s0_holdout_{phase}_{metric_name}'] = metric_value
         extra.update(critic_info)
         extra.update(actor_info)
+        if self.cost_actor_query_mode == 'crossfit':
+            # 旧target-online键为兼容既有profile继续保留；该别名明确当前比较的是
+            # 两个独立fold critic，避免把peer disagreement误读成Polyak lag。
+            extra['debug/cost_actor_query_is_crossfit'] = 1.0
+            extra['advantage/risk_query_crossfit_peer_abs_mean'] = float(
+                actor_info.get(
+                    'advantage/risk_query_target_online_abs_mean',
+                    self.last_risk_query_target_online_abs_mean))
+            extra['critic/cost_crossfit_peer_abs_mean'] = (
+                self.last_cost_crossfit_peer_abs_mean)
         if self.advantage_norm == 'qcpo':
             extra['norm/return_sigma_ema'] = float(self.return_rms.std)
             extra['norm/constraint_sigma_ema'] = float(self.constraint_rms.std)
@@ -2313,16 +2487,56 @@ class DQCACBetaGPU(VecAgentBase):
             cost_feature0 = self._initial_cost_history_feature(
                 s0, actor_feature0)
             cost_input0 = self._cost_inputs(s0, 0, cost_feature0)
-            psi0 = self.cost_critic(cost_input0, a0)
-            cost_cdf_initial = float(
-                self._cost_tail_probability(
-                    psi0, float(cost_limit), mode='hard').mean().item())
-            cost_cdf_smooth_initial = float(
-                self._cost_tail_probability(
-                    psi0, float(cost_limit), mode='sigmoid').mean().item())
-            pred_mean0, pred_std0 = self._cost_quantile_moments(psi0)
-            pred_cost_mean = float(pred_mean0.mean().item())
-            pred_cost_std = float(pred_std0.mean().item())
+            crossfit_eval = None
+            if self.cost_actor_query_mode == 'crossfit':
+                # 新评估状态没有训练fold身份，因此用两个独立估计的等权ensemble。
+                # CDF先各自查询再平均，不能先平均quantiles后count，否则二者不等价。
+                psi_primary = self.cost_critic(cost_input0, a0)
+                psi_peer = self.cost_crossfit_critic(cost_input0, a0)
+                hard_primary = self._cost_tail_probability(
+                    psi_primary, float(cost_limit), mode='hard')
+                hard_peer = self._cost_tail_probability(
+                    psi_peer, float(cost_limit), mode='hard')
+                smooth_primary = self._cost_tail_probability(
+                    psi_primary, float(cost_limit), mode='sigmoid')
+                smooth_peer = self._cost_tail_probability(
+                    psi_peer, float(cost_limit), mode='sigmoid')
+                cost_cdf_initial = float(
+                    (0.5 * (hard_primary + hard_peer)).mean().item())
+                cost_cdf_smooth_initial = float(
+                    (0.5 * (smooth_primary + smooth_peer)).mean().item())
+
+                # 把两critic视为等权分布mixture：Var=E[var+mean²]-E[mean]²。
+                mean_primary, std_primary = self._cost_quantile_moments(
+                    psi_primary)
+                mean_peer, std_peer = self._cost_quantile_moments(psi_peer)
+                mixture_mean = 0.5 * (mean_primary + mean_peer)
+                mixture_second = 0.5 * (
+                    std_primary.pow(2) + mean_primary.pow(2)
+                    + std_peer.pow(2) + mean_peer.pow(2))
+                mixture_std = (
+                    mixture_second - mixture_mean.pow(2)).clamp_min(0.0).sqrt()
+                pred_cost_mean = float(mixture_mean.mean().item())
+                pred_cost_std = float(mixture_std.mean().item())
+                crossfit_eval = {
+                    'cost_cdf_primary_initial': float(
+                        hard_primary.mean().item()),
+                    'cost_cdf_peer_initial': float(hard_peer.mean().item()),
+                    'cost_cdf_crossfit_peer_abs_mean': float(
+                        (hard_primary - hard_peer).abs().mean().item()),
+                }
+            else:
+                # 单critic分支逐式保留历史运算顺序，支持默认checkpoint exact回归。
+                psi0 = self.cost_critic(cost_input0, a0)
+                cost_cdf_initial = float(
+                    self._cost_tail_probability(
+                        psi0, float(cost_limit), mode='hard').mean().item())
+                cost_cdf_smooth_initial = float(
+                    self._cost_tail_probability(
+                        psi0, float(cost_limit), mode='sigmoid').mean().item())
+                pred_mean0, pred_std0 = self._cost_quantile_moments(psi0)
+                pred_cost_mean = float(pred_mean0.mean().item())
+                pred_cost_std = float(pred_std0.mean().item())
 
         reward_np = torch.cat(rewards_all).cpu().numpy().astype(np.float64)
         cost_np = torch.cat(costs_all).cpu().numpy().astype(np.float64)
@@ -2331,7 +2545,7 @@ class DQCACBetaGPU(VecAgentBase):
         threshold = -float(cost_limit)
         empirical = float(np.mean(transformed <= threshold))
         quantile = float(np.percentile(transformed, omega * 100))
-        return {
+        result = {
             'mean': float(reward_np.mean()),
             'reward_std': float(reward_np.std()),
             'empirical_prob': empirical,
@@ -2348,11 +2562,14 @@ class DQCACBetaGPU(VecAgentBase):
             'pred_cost_mean': pred_cost_mean,
             'pred_cost_std': pred_cost_std,
         }
+        if crossfit_eval is not None:
+            result.update(crossfit_eval)
+        return result
 
     # ============================================================ 总结接口 ============================================================
     def get_training_summary(self):
         """暴露最终约束指标。"""
-        return {
+        summary = {
             'lambda_final': float(self.lambda_dual.detach().item()),
             'empirical_prob': self.last_empirical_prob,
             'empirical_outage_prob': self.last_outage_prob,   # 兼容旧字段 (=empirical_prob)
@@ -2396,3 +2613,12 @@ class DQCACBetaGPU(VecAgentBase):
             'num_envs': self.num_envs,
             'num_iterations': self.num_iterations,
         }
+        if self.cost_actor_query_mode == 'crossfit':
+            summary.update({
+                'cost_crossfit_enabled': True,
+                'risk_query_crossfit_peer_abs_mean': (
+                    self.last_risk_query_target_online_abs_mean),
+                'cost_crossfit_peer_abs_mean': (
+                    self.last_cost_crossfit_peer_abs_mean),
+            })
+        return summary
