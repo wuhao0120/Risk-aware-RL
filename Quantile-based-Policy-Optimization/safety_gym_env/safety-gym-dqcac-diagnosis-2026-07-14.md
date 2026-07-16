@@ -1324,3 +1324,11 @@ seed0/2各完整训练1M并做520条fresh eval-only。baseline→aux的reward/ou
 本轮也校正了实验预算规则。100k确实对慢校准组件太短，300k固定策略才发现价值，1M seed1才证明它能改变policy；但是3 seeds×1M已足以拒绝当前`.25/r4`精确组合。它末200k没有跨seed一致的安全趋势，reward又在所有seed下降，因此继续1.5M主要是在等待周期换相位，收益概率低，不值得直接消耗预算。
 
 后续不再扫描simple replay系数。更合理的两条独立路线是：用cross-fit、慢target或ensemble uncertainty隔离“同批标签→共享critic→actor→下一批标签”的正反馈；给8-epoch PPO加入默认关闭的target-KL early stop，限制critic校准变化后单次策略回摆。joint critic clip确有工程耦合，但只在约8–12%的step触发且reward梯度远小于cost梯度，优先级低于上述两项。
+
+### 13.50 target-KL路线：短跑在这里不是保守，而是没有检验功效（2026-07-16）
+
+已实现默认关闭的`ppo_target_kl`。它与ratio clip互补：clip约束每个样本的surrogate，target-KL约束整批behavior→current policy位移。每个epoch先forward计算KL，若已越界则本epoch不backward、不step，并停止剩余actor epochs；critic更新数不变。默认0的改前/改后checkpoint六个Module、RMS、lambda、runtime和eval逐tensor exact；极低阈值smoke则稳定得到configured 3、completed 1、early-stop 1和critic 9/9 updates。
+
+阈值`.004`来自已有数据，不是新网格。P-M3 baseline最终epoch KL超过它的比例为18%，s0-aux为25.3%；baseline前300k只有2.2%，300–600k和600–800k各33.3%。因此跑100k几乎看不到target-KL触发，用短跑宣布无效属于错误实验设计。它必须在完整1M中检验是否削弱中段风险周期。
+
+P-M5只在原P-M3失败seed1上增加`.004`，不混入已经多seed失败的s0 replay。通过门为520条outage不高于0.22且相对0.3058至少下降0.08，reward不低于0.75；同时报告实际completed epochs和末200k周期。若失败，不扫`.003/.005/.006`，转cross-fit/慢target校准；若通过，再以seed0/2验证而不是只保留压力seed。

@@ -851,3 +851,12 @@
 - 末200k训练rollout的三seed均值同样显示reward/outage约为baseline `0.808/0.205`、aux `0.647/0.202`：训练窗口安全几乎不变，reward代价已出现。独立初始状态上的改善只发生在部分seed，不能靠挑checkpoint解释。
 - 长度判断：100k不足以否定s0 replay，300k冻结策略发现其校准价值，1M seed1发现live价值；但3 seeds×1M已足以拒绝当前`.25/r4`作为主配置。继续1.5M可能改变周期相位，却没有跨seed定向改善证据，低优先级且不值得直接续跑。
 - 下一步停止simple coef/replay网格，转向不会把同批反馈直接灌回共享critic的cross-fit/target-stabilized calibration，以及限制PPO闭环回摆的target-KL early stop；二者分别做默认关闭的单变量消融。
+
+### E61：P-M5 target-KL实现、回归与1M预注册（2026-07-16）
+
+- commit `955b05f`新增DQCAC专用`ppo_target_kl`，默认0完全关闭。正阈值在epoch forward得到behavior→current approximate KL后、backward前判断；越界probe不做optimizer step，剩余actor epochs跳过，但critic的20次更新继续跑满。日志同时记录configured/completed epochs、early-stop与update-applied。
+- 固定seed tiny recurrent金样本在改动前后比较：actor、reward/cost critic及target、RMS、lambda与全部runtime逐tensor/逐字段exact，eval JSON exact；唯一新增summary/config字段为`ppo_target_kl=0`。
+- `target=1e-8`触发smoke中，每轮configured actor epochs=3、completed=1、early_stop=1、最后probe update_applied=0；critic `learning_steps=9=3×3`，exit0。所有临时checkpoint/job/log/离线W&B已清理。
+- 用既有六条1M history选阈值而不扫网格：在P-M3 baseline中第8 epoch KL超过`.004`的rollout占18%，s0-aux中占25.3%；baseline 0–300k仅2.2%，300–600k与600–800k均33.3%。aux的KL与同批outage相关系数约0.394，因此`.004`能命中中段回摆而不会普遍砍掉早期更新。
+- P-M5以原P-M3 seed1为压力基线，只增加`ppo_target_kl=.004`，不带s0 aux；B20、C20、N32、T1、PID、LR和8个最大epoch全部不变。直接跑1M，因为100k/300k几乎不会触发该机制，短跑没有检验功效。
+- 原seed1 fresh520为reward/outage `0.8622/0.3058`。候选要求520条outage至少下降0.08并到`≤0.22`，reward保持`≥0.75`，且末200k不出现更大的risk周期；无论140条screen好坏都执行520。预计训练6～7分钟、140终评约1～2分钟、520复评约4分钟，总计约11～13分钟，持久化后台运行。
