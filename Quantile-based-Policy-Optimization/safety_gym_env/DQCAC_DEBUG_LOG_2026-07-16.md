@@ -758,3 +758,13 @@
 - 100k不足以否定此变量，因为其收益通过数十次policy/dual更新积累；本次直接跑1M，但仍按100k保存phase-aligned checkpoint。参考K4独占GPU训练`390.6s`，K16增加无梯度critic前向，预计纯训练约7～10分钟、含140条终评约9～12分钟。
 - 基本门仍为520条`reward>0.658,outage<=0.22`。相对K4 seed0还要求末200k训练outage不高于0.22、reward不低于约0.70，且KL/clip或风险周期至少一项显示稳定性不恶化；否则即使偶然终评好看也不晋级。
 - 140条只作是否扩520的screen。若P-M4通过，下一步优先在曾失败的seed1做同配置1M压力复现；若失败则停止K小网格，不试K8/K32碰运气，转recent/initial-state critic replay与holdout校准。
+
+### E52：P-M4 K16完整1M结果——中期PPO更稳，但后期风险周期与回报退化仍存在（2026-07-16）
+
+- job `DQCAC_DynamicButton_pm4_timew995_pi_target015_smoothT1_b20_k16_ckpt100k_1m_s0`，W&B `rx3mofgr`，正常exit 0。纯训练`393.1s`，K4为`390.6s`；K16额外无梯度cost-critic前向没有形成可测的wall-time代价，也无OOM/NaN。
+- 140条final为reward `0.6030±0.4853`、outage `25/140=0.1786`、mean cost `7.743`、Q80 cost `13.2`；hard/smooth critic CDF为`0.1346/0.1370`，pred mean `6.838`，lambda `0.2120`。安全点估计较好，但reward低于预注册`>0.658`门。
+- 0–300k时K4/K16的reward为`0.344/0.346`、outage `0.113/0.120`，没有早期优势。300–600k时K16确实表现出局部收益：outage从K4的`0.237`降到`0.163`，KL/clip从`0.00404/0.207`降到`0.00222/0.117`，reward仅`0.685→0.664`。
+- 这个中期好点没有保持。600k–1M的K16 outage为`0.270`，K4为`0.235`；680k单批outage达到`0.65`，lambda随后升至约`0.51`。末200k K16/K4 reward为`0.621/0.711`，window outage为`0.236/0.212`，KL为`0.00382/0.00286`，clip为`0.1888/0.1557`。
+- 因此K16减小action baseline Monte Carlo误差可以短暂降低PPO位移和中期outage，但它不是后期策略—critic—PID周期的主瓶颈。更长的1M预算再次避免了只看300–600k而把K16误判为成功。
+- 由于末段趋势门和140条reward门同时失败，不扩520，不跑seed1，也不继续K8/K32小网格。K16保留为负/阶段性正消融；主线转recent/initial-state cost critic replay、holdout CDF calibration或直接s0 auxiliary。
+- 完整history和对齐图：`_runs/wandb_export/dqc_pm3_k4_pm4_k16_1m_2026-07-16/`、`_runs/profiles/dqc_pm3_k4_pm4_k16_1m_2026-07-16/`。

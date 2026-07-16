@@ -1244,3 +1244,11 @@ P-M4在P-M3 B20基础上只把`num_action_samples=4→16`，固定1M环境步。
 该实验不应被解释成critic校准修复。seed1的CDF低估需要recent/initial-state replay或holdout objective单独处理；K16只检验相对动作排序噪声是否导致PPO/dual周期。预计纯训练7～10分钟，持久化后台运行，每100k保存快照。
 
 晋级门不仅看最终点：520条需满足reward>0.658和outage<=0.22，末200k训练reward/outage需不差于约0.70/0.22，并检查KL、clip和风险周期是否相对K4改善。通过后先在失败的seed1压力复现；失败则不继续扫K8/K32，转critic replay/holdout路线。
+
+### 13.41 P-M4结果：K16改善中期方差，但不是长期闭环不稳定的主修复（2026-07-16）
+
+K16完整1M训练耗时`393.1s`，与K4的`390.6s`基本相同。140条final得到reward/outage `0.6030/0.1786`，critic CDF `0.1346`；安全但reward未过`0.658`门。
+
+K16在300–600k有真实的阶段性收益：K4→K16使训练outage `0.237→0.163`、KL `0.00404→0.00222`、clip `0.207→0.117`。但600k–1M时outage反而`0.235→0.270`，680k出现0.65 outage；末200k reward `0.711→0.621`、window outage `0.212→0.236`、KL/clip也变差。若只跑到600k，会错误地宣布K16稳定化成功。
+
+结论是action baseline MC噪声存在，但不是主瓶颈。按预注册不做520、不扩seed、不扫K8/K32；下一主线直接处理三seed均出现、seed1最严重的initial-state critic低估，通过recent/initial-state replay、holdout CDF calibration或direct s0 auxiliary做独立消融。完整对齐数据位于`_runs/wandb_export/dqc_pm3_k4_pm4_k16_1m_2026-07-16/`和`_runs/profiles/dqc_pm3_k4_pm4_k16_1m_2026-07-16/`。
