@@ -83,13 +83,29 @@
 
 2026-07-16 分别对 `distributional`、`gae`、`gae_ppo` 三条路径执行 `B=2,T=32,iters=2` 后台 smoke。三者训练、评估、JSON 保存和退出码均正常；训练分别约 8 秒，无 NaN/Traceback。scalar reward value 在 episodic 模式下与 distributional critic 一样接收 `t/T` step feature；GAE target 每个 rollout 只计算一次并在 value/PPO epochs 间冻结。
 
+### 关键修正：actor 多次更新的策略新鲜度与 importance ratio
+
+- 排查发现旧 DQCACBeta 的 `updates_per_episode=10` 同时表示 critic 和 actor 都在同一 rollout 上更新 10 次；第 2~10 次 actor step 已不再来自当前策略，但旧 `distributional` loss 没有 importance ratio，因此属于未修正的 off-policy rollout reuse。这是 reward 均值/quantile 长期大幅波动的高优先级原因之一。
+- 现拆分为 `updates_per_episode`（critic/value epochs，默认 10）与 `actor_updates_per_episode`（actor epochs，非 PPO 默认 1）。`distributional` 和 `gae` 若设置 actor epochs > 1 会直接报错，防止静默重现旧问题。
+- `gae_ppo` 在采样时只保存一次行为策略 `old_log_probs=log π_behavior(a|s)`；每次 actor 更新重新前向计算当前 `log π_θ(a|s)`，ratio 始终为 `exp(logπ_current-logπ_behavior)`，分母在整个 rollout 的所有 PPO epochs 中保持固定。不能在每次更新后覆盖 `old_log_probs`，否则 ratio 会被人为重置到 1，失去对 rollout-policy drift 的检测与裁剪。
+- reward surrogate 使用 PPO clipped minimum；需要最小化的 cost-risk surrogate 使用 conservative maximum。同步记录 ratio mean/std、clip fraction 和 approximate KL。
+- 额外发现 warmup 中旧代码在 optimizer 没有 step 时仍推进 actor/dual LR scheduler，并触发 PyTorch `scheduler.step() before optimizer.step()` 警告。现仅在对应 optimizer 真正更新后推进 scheduler，使学习率时间轴与参数更新时间一致。
+- 持久化验证：`smoke_ppo_multiupdate` 令 critic/actor epochs 均为 2，训练 7.9 秒、exit code 0，证明固定行为 log-prob 的多 epoch PPO 路径可执行；`smoke_gae_warmup_scheduler` 令 warmup=1、critic epochs=2、actor epochs=1，训练 8.2 秒、exit code 0，且无 scheduler-before-optimizer 警告，证明单次 on-policy GAE 与调度顺序均生效。
+
+### E2 首次启动中止记录（不计入算法结果）
+
+- job：`DQCAC_DynamicButton_dbg_e2_gae_rewardonly_800k_s0`；W&B run id：`jud8j38v`。
+- 代码：`58ace0b`；日志只到 iteration 4 / 约 5 万 env steps，仍处于 30-iteration critic warmup，actor 尚未执行，因此不能用于判断 GAE 效果。
+- 人工中止原因：启动后确认该版本仍把同一 rollout 用于 10 次无 ratio 的 GAE actor 更新。为避免在已知不正确的策略新鲜度设置上浪费 80 万步，终止整个后台进程组；这属于开发过程的 aborted run，不与 E1/基线比较。
+- 修正后 E2 将使用 critic/value epochs=10、actor epochs=1；E3 才在固定 old log-prob 的 PPO clip 下使用多个 actor epochs。
+
 ### E2：纯奖励门——scalar value + GAE（不启用 PPO）
 
-- 状态：待候选代码提交后启动。
+- 状态：待 on-policy 修正提交后重新启动。
 - 唯一 reward 主干变化：`reward_actor_mode=gae`；PPO clip 暂不开。
 - 隔离设置：`lambda_max=0`，确保 cost critic/dual 不能污染 reward actor 梯度。
-- 沿用 E1 的 `init_std=1.0`、`B=10`、`T=1000`、`warmup_iters=30`、10 epochs、seed 0。
-- 预算：80 iterations = 80 万 env steps；按 E1 速度加上 scalar value 开销，预计训练约 7~9 分钟，评估后总计约 9~11 分钟。
+- 沿用 E1 的 `init_std=1.0`、`B=10`、`T=1000`、`warmup_iters=30`、seed 0；critic/value epochs=10，actor epochs=1，保证 GAE 单独消融严格 on-policy。
+- 预算：80 iterations = 80 万 env steps；减少 9 次 actor 前向/反向后，保守预计训练约 6~8 分钟，评估后总计约 8~10 分钟；启动后再按实测 iteration 速度校准。
 - 检查点：60 万步。届时已完成约 30 个 actor rollout；若 reward late mean/斜率均不优于 E1 的 matched-budget 曲线，则停止，不扩大预算。
 - 通过后才运行 E3 `gae_ppo`，从而把 GAE 和 PPO clip 的贡献拆开。
 

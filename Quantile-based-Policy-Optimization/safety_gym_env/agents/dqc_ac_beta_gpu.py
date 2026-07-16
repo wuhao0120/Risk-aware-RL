@@ -60,6 +60,11 @@ class DQCACBetaGPU(VecAgentBase):
         self.critic_step_feature = bool(_csf) if _csf is not None else self.episodic
         self.num_action_samples = max(1, int(getattr(args, 'num_action_samples', 4)))
         self.updates_per_episode = max(1, int(getattr(args, 'updates_per_episode', 10)))
+        # critic/value 可复用同一 rollout 多次；非 PPO actor 必须保持 1 次严格 on-policy 更新。
+        self.actor_updates_per_episode = max(
+            1, int(getattr(args, 'actor_updates_per_episode', 1)))
+        if self.actor_updates_per_episode > self.updates_per_episode:
+            raise ValueError("actor_updates_per_episode cannot exceed updates_per_episode")
         self.advantage_norm = getattr(args, 'advantage_norm', 'qcpo')
         self.entropy_coef = getattr(args, 'entropy_coef', 0.0)
         self.lambda_max = getattr(args, 'lambda_max', 50.0)
@@ -73,6 +78,8 @@ class DQCACBetaGPU(VecAgentBase):
         # - gae_ppo:        同一 GAE，再加 old-logπ ratio 与 PPO clip 多 epoch 更新。
         self.reward_actor_mode = str(getattr(args, 'reward_actor_mode', 'distributional')).lower()
         valid_reward_modes = {'distributional', 'gae', 'gae_ppo'}
+        if self.reward_actor_mode != 'gae_ppo' and self.actor_updates_per_episode > 1:
+            raise ValueError("multiple actor updates on one rollout require gae_ppo importance ratio + clip")
         if self.reward_actor_mode not in valid_reward_modes:
             raise ValueError(f"reward_actor_mode must be one of {sorted(valid_reward_modes)}, "
                              f"got {self.reward_actor_mode!r}")
@@ -152,8 +159,9 @@ class DQCACBetaGPU(VecAgentBase):
         print(f"DQCACBetaGPU[CMDP]: env={self.env_name}, beta={self.beta}, omega={self.q_alpha}, "
               f"d(cost_limit)={self.cost_limit}, cost_gamma={self.cost_gamma}, episodic={self.episodic}, "
               f"step_feature={self.critic_step_feature}, N={self.num_quantiles}, B={self.num_envs}, T={self.n}, "
-              f"iters={self.num_iterations}, updates/iter={self.updates_per_episode}, "
-              f"reward_actor={self.reward_actor_mode}, device={self.device}")
+              f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
+              f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
+              f"device={self.device}")
 
         for it in range(self.num_iterations):
             # ===== 1. 采样 + DQCAC 专属后处理 (cost budget / n-step / d,e) =====
@@ -169,26 +177,32 @@ class DQCACBetaGPU(VecAgentBase):
 
             # ===== 2. 内层更新 (双 critic + actor) =====
             critic_info, actor_info = {}, {}
-            for _ in range(self.updates_per_episode):
+            actor_updated = False
+            for update_idx in range(self.updates_per_episode):
                 critic_info = self.update_critic(batch)
                 # 标量 reward value 在 warmup 中也训练；actor 仍由下面的 in_warmup 控制。
                 # value 每个 epoch 拟合同一批冻结 λ-return，actor 复用冻结 advantage。
                 if self.reward_actor_mode != 'distributional':
                     critic_info.update(self.update_reward_value(batch))
-                if not in_warmup:
+                if not in_warmup and update_idx < self.actor_updates_per_episode:
                     actor_info = self.update_actor(batch)
+                    actor_updated = True                       # scheduler 只能跟随真实 optimizer.step()
                 if self.learning_steps % self.target_update_interval == 0:
                     self._soft_update_target()
                 self.learning_steps += 1
 
             # ===== 3. 外层 λ 更新 (cost-critic 在 (s0,a0) 估 P(C≥d) 驱动) =====
+            dual_updated = False
             if not in_warmup and it % self.outer_interval == 0:
                 self.update_dual(batch)
+                dual_updated = True                            # warmup 时不推进 λ 的学习率时间轴
 
             # ===== 4. 日志 + 调度 =====
             self._log(it, batch, critic_info, actor_info)
-            self.actor_scheduler.step()
-            self.lambda_scheduler.step()
+            if actor_updated:
+                self.actor_scheduler.step()                    # 每个有 actor update 的 rollout 推进一步
+            if dual_updated:
+                self.lambda_scheduler.step()                   # 严格位于 lambda_optimizer.step() 之后
 
     # ============================================================ 采样 + 后处理 (对齐模板, budget 换 cost) ============================================================
     def _rollout_vec(self):
@@ -598,6 +612,7 @@ class DQCACBetaGPU(VecAgentBase):
             'budget/mean': float(np.mean(budgets_np)),
             'training/learning_steps': self.learning_steps,
             'training/actor_lr': float(self.actor_scheduler.get_last_lr()[0]),
+            'training/actor_updates_per_iteration': self.actor_updates_per_episode,
         }
         extra.update(critic_info)
         extra.update(actor_info)
@@ -618,6 +633,7 @@ class DQCACBetaGPU(VecAgentBase):
             'dual_prob': self.last_dual_prob,
             'beta': self.beta,
             'reward_actor_mode': self.reward_actor_mode,
+            'actor_updates_per_episode': self.actor_updates_per_episode,
             'num_envs': self.num_envs,
             'num_iterations': self.num_iterations,
         }
