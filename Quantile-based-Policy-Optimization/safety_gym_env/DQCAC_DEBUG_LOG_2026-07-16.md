@@ -261,3 +261,22 @@
 - 恢复约束后，经验 outage、critic CDF、λ 三者方向一致，CDF calibration error 不持续扩大。
 
 只有通过上述门槛的配置才扩展到 300~500 万步和多个 seed。
+
+### E11：QCPO 主干校准（Q-A0/Q-A1/Q-A2）
+
+- 状态：实现与持久化 smoke 已完成，短预算对比待运行。
+- 2026-07-16 定位到两个确定性工程错误：
+  1. 旧 `QCPOGPU` 默认把同一 rollout 连续用于 5 次 actor update，但没有 behavior `old_log_prob`、importance ratio 或 PPO clip；第 2～5 次是未修正的 off-policy reuse。
+  2. 基类虽已提供 `ObservationNormalizer`，QCPO 训练循环从未调用 `obs_normalizer.update()`；打开开关也只会一直使用初始 mean=0/var=1，等价于没有归一化。
+- 修正后的安全默认是 `qcpo_actor_update_mode=on_policy, updates_per_episode=1`；如果 on-policy 模式配置多次更新会直接抛错，避免静默重现旧 bug。
+- 新增 `qcpo_actor_update_mode=ppo`：rollout 采样时只保存一次 `old_log_probs=log π_behavior(a|s)`，所有 actor epochs 的分母固定；每个 epoch 只重新计算当前策略分子，并用 `clip=0.1` 的 PPO surrogate。记录 ratio mean/std、clip fraction、approx KL、actor grad norm 与 log-std。
+- observation RMS 在预热 rollout 更新；正式 rollout 中，moments 在采样和全部 actor epochs 内保持冻结，本批训练完成后才合并统计供下一次 rollout 使用。因此 on-policy log-prob 输入变换严格一致，PPO 的 ratio 也不会混入本批 RMS 突变。
+- 新增可学习 `log_std` 的有限区间保护 `[-5,2]`；默认仍关闭以复现旧基线，Q-A1/Q-A2 显式使用 `init_std=1, learn_std=true`。
+- 持久化 smoke：
+  - `QCPO_DynamicButton_smoke_onpolicy_fix_s0`：`B=2,T=32,iters=2`，训练 `7.5s`，exit code 0。
+  - `QCPO_DynamicButton_smoke_ppo_obsnorm_fix_s0`：在同预算启用 obs RMS、PPO 8 epochs、可学习 σ，训练 `6.9s`，exit code 0。
+- 接下来的轻量门控固定 `DynamicButton/seed0/λ=0/B=10/T=1000`：
+  - Q-A0：单次 on-policy、无 obs norm、固定 σ=0.5，先跑 100k。
+  - Q-A1：单次 on-policy + obs norm + σ=1/learnable，先跑 100k。
+  - Q-A2：Q-A1 + 固定-old PPO 8 epochs，先跑 100k。
+  - 100k 仅用于排除明显不学习配置；胜者扩到独立 300k run，不从 100k checkpoint 续跑，保证比较协议一致。

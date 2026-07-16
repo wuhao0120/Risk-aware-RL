@@ -36,6 +36,19 @@ class QCPOGPU(VecAgentBase):
         self.warmup_rms_iters = max(1, int(getattr(args, 'warmup_rms_iters', 2)))   # rms 预热
         self.actor_grad_clip = float(getattr(args, 'actor_grad_clip', 1.0))         # 范数裁剪 (MLP 保护)
 
+        # 同一 rollout 复用多次时，必须用采样时冻结的行为策略概率作 IS 分母。
+        # on_policy 只允许一步 actor update；ppo 才允许多 epoch，并始终保留同一 old_log_prob。
+        self.actor_update_mode = str(getattr(args, 'qcpo_actor_update_mode', 'on_policy')).lower()
+        if self.actor_update_mode not in {'on_policy', 'ppo'}:
+            raise ValueError("qcpo_actor_update_mode must be 'on_policy' or 'ppo'")
+        if self.actor_update_mode == 'on_policy' and self.updates_per_iteration != 1:
+            raise ValueError(
+                "QCPO reuses one rollout without importance correction: set "
+                "updates_per_episode=1, or qcpo_actor_update_mode=ppo")
+        self.ppo_ratio_clip = float(getattr(args, 'ppo_ratio_clip', 0.1))
+        self.log_std_min = float(getattr(args, 'log_std_min', -5.0))
+        self.log_std_max = float(getattr(args, 'log_std_max', 2.0))
+
         # return_rms: EMA 奖励回报归一化 (decay=0.01 ≈ 最近 100 条轨迹, QCPO 配方)
         self.return_rms = RunningMeanStd(decay=float(getattr(args, 'norm_ema_decay', 0.01)))
 
@@ -67,21 +80,28 @@ class QCPOGPU(VecAgentBase):
         """rms 预热 → 每迭代: 采样(含cost) → 刷 rms → 内层策略更新 → (外层)λ 更新 → 日志+调度。"""
         print(f"QCPOGPU[CMDP]: env={self.env_name}, omega={self.q_alpha}, d(cost_limit)={self.cost_limit}, "
               f"B={self.num_envs}, T={self.n}, iters={self.num_iterations}, "
-              f"updates/iter={self.updates_per_iteration}, opt={self.theta_optimizer_name}, device={self.device}")
+              f"updates/iter={self.updates_per_iteration}, actor_mode={self.actor_update_mode}, "
+              f"obs_norm={self.normalize_observation}, opt={self.theta_optimizer_name}, device={self.device}")
 
-        # ===== return_rms 预热 (只采集刷 reward 回报归一化器, 不更新策略) =====
+        # ===== return/observation RMS 预热 (只采样和刷统计，不更新策略) =====
         for _ in range(self.warmup_rms_iters):
-            self._update_rms(self._rollout_core()['disc_return'])
+            warmup_roll = self._rollout_core()
+            self._update_rms(warmup_roll['disc_return'])
+            self._update_obs_rms(warmup_roll['S'])
         print(f"QCPOGPU warm up || rms_mean:{self.return_rms.mean:.3f} rms_std:{self.return_rms.std:.3f}")
 
         for it in range(self.num_iterations):
             # ===== 1. 并行采 B 条轨迹 (冻结策略, 含 cost 流) =====
-            roll = self._rollout_core()
+            keep_logp = self.actor_update_mode == 'ppo'
+            roll = self._rollout_core(keep_logp=keep_logp)
             n, B = self.n, self.num_envs
             states = roll['S'].reshape(n * B, -1)             # [n·B, sd]
             actions = roll['A'].reshape(n * B, -1)            # [n·B, ad]
             R = roll['disc_return']                           # [B] 奖励回报 (目标)
             C = roll['disc_cost']                             # [B] cost 回报 (约束变量)
+            old_log_probs = roll.get('logp', None)
+            if old_log_probs is not None:
+                old_log_probs = old_log_probs.reshape(n * B).detach()  # 全 epoch 固定行为分母
 
             # ===== 2. 刷新 return_rms (奖励回报, 逐条) =====
             self._update_rms(R)
@@ -89,11 +109,16 @@ class QCPOGPU(VecAgentBase):
             # ===== 3. 内层策略更新 (复用本批) =====
             actor_info = {}
             for _ in range(self.updates_per_iteration):
-                actor_info = self._update_actor(states, actions, R.detach(), C.detach())
+                actor_info = self._update_actor(
+                    states, actions, R.detach(), C.detach(), old_log_probs=old_log_probs)
 
             # ===== 4. 外层 λ 更新 (经验 outage 驱动) =====
             if it % self.outer_interval == 0:
                 self._update_dual(C.detach())
+
+            # actor 更新期间 observation moments 必须冻结，确保本 rollout 的输入变换与
+            # 采样时完全相同；本批统计只供下一次 rollout 使用，避免制造隐式 off-policy。
+            self._update_obs_rms(roll['S'])
 
             # ===== 5. 统一日志 + LR 调度 =====
             R_np = R.detach().cpu().numpy()
@@ -107,13 +132,22 @@ class QCPOGPU(VecAgentBase):
                 'normalize/return_std': float(self.return_rms.std),
                 'training/actor_lr': float(self.scheduler.get_last_lr()[0]),
             }
+            if self.normalize_observation:
+                obs_std = self.obs_normalizer.var.detach().clamp_min(0.0).sqrt()
+                extra.update({
+                    'obs_norm/count': float(self.obs_normalizer.count.item()),
+                    'obs_norm/mean_abs': float(self.obs_normalizer.mean.detach().abs().mean().item()),
+                    'obs_norm/std_min': float(obs_std.min().item()),
+                    'obs_norm/std_median': float(obs_std.median().item()),
+                    'obs_norm/std_max': float(obs_std.max().item()),
+                })
             extra.update(actor_info)
             self._log_core(it, R_np, Zc_np, Cu_np, extra=extra)
             self.scheduler.step()
             self.lambda_scheduler.step()
 
     # ============================================================ 策略更新 (与模板逐式一致, 约束换 cost 上尾) ============================================================
-    def _update_actor(self, states, actions, R, C):
+    def _update_actor(self, states, actions, R, C, old_log_probs=None):
         """
         weight(τ) = (R-μ_R)/σ_R  -  λ·𝟙{C≥d}   (每条轨迹标量, 广播到全部 n 个 timestep)
         loss = -E[logπ·weight]
@@ -125,16 +159,51 @@ class QCPOGPU(VecAgentBase):
         weight_full = weight.unsqueeze(0).expand(n, B).reshape(n * B)   # [n·B]
 
         log_probs = self._compute_log_probs(states, actions)  # [n·B]
-        actor_loss = -(log_probs * weight_full.detach()).mean()
+        ppo_info = {}
+        if self.actor_update_mode == 'ppo':
+            if old_log_probs is None:
+                raise RuntimeError("PPO update requires rollout behavior old_log_probs")
+            # ratio 分母在整个 rollout 的所有 epoch 中保持不变；optimizer.step() 后只
+            # 重算分子 logπ_current，绝不能把 old_log_probs 覆盖成当前策略概率。
+            log_ratio = log_probs - old_log_probs
+            ratio = torch.exp(log_ratio)
+            clipped_ratio = torch.clamp(
+                ratio, 1.0 - self.ppo_ratio_clip, 1.0 + self.ppo_ratio_clip)
+            surrogate = torch.minimum(
+                ratio * weight_full.detach(), clipped_ratio * weight_full.detach())
+            actor_loss = -surrogate.mean()
+            ppo_info = {
+                'ppo/ratio_mean': float(ratio.detach().mean().item()),
+                'ppo/ratio_std': float(ratio.detach().std(unbiased=False).item()),
+                'ppo/clip_fraction': float(
+                    ((ratio.detach() - 1.0).abs() > self.ppo_ratio_clip).float().mean().item()),
+                'ppo/approx_kl': float(
+                    ((ratio.detach() - 1.0) - log_ratio.detach()).mean().item()),
+            }
+        else:
+            actor_loss = -(log_probs * weight_full.detach()).mean()
 
         self.optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         if self.actor_grad_clip and self.actor_grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.actor_grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.actor.parameters(), self.actor_grad_clip)
+        else:
+            grad_norm = torch.tensor(0.0, device=self.device)
         self.optimizer.step()
-        return {'actor/loss': float(actor_loss.item()),
-                'actor/weight_mean': float(weight.mean().item()),
-                'actor/weight_std': float(weight.std(unbiased=False).item())}
+
+        # 可学习探索方差必须保留在有限区间，避免少数 MC 轨迹把高斯熵瞬间推爆/压没。
+        with torch.no_grad():
+            self.actor.log_std.clamp_(min=self.log_std_min, max=self.log_std_max)
+        info = {
+            'actor/loss': float(actor_loss.item()),
+            'actor/weight_mean': float(weight.mean().item()),
+            'actor/weight_std': float(weight.std(unbiased=False).item()),
+            'actor/grad_norm': float(grad_norm.item()),
+            'actor/log_std_mean': float(self.actor.log_std.detach().mean().item()),
+        }
+        info.update(ppo_info)
+        return info
 
     # ============================================================ Dual 更新 (经验 outage 驱动) ============================================================
     def _update_dual(self, C):
@@ -153,6 +222,11 @@ class QCPOGPU(VecAgentBase):
         """用本批 B 条轨迹【奖励回报】逐条更新 EMA return_rms。"""
         for z in disc_returns.detach().cpu().tolist():
             self.return_rms.update(z)
+
+    def _update_obs_rms(self, states):
+        '''在 rollout 边界批量合并 observation moments；关闭开关时保持旧行为。'''
+        if self.normalize_observation:
+            self.obs_normalizer.update(states)
 
     def get_training_summary(self):
         """暴露最终约束指标。"""

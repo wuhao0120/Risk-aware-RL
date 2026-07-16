@@ -118,7 +118,17 @@ def base_args(algo, seed, device, env_key):
         a.norm_ema_decay = 0.01
         a.actor_grad_clip = 1.0
         a.warmup_rms_iters = 2
-        a.updates_per_episode = 5                       # 轨迹级复用 (新鲜度 vs 效率折中)
+        # 安全默认只做一次严格 on-policy actor update；多 epoch 必须显式切到 PPO，
+        # 使用固定 behavior log-prob importance ratio 与 clip。
+        a.updates_per_episode = 1
+        a.qcpo_actor_update_mode = 'on_policy'
+        a.ppo_ratio_clip = 0.1
+        a.normalize_observation = False                 # Q-A1 起显式打开，保留旧基线可复现
+        a.obs_norm_var_clip = 1e-6
+        a.obs_norm_clip = 10.0
+        a.learn_std = False                             # Q-A1 起用 σ=1 + learnable 作独立消融
+        a.log_std_min = -5.0
+        a.log_std_max = 2.0
     elif algo == 'DQCAC':
         # per-transition 双 critic 版 (继承 portfolio DQCACBetaGPU 已验证配方)。
         a.beta = 0.95
