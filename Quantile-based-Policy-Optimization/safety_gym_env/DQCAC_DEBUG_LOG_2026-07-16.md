@@ -728,3 +728,24 @@
 - 140条只作screen。每个新seed若reward `>0.658`且outage `≤0.27`，再串行做520条final确认；无论成败都报告，不以best seed替代三seed统计。
 - 最终汇总使用seed0/1/2每seed相同评估协议，报告reward跨seed均值/标准差、总outage计数、每seedWilson区间和三seed聚合区间。若至少2/3 seed通过且聚合outage≤0.2，B20进入主推荐；否则它只作为有益但不足的组件。
 - K16、PID uncertainty buffer/window和recent-rollout critic replay全部暂停到多seed结果后，避免在尚未确认B20泛化前继续叠加变量。
+
+### E49：P-M3 多seed结果——B20确定有益，但尚不足以作为稳定主配置（2026-07-16）
+
+- seed1/2 的1M训练均正常结束，耗时分别为 `713.4s/717.9s`，W&B run 为 `lcllgvhx/fwsc50vq`。两条run并行共享GPU，因此单条wall time高于seed0独占时的`390.6s`，但固定的1M环境步数和算法配置不变。
+- 内置140条final评估的seed0/1/2 reward-outage为 `0.7725/0.2286`、`0.8404/0.2429`、`0.8451/0.1786`。三条都通过了宽松screen，所以按预注册规则一律扩到同协议520条，没有丢弃不好看的seed。
+- 520条结果为：seed0 reward `0.7180±0.5201`、outage `87/520=0.1673`、Wilson 95% `[0.1377,0.2018]`；seed1 reward `0.8622±0.5809`、outage `159/520=0.3058`、区间 `[0.2677,0.3467]`；seed2 reward `0.8670±0.4263`、outage `110/520=0.2115`、区间 `[0.1786,0.2487]`。
+- 跨seed reward为 `0.8157±0.0847`（seed间sample std），outage为 `0.2282±0.0707`。合并事件计数为 `356/1560=0.2282`，事件级Wilson 95%区间 `[0.2081,0.2497]`。合并区间只描述这三个已抽seed的episode不确定性，不能消除明显的seed间异质性。
+- 按预注册门，seed0和seed2的点估计同时通过`reward>0.658/outage<=0.22`，即2/3 seed通过；但聚合outage `0.2282>0.2`，故整体门失败。B20不进入“已稳定的主推荐”，只记为已证明能降低PPO/control方差、提高吞吐的正向组件。
+- 末200k训练rollout outage均值在seed0/1/2上只是`0.215/0.180/0.220`，看起来三者都接近可行；然而seed1的520条独立outage是`0.3058`。这个`+0.126`的差距证明，训练末段的20条on-policy轨迹仍不能替代大样本初始状态泛化评估。
+- critic低估在三个seed都存在：hard CDF/truth分别为 `0.1058/0.1673`、`0.1043/0.3058`、`0.1657/0.2115`，其中seed1低估`0.2015`个概率点。因此下一阶段不应把“再多跑几步”当作主修复，而应降低action-baseline噪声并增强cost critic对recent/initial-state分布的holdout校准。
+- 完整history与三seed对齐图位于 `_runs/wandb_export/dqc_pm3_b20_multiseed_1m_2026-07-16/` 和 `_runs/profiles/dqc_pm3_b20_multiseed_1m_2026-07-16/`。
+
+### E50：对“现在训练是否太短”的最终判断与早停规则（2026-07-16）
+
+- 结论不是简单的“够”或“不够”。100k足够做机制级screen和发现确定性bug，但不足以否定有慢变量的PID/LSTM/distributional-critic组合；300k足够做闭环趋势screen，但只有当末段已平稳且被基线支配时才可早停；1M是稳定性验证，不是所有组合的默认入场成本。
+- P-M1给出了false-negative的直接实例：同一seed的520条复评从300k的`reward/outage=0.776/0.248`改善到600k的`0.814/0.225`，所以“早期不好、之后变好”确实会发生。但到1M又退化为`0.632/0.244`，说明它是闭环相位/极限环，而不是单调的慢收敛。
+- 随机初始化可能改变某个工作点出现的时间，但无法解释三seed在同一1M预算下的大幅critic低估和outage差异。当前“失败组合单靠更长训练稳定反转”的优先级已降低；不臆造数值概率，因为三个seed不足以可靠估计这个概率。
+- 继续长跑的晋级条件：末20%的reward或constraint仍有持续改善趋势；lambda/critic显示仍在有方向地追赶而非重复周期；至少一个独立大样本checkpoint比早期明显改善；或组件理论上存在明确的慢传播时常。
+- 应当早停的条件：末段已平稳且reward/outage同时被基线支配；多个checkpoint重复同样的风险周期；配对试验证明变量只修正梯度尺度却没有改善校准；或失败由确定性目标错配造成。这些情况下继续加步数只会浪费资源。
+- 评估协议保持两层：140条只作screen，520条作单seed确认。在outage约0.2时，520条的二项标准误约`0.0175`，95%半宽约`0.034`；140条半宽约`0.066`，不适合判定贴边界的安全性。最终候选至少3 seeds × 1.5M，与QCPO_refs正式比较时再对齐其5M环境步数。
+- 当前下一单变量路线是在B20上把`num_action_samples=4→16`，检验冻结后在8个PPO epoch重复使用的action risk baseline方差；同时把recent-rollout/initial-state replay和holdout CDF calibration作为更直接针对seed1 critic低估的独立路线。两者不在同一跑中混合。

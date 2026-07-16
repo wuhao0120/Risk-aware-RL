@@ -1218,3 +1218,21 @@ P-M3（W&B `ky7voxle`）固定1M总环境步，只把B从10增到20、iteration�
 seed1/2各跑同一P-M3配置1M步，持久化后台并行；预计总墙钟约11–14分钟。built-in 140条只作screen，满足reward大于0.658且outage不高于0.27才扩520条，但失败seed仍保留并纳入报告。
 
 最终至少报告三项：每seed reward/outage与Wilson区间；三seedreward均值±标准差；三seed总outage计数及聚合置信区间。至少2/3 seed通过且聚合outage不高于0.2，才把B20列为主推荐。否则下一路线优先是action baseline K4→K16和recent-rollout critic replay/holdout calibration，而不是用seed0 best checkpoint包装成成功。
+
+### 13.38 P-M3多seed结论：方差降低有效，但critic泛化仍会让单个seed严重失约（2026-07-16）
+
+P-M3的seed1/2均完成1M步，训练耗时`713.4s/717.9s`。三个seed各自520条独立终评的reward/outage为：seed0 `0.7180/87/520=0.1673`，seed1 `0.8622/159/520=0.3058`，seed2 `0.8670/110/520=0.2115`。outage的Wilson 95%区间依次为`[0.1377,0.2018]`、`[0.2677,0.3467]`和`[0.1786,0.2487]`。
+
+跨seed reward是`0.8157±0.0847`，outage是`0.2282±0.0707`（均为seed间sample standard deviation）。合并356次失约/1560条episode得到`0.2282`，事件级Wilson区间`[0.2081,0.2497]`。虽然seed0和seed2按点估计通过`reward>0.658,outage<=0.22`，达到2/3，但预注册的聚合outage<=0.2失败。因此B20是应保留的稳定化组件，不是已完成的主配置。
+
+这次最重要的诊断信息来自seed1。它末200k的训练rollout outage均值只有`0.180`，但独立520条为`0.3058`；critic hard CDF只预测`0.1043`，相对truth低估`0.2015`个概率点。seed0/2也分别低估`0.0615/0.0458`。这说明B20减小了当前batch方差，但未保证distributional critic对独立初始状态和最终策略的校准。
+
+完整history、对齐表和图位于`_runs/wandb_export/dqc_pm3_b20_multiseed_1m_2026-07-16/`与`_runs/profiles/dqc_pm3_b20_multiseed_1m_2026-07-16/`。下一步保留B20，但把K4→K16 action baseline和recent/initial-state critic replay+holdout calibration作为两条独立消融。
+
+### 13.39 对训练长度的判断：短跑会漏掉中期好点，但无条件长跑不会修复闭环极限环（2026-07-16）
+
+用P-M1的300k/600k/1M同相位520条复评可以直接回答这个问题：`0.776/0.248 → 0.814/0.225 → 0.632/0.244`。所以300k确实可能false-negative，因为600k工作点更好；但好点到1M没有保持，证明主要现象是策略—critic—PID的相位漂移，不是普通的慢收敛。
+
+因此预算按用途分级：100k只做确定性机制/尺度/早期校准screen；300k判断闭环趋势，末段仍有定向改善才晋级；1M检验是否存在反复周期；最终候选至少3 seeds × 1.5M，与QCPO_refs正式数值比较对齐5M步。N64、local quantile和cost-LSTM的现有结论必须保持为“100k/seed0无早期收益”，不写成永久无效；而旧N64梯度尺度bug、uniform-transition目标错配和pre/post policy相位错位由公式、配对run或hash/checkpoint直接确认，无需靠更长训练重新证明。
+
+140条评估在p约0.2时的95%半宽约`0.066`，只能screen；520条半宽约`0.034`，用于单seed确认。即使520条也不能替代多seed，因为P-M3的跨seed outage standard deviation已达`0.0707`。后续早停看趋势、checkpoint与校准，不根据某个末点的运气做选择。
