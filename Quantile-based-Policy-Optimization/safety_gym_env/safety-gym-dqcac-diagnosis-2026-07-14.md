@@ -1107,3 +1107,15 @@ profile 位于 `_runs/profiles/dqc_cost_time_weight_cw2_300k_2026-07-16/`，完�
 下一条 C-W3 是最小且信息量最高的消融：保留 C-W1 time weighting、window50 PI 与其余全部配置，只将 `cost_cdf_mode=sigmoid→hard`。它相对 C-W2 只移除平滑，相对 P-B3 只增加时间加权。预期它能降低 risk-gradient 连续强度，在 P-B3 的 `1.132/0.315` 与 C-W2 的 `0.480/0.131` 之间寻找 reward/outage 折中。300k seed0 门仍为 outage `≤0.22` 且 reward `>0.658`；预计训练约160秒，失败不扩 seed。
 
 分歧路线全部保留而不混跑：若 C-W3 仍过安全，依次测试 actor `beta=.99`、controller safety setpoint、较小 Kp/lambda gain；若不安全，则测试 time-weighted sigmoid `T=.5/1`。direct s0 auxiliary、early stratified replay、C-H1+time weighting、IQN 与 adaptive bandwidth 属于 critic 表示/目标路线，不能拿来同时修 controller 强度。
+
+### 13.25 C-W3：时间加权后的 hard CDF 仍不安全，瓶颈转向 actor 风险查询核（2026-07-16）
+
+C-W3（W&B `9wtkz26h`）从 commit `3619c93` 启动，训练 `162.0s`、exit code 0。它相对 C-W2 只将 `cost_cdf_mode=sigmoid→hard`。130 条终评 reward/outage 为 `0.9481/0.3385`，真实 mean cost `14.131`、cost quantile `21.0`；critic CDF `0.3168`、predicted mean `13.997`，最终 lambda `0.1000`。因此 reward 门通过，但 outage 门失败。
+
+最重要的证据是 critic 已经很准：CDF absolute error 只有 `0.0216`，mean relative error约 `0.95%`。所以 C-W3 的不安全不能继续解释成 cost critic 低估。后60k risk-adv std约 `0.0142`，但 nonzero fraction只有 `0.387`；平滑 P-S2/C-W2 则约 `0.994/0.981`。hard count 使多数候选动作的经验 CDF 完全相同，actor 即使拿到准确的初始风险概率，也缺少连续的动作局部排序。
+
+C-W2/C-W3 形成清楚的两端：T2 为 `reward/outage=0.480/0.131`，hard 为 `0.948/0.338`。两条 critic CDF 方向都正确且训练无 NaN，说明当前应调 actor 风险查询核的有效增益，而不是继续增加 quantile、LSTM 或 PID 强度。C-W3 末段 critic clipping较多，但终评校准极好，因此提高 critic grad clip不再是当前第一优先级。
+
+五条关键曲线的完整对齐 profile 位于 `_runs/profiles/dqc_cost_time_weight_cw23_300k_2026-07-16/`，history 位于 `_runs/wandb_export/dqc_cost_time_weight_cw23_300k_2026-07-16/`。
+
+下一条 C-W4 只把 C-W2 的 temperature `2→1`，保留 time weighting、window50 PI、beta=.995 与全部其余配置。它是最小的中间强度验证，硬门仍为 outage `≤0.22` 且 reward `>0.658`。若失败，固定温度主线停止：后续优先按查询附近 quantile spacing 自适应 bandwidth，或引入显式 risk gain 将 critic校准与actor约束强度解耦；T=.5/1.5只作为温度曲线消融记录。

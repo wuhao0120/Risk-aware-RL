@@ -598,3 +598,18 @@
 - 目的：检验 C-W2 的过度保守是否来自“校准增强 + 平滑查询”叠加。理论预期是 hard CDF 降低候选动作风险差的连续强度，使结果落在 P-B3 的 `1.132/0.315` 与 C-W2 的 `0.480/0.131` 之间。
 - 仍用 300k seed0 与 130 条终评；预计训练约160秒、含导出分析约5分钟。硬门保持 outage `≤0.22` 且 reward `>0.658`，校准不能明显差于 C-W2/P-S2；失败不扩 seed。
 - 若 C-W3 仍过保守，分歧路线依次保留为：actor risk discount `beta .995→.99`；PID 内部 safety setpoint 小于0.2；降低 Kp 或 lambda gain。若 C-W3 不安全，则考虑 time-weighted sigmoid `T=.5/1`。这些都按单变量轻量门测试，不并入同一 run。
+
+### E35：C-W3 结果——critic 已校准，但 hard CDF 的动作风险差仍过稀疏（2026-07-16）
+
+- C-W3 job `DQCAC_DynamicButton_recur_mc_c20_timew995_pi_kp1_w50_hard_300k_s0`（W&B `9wtkz26h`）从 commit `3619c93` 启动，训练 `162.0s`、exit code 0；相对 C-W2 唯一变化为 `sigmoid T2→hard`。
+- 130 条终评 reward `0.9481`、outage `0.3385`、mean cost `14.131`、cost quantile `21.0`、critic CDF `0.3168`、predicted mean `13.997`，最终 lambda `0.1000`。reward 通过 `>0.658`，但 outage 明显未通过 `≤0.22`，故不扩 seed。
+- 这条 run 的 critic 校准是当前 constrained run 中最好的一组：CDF error `0.0216`，mean relative error约 `0.95%`。因此约束失败不能再主要归因于 critic 低估；即使查询概率准确，hard count 仍不能给候选动作提供足够密集、稳定的局部排序梯度。
+- 后60k reward/outage/lambda约为 `0.934/0.286/0.165`；末点 risk-adv std `0.0145`，与平滑路线相当，但 nonzero fraction只有 `0.396`。P-S2/C-W2 的 nonzero fraction分别约 `0.981/1.000`。核心差异是“有多少状态动作收到风险方向”，而不是单纯 risk std 幅值。
+- C-W2 与 C-W3 把合理区间夹出：T2 得到 `reward/outage=0.480/0.131`，hard 得到 `0.948/0.338`。两者都数值稳定，说明需要校准 actor 查询核/风险增益，而不是继续堆 critic 容量。C-W3 末段 cost grad clip 较多，但终评校准非常好，因此 C-WG1 提高 critic clip 降为次级优化。
+- 五条 hard/T1/T2/time-weight 对齐 profile：`_runs/profiles/dqc_cost_time_weight_cw23_300k_2026-07-16/`；完整 history：`_runs/wandb_export/dqc_cost_time_weight_cw23_300k_2026-07-16/`。
+
+### E36：C-W4 计划——time-weighted sigmoid T=1
+
+- C-W4 与 C-W2 唯一差异是 temperature `2→1`；与 C-W3 相比则只把 hard 查询换成较窄 sigmoid。目标是在 hard 的高 reward/高 outage 与 T2 的低 reward/低 outage 之间寻找可行 Pareto 点。
+- 仍用 300k seed0、130 条终评，预计训练约160秒、总计约4分钟。硬门不变：outage `≤0.22` 且 reward `>0.658`；同时记录 CDF calibration、risk-adv nonzero fraction、PPO KL/clip。
+- 若 T1 不通过，停止固定 `.5/1/2/hard` 主线网格：若仍不安全，说明需要介于 T1/T2 的自适应/连续增益；若过安全，则说明策略对温度非常敏感，应显式引入 risk gain 或按 local quantile spacing 自适应带宽，而不是用温度碰运气。T=.5/1.5 只保留为论文温度曲线，不作为无止境主线调参。
