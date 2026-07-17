@@ -1279,3 +1279,21 @@
 - P-M10 fresh520的reward只比门低`.01229`，但末200k训练reward长期均值也只有`.70883`。为区分“最后一次B40联合更新造成终点跳变”与“window100在后400k已形成持续低reward路径”，只对`rollout_step001000000.pt`做同一seed、同一当前evaluator的140回合eval-only诊断；不新增训练，不修改正式E97失败裁决。
 - 只比较pre/post的reward、outage、CDF/Brier/mean-cost和crossing。若pre相对post的reward至少高`.08`且outage不恶化超过`.03`，则把“限制单次Actor/critic联合移动”列为下一候选；否则认为主要是跨多个控制事件的路径/风险表示问题，优先保守action-risk不确定性或跨rollout critic validation。无论结果如何，本诊断不触发seed扩展、window扫描或事后checkpoint择优fresh520。
 - 预计140回合约1--2分钟，使用`launch_background.sh`持久化、`wandb_mode=disabled`，结果与checkpoint均留在`/vepfs`。
+
+
+### E99：P-M10 pre/post诊断——最终更新不是低reward主因（2026-07-17）
+
+- eval-only持久化job正常`exit 0`。同一140回合协议下，pre/post reward为`0.68265→0.71810`，差`+0.03545`且Welch 95%区间`[-0.06096,+0.13185]`；outage为`16/140=.11429→29/140=.20714`，差`+.09286`且Newcombe区间`[+.00641,+.17874]`。
+- E98的触发条件要求pre reward至少高`.08`且outage最多恶化`.03`；实际pre reward更低，所以严格失败。最后一次更新提高点估计reward并显著增加风险，不能解释P-M10相对P-M8的`.158` reward损失；低reward来自后400k多个控制事件形成的路径。
+- pre/post hard/smooth CDF error为`.02991/.02740→.06808/.07245`，mean-cost error `.45062→3.10250`，raw Brier `.10038→.17252`，Brier Skill `+.84%→-5.05%`。最后一次更新仍使critic跨分布校准明显变差，但简单回滚会得到更低reward；不做事后fresh520或checkpoint择优。
+- 正式CSV/JSON/图位于`_runs/profiles/dqc_pm10_pre_post_seed0_1m_2026-07-17/`，比较图为`2775×1895`且PIL解码通过。
+
+### E100：C-H1W time-weighted cost-LSTM冻结600k预注册（2026-07-17）
+
+- 旧C-H1只在100k、uniform-transition cost loss下测试。随后C-W1证明每条T1000轨迹中999个后期低cost-to-go样本会主导均匀loss，独立LSTM甚至更容易牺牲s0来降低总体loss；因此旧负结果不能回答“risk-discount正确训练测度下history是否有效”。
+- 结构动机仍成立：行为policy是MLP+LSTM，未来动作分布依赖hidden；raw cost critic只估计`Z_c(s,a)`，而正确条件量一般是`Z_c(s,h,a)`。现有`cost_history_mode=cost_lstm`已使用与QCPO_refs同协议的`[observation,previous_cost]→MLP`，再拼`previous_action/previous_reward→LSTM512`，最后仍接当前action输出QR32，不会退化成state-only head。
+- 首轮只做冻结policy校准，不进入PID闭环。源策略固定为P-M3 seed1 1M final，rollout seed101；对照是既有raw-QR run`8ry7xn6g`。候选仅设`cost_history_mode=cost_lstm`，保持30×B20×T1000=600k、MC、risk-discount `.995`、QR32、20 critic updates、LR、TBPTT seq100、源actor与observation statistics全部冻结。构造后重置host/CUDA RNG，30批reward/outage/cost必须与raw对照逐值exact。
+- 在正式训练前增加只读评估诊断：旧hard-Brier字段保持兼容，另报smooth-Brier、各自Brier Skill、ROC-AUC、outage-vs-safe预测均值差和预测概率标准差。它们不参与loss、RNG、actor或checkpoint选择；目的是区分“总体CDF均值碰巧准确”和“逐轨迹风险排序真正改善”。
+- raw基线末5批pre-CDF error/Brier为`.10656/.23253`，post为`.03750/.20023`，pre predicted/true mean为`13.2968/13.1100`。候选600k screen要求：末5批pre的CDF error至少改善20%或Brier至少改善10%，另一项不得恶化10%，mean-cost absolute bias不超过1.0；独立140条的hard或smooth Brier至少改善10%且AUC至少提高.03，或Brier改善20%且AUC不得下降超过.02，mean-cost error≤0.90、crossing≤0.10。
+- 只有history screen与独立140同时通过才对raw/cost-LSTM做统一fresh520；fresh门沿用Brier至少改善10%与AUC至少提高.03（或Brier改善20%且AUC不退化）的联合证据。若末5批仍相对前5批改善超过10%且方向一致，可预注册一次1.2M长度审计；否则不扫LSTM hidden、TBPTT或LR，也不进入live P-M8/P-M10。
+- 预计单条纯训练7--9分钟、140评估约1--2分钟，总墙钟9--11分钟。正式run使用持久化后台与脱敏W&B online，checkpoint、history和分析产物均写`/vepfs`。

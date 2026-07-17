@@ -1686,3 +1686,20 @@ distributional critic仍是主要上限。hard/smooth总体CDF误差基本不变
 因此按预注册规则不扩seed、不扫中间窗口，也不把“只差0.012”当成移动门槛的理由。window100保留为有效减振消融，未来只有在条件risk估计真正改善后才值得重新组合。当前只补一个140回合pre-update诊断，判断最终reward损失是否集中在最后一次联合更新；该诊断不改变P-M10失败裁决，也不用于事后选择漂亮checkpoint。若终点更新不是主因，下一主线应从保守action-risk不确定性或跨rollout validation入手，而不是继续微调scalar PID。
 
 正式数据和图位于`_runs/wandb_export/dqc_pm10_pid_window100_seed0_1m_2026-07-17/`、`_runs/profiles/dqc_pm10_pid_window100_mechanism_seed0_2026-07-17/`与`_runs/profiles/dqc_pm8_pm10_pid_window_seed0_2026-07-17/`。正式训练W&B online run为`p5tv7sij`，公开字段隐私审计通过；纯评估不创建远端run。
+
+
+### 13.84 P-M10终点更新不是回报损失来源（2026-07-17）
+
+更新前后140回合reward为0.683→0.718，outage为0.114→0.207。最后一次更新增加约0.035 reward而不是降低reward，同时使outage增加0.093；后者的Newcombe 95%区间为[0.006,0.179]。因此P-M10相对P-M8的回报下降不是终点一次更新造成的，二元checkpoint回滚也不会恢复高reward。
+
+critic在最后更新后仍明显退化：hard/smooth CDF error约增加1.28/1.64倍，mean-cost error从0.451升到3.102，Brier从0.100升到0.173。这个事实支持跨批泛化问题，但pre策略reward更低，说明只限制最后一次update不够。P-M10的行为是多个PID--Actor事件形成的路径依赖，下一步不再围绕window或终点guard微调。
+
+### 13.85 重新公平验证cost-LSTM：旧负结果缺少正确时间测度（2026-07-17）
+
+一个重要遗漏是，独立cost-LSTM只在旧的uniform-transition目标下跑过100k。后续实验已经证明，该目标让每条T1000轨迹的999个后期低remaining-cost样本淹没s0与早期风险监督；LSTM容量越强，越可能通过牺牲早期状态来降低全局loss。现在主配置使用risk-discount=.995纠正了训练测度，却从未重新测试history。因此不能引用旧C-H1结果断言“LSTM对cost critic无用”。
+
+这项复验直接对应网络公平性：行为策略未来动作依赖LSTM hidden，raw critic的Z(s,a)会把不同hidden下的未来策略混成一个分布；C-H1估计Z(s,h,a)，并把previous cost/action/reward加入与QCPO_refs一致的因果历史输入，同时保留DQCAC必须的action-conditioned输出。它不是简单堆更大网络，而是补齐critic条件信息。
+
+为避免再次把表示变化和闭环路径混在一起，先固定P-M3 seed1成熟policy，用seed101收集与既有raw-QR 600k完全相同的30批轨迹。候选只把raw换成cost-LSTM，MC、time weight、QR32、C20和全部优化参数不变。只有逐批truth严格配对、prequential校准和独立Brier/AUC联合通过，才做fresh520并考虑live；否则停止，不扫hidden和LR。
+
+本轮同时补充hard/smooth Brier Skill、ROC-AUC、预测分离度与概率方差。Brier检验概率误差，AUC检验outage与safe轨迹的排序；两者必须联合，防止总体CDF均值看起来准确但action-risk没有分辨力。正式训练预计9--11分钟并使用脱敏W&B online。

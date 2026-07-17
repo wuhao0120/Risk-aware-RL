@@ -103,6 +103,76 @@ def _build_cost_quantile_grid(num_quantiles, mode, query_tau, half_width,
     return taus.float(), weights.float(), density.float()
 
 
+def _binary_probability_metrics(probabilities, outcomes):
+    """
+    计算Bernoulli概率预测的proper score、skill与排序分辨率。
+
+    输入是逐轨迹预测概率和0/1 outage标签；返回值只用于独立评估日志，不参与
+    critic loss、actor advantage或PID。ROC-AUC使用带平均tie rank的Mann--Whitney
+    公式，因此hard QR的1/N离散概率不会因任意排序tie而得到虚假的分辨率。
+    """
+    predicted = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    labels = np.asarray(outcomes, dtype=np.float64).reshape(-1)
+    if predicted.shape != labels.shape or predicted.size == 0:
+        raise ValueError("probabilities and outcomes must be non-empty aligned vectors")
+    if not np.isfinite(predicted).all() or not np.isfinite(labels).all():
+        raise ValueError("probabilities and outcomes must be finite")
+    if np.any((labels != 0.0) & (labels != 1.0)):
+        raise ValueError("outcomes must contain only binary 0/1 labels")
+    if np.any(predicted < -1e-7) or np.any(predicted > 1.0 + 1e-7):
+        raise ValueError("probabilities must lie in [0, 1]")
+
+    # Brier Skill以当前独立评估集的经验基率常数预测为climatology；BSS>0才表示
+    # 逐状态概率预测优于永远输出同一个outage rate。单一类别时skill未定义。
+    brier = float(np.mean((predicted - labels) ** 2))
+    prevalence = float(labels.mean())
+    climatology_brier = prevalence * (1.0 - prevalence)
+    brier_skill = (
+        1.0 - brier / climatology_brier
+        if climatology_brier > 0.0 else float('nan'))
+
+    positive = labels == 1.0
+    negative = ~positive
+    positive_mean = (
+        float(predicted[positive].mean()) if bool(positive.any()) else float('nan'))
+    negative_mean = (
+        float(predicted[negative].mean()) if bool(negative.any()) else float('nan'))
+    discrimination_gap = positive_mean - negative_mean
+
+    # 先稳定排序，再为每个完全相同的score分配平均1-based rank。这样全常数预测
+    # 精确得到AUC=.5，而不是由episode原始顺序决定0或1。
+    positive_count = int(positive.sum())
+    negative_count = int(negative.sum())
+    roc_auc = float('nan')
+    if positive_count > 0 and negative_count > 0:
+        order = np.argsort(predicted, kind='mergesort')
+        sorted_scores = predicted[order]
+        ranks = np.empty(predicted.size, dtype=np.float64)
+        begin = 0
+        while begin < predicted.size:
+            finish = begin + 1
+            while (finish < predicted.size
+                   and sorted_scores[finish] == sorted_scores[begin]):
+                finish += 1
+            average_rank = 0.5 * ((begin + 1) + finish)
+            ranks[order[begin:finish]] = average_rank
+            begin = finish
+        positive_rank_sum = float(ranks[positive].sum())
+        roc_auc = (
+            positive_rank_sum - positive_count * (positive_count + 1) / 2.0
+        ) / (positive_count * negative_count)
+
+    return {
+        'brier': brier,
+        'brier_skill': float(brier_skill),
+        'roc_auc': float(roc_auc),
+        'positive_mean': positive_mean,
+        'negative_mean': negative_mean,
+        'discrimination_gap': float(discrimination_gap),
+        'prediction_std': float(predicted.std()),
+    }
+
+
 class DQCACBetaGPU(VecAgentBase):
     """DQC-AC-β CMDP 版 (reward+cost 双分布式 critic; budget/critic-dual 在 cost 上; 上尾约束)。"""
 
@@ -3326,6 +3396,7 @@ class DQCACBetaGPU(VecAgentBase):
             crossfit_eval = None
             qr_cdf_eval = None
             selected_probability_eval = None
+            selected_smooth_probability_eval = None
             qr_probability_eval = None
             direct_online_probability_eval = None
             if self.cost_actor_query_mode == 'crossfit':
@@ -3343,10 +3414,12 @@ class DQCACBetaGPU(VecAgentBase):
                     psi_peer, float(cost_limit), mode='sigmoid')
                 selected_probability_eval = 0.5 * (
                     hard_primary + hard_peer)
+                selected_smooth_probability_eval = 0.5 * (
+                    smooth_primary + smooth_peer)
                 cost_cdf_initial = float(
                     selected_probability_eval.mean().item())
                 cost_cdf_smooth_initial = float(
-                    (0.5 * (smooth_primary + smooth_peer)).mean().item())
+                    selected_smooth_probability_eval.mean().item())
 
                 # 把两critic视为等权分布mixture：Var=E[var+mean²]-E[mean]²。
                 mean_primary, std_primary = self._cost_quantile_moments(
@@ -3384,6 +3457,7 @@ class DQCACBetaGPU(VecAgentBase):
                     direct_probability = self._direct_cost_tail_probability(
                         cost_input0, a0, float(cost_limit))
                     selected_probability_eval = direct_probability
+                    selected_smooth_probability_eval = direct_probability
                     qr_probability_eval = qr_hard
                     cost_cdf_initial = float(
                         direct_probability.mean().item())
@@ -3401,6 +3475,7 @@ class DQCACBetaGPU(VecAgentBase):
                                 source='online'))
                 else:
                     selected_probability_eval = qr_hard
+                    selected_smooth_probability_eval = qr_smooth
                     cost_cdf_initial = float(qr_hard.mean().item())
                     cost_cdf_smooth_initial = float(
                         qr_smooth.mean().item())
@@ -3421,8 +3496,12 @@ class DQCACBetaGPU(VecAgentBase):
         observed_outage = (cost_np >= float(cost_limit)).astype(np.float64)
         selected_probability_np = (
             selected_probability_eval.detach().cpu().numpy().astype(np.float64))
-        selected_brier = float(np.mean(
-            (selected_probability_np - observed_outage) ** 2))
+        selected_smooth_probability_np = (
+            selected_smooth_probability_eval.detach().cpu().numpy().astype(np.float64))
+        hard_probability_metrics = _binary_probability_metrics(
+            selected_probability_np, observed_outage)
+        smooth_probability_metrics = _binary_probability_metrics(
+            selected_smooth_probability_np, observed_outage)
         result = {
             'mean': float(reward_np.mean()),
             'reward_std': float(reward_np.std()),
@@ -3437,7 +3516,27 @@ class DQCACBetaGPU(VecAgentBase):
             'num_episodes': int(reward_np.shape[0]),
             'cost_cdf_initial': cost_cdf_initial,
             'cost_cdf_smooth_initial': cost_cdf_smooth_initial,
-            'cost_cdf_brier_initial': selected_brier,
+            # 历史Brier字段保持hard estimator语义；新增smooth字段才对应T1 actor查询。
+            'cost_cdf_brier_initial': hard_probability_metrics['brier'],
+            'cost_cdf_brier_skill_initial': hard_probability_metrics['brier_skill'],
+            'cost_cdf_roc_auc_initial': hard_probability_metrics['roc_auc'],
+            'cost_cdf_discrimination_gap_initial': (
+                hard_probability_metrics['discrimination_gap']),
+            'cost_cdf_prediction_std_initial': hard_probability_metrics['prediction_std'],
+            'cost_cdf_outage_mean_initial': hard_probability_metrics['positive_mean'],
+            'cost_cdf_safe_mean_initial': hard_probability_metrics['negative_mean'],
+            'cost_cdf_smooth_brier_initial': smooth_probability_metrics['brier'],
+            'cost_cdf_smooth_brier_skill_initial': (
+                smooth_probability_metrics['brier_skill']),
+            'cost_cdf_smooth_roc_auc_initial': smooth_probability_metrics['roc_auc'],
+            'cost_cdf_smooth_discrimination_gap_initial': (
+                smooth_probability_metrics['discrimination_gap']),
+            'cost_cdf_smooth_prediction_std_initial': (
+                smooth_probability_metrics['prediction_std']),
+            'cost_cdf_smooth_outage_mean_initial': (
+                smooth_probability_metrics['positive_mean']),
+            'cost_cdf_smooth_safe_mean_initial': (
+                smooth_probability_metrics['negative_mean']),
             'pred_cost_mean': pred_cost_mean,
             'pred_cost_std': pred_cost_std,
             'cost_quantile_crossing_fraction': (

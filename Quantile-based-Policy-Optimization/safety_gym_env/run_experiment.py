@@ -542,8 +542,13 @@ def main():
               f"truth={emp:.3f} bias={res['cost_cdf_initial']-emp:+.3f}")
     if res.get('cost_cdf_brier_initial') is not None:
         print(
-            f"[cost-critic proper score] selected Brier="
-            f"{res['cost_cdf_brier_initial']:.4f}")
+            f"[cost-critic discrimination] hard Brier/AUC/BSS="
+            f"{res['cost_cdf_brier_initial']:.4f}/"
+            f"{res['cost_cdf_roc_auc_initial']:.4f}/"
+            f"{res['cost_cdf_brier_skill_initial']:.2%}  "
+            f"smooth={res['cost_cdf_smooth_brier_initial']:.4f}/"
+            f"{res['cost_cdf_smooth_roc_auc_initial']:.4f}/"
+            f"{res['cost_cdf_smooth_brier_skill_initial']:.2%}")
     if res.get('cost_cdf_qr_initial') is not None:
         # direct模式的主键是Bernoulli head；QR同样本对照单独打印，禁止混为一个CDF。
         print(
@@ -591,6 +596,19 @@ def main():
         if res.get('cost_cdf_brier_initial') is not None:
             eval_log['eval/cost_cdf_brier_initial'] = (
                 res['cost_cdf_brier_initial'])
+        for key in (
+                'cost_cdf_brier_skill_initial', 'cost_cdf_roc_auc_initial',
+                'cost_cdf_discrimination_gap_initial',
+                'cost_cdf_prediction_std_initial', 'cost_cdf_outage_mean_initial',
+                'cost_cdf_safe_mean_initial', 'cost_cdf_smooth_brier_initial',
+                'cost_cdf_smooth_brier_skill_initial',
+                'cost_cdf_smooth_roc_auc_initial',
+                'cost_cdf_smooth_discrimination_gap_initial',
+                'cost_cdf_smooth_prediction_std_initial',
+                'cost_cdf_smooth_outage_mean_initial',
+                'cost_cdf_smooth_safe_mean_initial'):
+            if res.get(key) is not None:
+                eval_log[f'eval/{key}'] = res[key]
         if res.get('cost_cdf_qr_initial') is not None:
             eval_log['eval/cost_cdf_qr_initial'] = res['cost_cdf_qr_initial']
         if res.get('cost_cdf_qr_brier_initial') is not None:
