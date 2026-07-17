@@ -26,6 +26,47 @@ from utils import Actor, ObservationNormalizer                # 策略网络 + �
 from envs import make_vec_env                                 # CPU 向量化工厂 (mp 多进程 / sync 串行)
 
 
+_WANDB_PRIVATE_CONFIG_KEYS = {
+    'wandb_dir',                 # 当前机器的绝对工作目录，不影响算法复现
+    'checkpoint_dir',            # 本地持久化位置；结构配置已经由其它字段完整描述
+    'calibration_source_checkpoint',  # critic校准源快照的绝对路径
+}
+_WANDB_SECRET_KEY_MARKERS = (
+    'api_key', 'password', 'secret', 'token', 'credential',
+)
+
+
+def wandb_public_config(args):
+    """
+    [函数简介]: 构造只含公开实验语义的W&B配置，不上传机器路径或凭据。
+    [输入输出]: args是argparse namespace；返回可直接传给wandb.init的dict。
+    [算法影响]: 仅改变外部日志元数据，不参与网络前向、随机数或优化器更新。
+
+    除显式私有字段外，任何绝对路径值也会被剔除；这样后续新增路径参数时
+    不需要依赖维护者记得同步更新黑名单。list/dict等超参仍沿用历史行为转成
+    字符串，保证W&B表格可读且不改变已有标量字段类型。
+    """
+
+    public = {}
+    for key, value in vars(args).items():
+        key_lower = str(key).lower()
+        if key in _WANDB_PRIVATE_CONFIG_KEYS:
+            continue
+        if any(marker in key_lower for marker in _WANDB_SECRET_KEY_MARKERS):
+            continue
+
+        # torch.device等对象先转成历史格式字符串；PathLike值则显式展开，
+        # 之后统一判断绝对路径，避免把/vepfs用户名或机器目录发送到云端。
+        if isinstance(value, os.PathLike):
+            value = os.fspath(value)
+        if isinstance(value, str) and os.path.isabs(os.path.expanduser(value)):
+            continue
+        public[key] = (
+            value if isinstance(value, (int, float, bool, str, type(None)))
+            else str(value))
+    return public
+
+
 class VecAgentBase(object):
     """QCPO/DQCAC 共享: 环境/策略/采样(含cost)/日志(outage)/评估接口 (更新逻辑在子类)。"""
 
@@ -113,15 +154,28 @@ class VecAgentBase(object):
         # -------------------- wandb (独立 project, env-step 为默认 x 轴) --------------------
         tags = [t.strip() for t in str(getattr(args, 'wandb_tags', '') or '').split(',')
                 if t.strip()]
+        # W&B默认会采集host、username、Git remote/commit、代码和system stats。
+        # 本项目只需要训练指标与公开超参；关闭机器元数据既减少隐私暴露，也不
+        # 改变wandb.log的训练曲线。GPU/CPU资源仍由本地nvidia-smi/作业日志监控。
+        wandb_settings = wandb.Settings(
+            _disable_machine_info=True,
+            _disable_meta=True,
+            _disable_stats=True,
+            _save_requirements=False,
+            disable_git=True,
+            disable_code=True,
+            disable_job_creation=True,
+            save_code=False)
         self._wandb_run = wandb.init(
             project=getattr(args, 'wandb_project', 'safety_gym_qcrl'),
             name=getattr(args, 'wandb_name', None) or f"{self.algo_name}_{args.seed}",
-            config={k: str(v) if not isinstance(v, (int, float, bool, str, type(None)))
-                    else v for k, v in vars(args).items()},
+            config=wandb_public_config(args),
             reinit=True,
             group=getattr(args, 'wandb_group', None) or self.algo_name,
             notes=getattr(args, 'wandb_notes', None),
             tags=tags or None,
+            save_code=False,
+            settings=wandb_settings,
             dir=getattr(args, 'wandb_dir', None))
         if self._wandb_run is not None:
             self._wandb_run.define_metric("progress/env_steps")
