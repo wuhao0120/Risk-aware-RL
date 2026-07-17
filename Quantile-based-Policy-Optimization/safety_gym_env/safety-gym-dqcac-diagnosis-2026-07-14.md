@@ -2068,3 +2068,22 @@ eta1在工程上完全正常，但算法表现明确失败。1M训练末5批rewa
 统计时序与PPO因果性同样重要。两个component EMA只在某个behavior batch的首个actor epoch推进一次，online模式使用actor实际看到的当前critic；随后的epoch固定risk target和old log-probability。若在每个epoch更新scale，当前策略和更新后critic就会偷偷改变同一批监督，rho的解释再次失效。actor cadence大于1时应在合并后的独立trajectory集合上更新，而不是分别标准化后拼接。
 
 解析测试证明rho=1与.25得到的实际修正/critic RMS比就是1与.25，默认raw eta0的176个checkpoint tensor leaves补丁前后最大差为0。循环与MLP短测也都完成训练、评估和checkpoint保存，ratio误差远低于1e-3。下一条正式实验只在C-H8 seed1打开rho1 balanced；评价仍是outage接近0.20后最大化reward，而不是因为新增机制降低了outage就判成功。
+
+
+### 13.129 配平trajectory residual解决了critic偏差，却以过强风险credit牺牲了收益（2026-07-17）
+
+C-H14证明了两个必须同时保留的事实。第一，RMS配平后的真实trajectory residual不是无效噪声。相同seed、相同1M预算下，独立512条的hard-CDF误差降低82.4%，Brier降低42.3%，mean-cost误差降低80.1%；后段实际修正/critic尺度比约1.40，所有PPO和数值诊断正常。因此它确实修复了C-H8 cost critic严重低估风险的一部分，而不是靠未归一化的巨大梯度偶然压低策略。
+
+第二，更准确的risk critic或更低outage不自动等于更好的受约束策略。rho0的reward/outage为0.8195/0.2500，rho1为0.7029/0.1348；reward下降的95%差区间为[-0.1729,-0.0603]，outage下降区间为[-0.1628,-0.0672]。rho1的Wilson上界0.1671仍低于0.18工作带，故它明显越过0.20目标进入保守侧。后段clip fraction与KL约减半，也支持风险credit过强限制了有收益的策略移动。
+
+评价口径由真实任务决定：希望outage在0.20附近，然后最大化mean reward。低于0.18且reward下降是资源未充分利用，不是额外加分；低outage只有在reward同时不低时才构成Pareto优势。严格chance constraint在数学上是上界，但本实验的控制校准目标需要报告双侧偏差，避免把“把策略停住”误写成算法进步。
+
+retention guard不是这个setpoint问题的解决方案。它只把上一rollout作为无梯度holdout，用smooth-Brier选择或回滚当前cost critic更新；它既不更新PID，也不知道真实0.20目标。既有结果reward/outage约0.579/0.141，正是更保守但收益更差。因此它继续作为防遗忘诊断默认关闭，不能拿来最小化outage。
+
+### 13.130 rho=.5是当前最小且可归因的工作点校准实验（2026-07-17）
+
+rho0的fresh outage为0.25，rho1为0.135；两端跨过了0.20，且rho1的critic校准显著改善，所以最有信息量的下一步不是换网络、开B80或同时调PID，而是把配平残差强度减半。C-H15保持C-H14全部配置，只把rho从1改为0.5；由于修正已经在总RMS之前按component尺度配平，这一次rho不会像旧raw eta那样被归一化近似抵消。
+
+实验仍跑满B40×25×T1000=1M，预计训练约7分钟、内部评估1--2分钟，内部宽screen通过后fresh512约3--4分钟。性能按双侧工作带[0.18,0.22]裁决：进带后reward至少达到同seed 2M参考0.7954，目标超过1M基线0.8195；机制上要求修正/critic RMS处于有界范围且PPO ratio、KL和所有张量有限。
+
+分歧路线预先固定。rho=.5成功就扩seed而不继续针对seed1插值；仍过保守则停止靠增加trajectory residual追求更低风险，转独立PID setpoint或controller--actor同步；仍不安全但方向和reward都保留，才允许一次rho=.75有界插值。B80、PID增益和rho不能在同一实验中一起改变，否则无法知道改进来自独立trajectory数量、控制器还是风险credit。

@@ -1755,3 +1755,21 @@
 - 正式C-H14只改C-H8 seed1的risk estimator：B40×25×T1000=1M、C20/A8、LSTM512、QR32/MC、actor-feature、mean-anchor=.5/scale10、obs RMS、GAE-PPO、beta=.995、经验PID target=.15与所有LR保持不变；设置`correction_coef=1, mode=rms_balanced, floor=1e-4, ratio_max=1`。W&B使用脱敏name `DQCAC_DynamicButton_ch14_mcbalance_rho1_b40_1m_s1`和group `dqcac_trajectory_mc_balance_dynamicbutton`。
 - 预计纯训练7--9分钟、内置128评估1--2分钟。机制门要求全部有限、首epoch ratio小于`1e-3`、末段实际修正/critic RMS比在`[.5,2]`且balance scale不长期触及非有限值。内置宽screen为reward至少`.60`、outage位于`.05--.40`；通过才做约3--4分钟fresh512。
 - 最终首先要求fresh outage点估计进入双侧带`[.18,.22]`；reward最低参考是同seed 2M带内点`.79542`，目标是不低于1M基线`.81951`。低于.18且reward下降记为过度保守，高于.22记为风险不足；更低outage只有在reward同时更高时才构成支配。若rho1过度保守，下一单变量为rho=.5；若仍明显不安全但方向改善，可讨论允许rho>1或B80独立trajectory消融，不能同时改batch、PID和rho。
+
+
+### E149：C-H14 rho=1配平残差——风险估计显著变准，但策略越过目标进入保守侧（2026-07-17）
+
+- 正式job `DQCAC_DynamicButton_ch14_mcbalance_rho1_b40_1m_s1`绑定提交`f342528`，由`launch_background.sh`持久化完成，exit0；W&B run为`eklrfou4`且已finished。配置相对C-H8 seed1只增加`mode=rms_balanced,rho=1`，B40×25×T1000=1M、C20/A8、LSTM512、QR32/MC、actor-feature、mean-anchor=.5/scale10、obs RMS、GAE-PPO、beta=.995、经验PID内部target=.15和所有LR均不变。纯训练`407.2s`，全部关键数值有限。
+- 机制门通过。后20%的实际MC修正/critic风险优势标准差比均值为`1.4016`，范围`[.9024,1.8331]`，位于预注册`[.5,2]`；balance scale均值`.01669`，critic/residual EMA尺度约`.00504/.30221`，证明二元残差已按约60倍尺度差配平而不是直接压进actor。首epoch behavior ratio链路继续正常。相对C-H8，后20% PPO clip fraction由`.12843`降到`.06341`，KL由`.002319`降到`.001341`，说明rho1确实改变并收紧了策略更新。
+- 内置128条为reward/outage `.7434/.1328`，通过宽screen后执行完全独立fresh512。最终C-H8 rho0→C-H14 rho1为reward `.81951→.70292`、outage `128/512=.25000→69/512=.13477`。reward差为`-.11659`，Welch95区间`[-.17289,-.06029]`；outage差为`-.11523`，Newcombe95区间`[-.16282,-.06719]`。C-H14 outage的Wilson95为`[.10789,.16708]`，整个区间都低于双侧工作带`[.18,.22]`，所以不是128条小样本的偶然偏低。
+- critic质量却有一致改善：hard-CDF absolute error `.09546→.01678`（降低82.4%），smooth-CDF error降低79.8%，Brier `.19851→.11452`（降低42.3%），mean-cost absolute error `3.4572→.6883`（降低80.1%），crossing略降。这说明trajectory residual的真实风险方向有价值；失败点是rho1把工作点推得过远并损失reward，不是机制未生效。
+- 严格裁决为`reject_overconservative_but_direction_useful`。本项目的控制目标是让真实outage约等于0.20后最大化mean reward，不是最小化outage：点估计低于.18且reward下降记为过度保守；只有outage更低同时reward更高才构成Pareto支配。训练末段两条run的批均值都约.22，而fresh终点相差.115，也再次证明B40单批训练outage不能替代独立评估。
+- retention guard与该目标无关。它只在上一rollout上用smooth-Brier选择/回滚cost critic参数及Adam状态，不更新lambda、不设outage setpoint，也不给旧批反传；既有C-H10G的fresh reward/outage约`.579/.141`同样属于低收益的过度保守。因此guard继续默认关闭，仅保留为critic遗忘消融，不能拿来追求更低outage。
+- 完整history与profile在`_runs/wandb_export/dqc_ch8b40_vs_ch14_mcbalance_rho1_b40_1m_s1_2026-07-17/`和`_runs/profiles/dqc_ch8b40_vs_ch14_mcbalance_rho1_b40_1m_s1_2026-07-17/`；fresh512目录含CSV、JSON和比较图。公开W&B config未发现绝对路径或敏感键；本地export metadata含工作目录是分析溯源信息，未上传到W&B。
+
+### E150：C-H15 rho=.5单变量预注册——在rho0不安全与rho1过保守之间校准工作点（2026-07-17）
+
+- 下一条严格复用C-H14，只把`cost_actor_mc_correction_coef:1→.5`。公式仍为`A=Acritic+rho*(sigma_critic/sigma_residual)*(I-p_hat)`，因此预期MC修正RMS约为rho1的一半；不改PID target/增益、B40、网络、quantile、critic更新数、PPO epoch或学习率。它回答的是一个可辨识的风险credit强度问题，不是同时搜索多个超参数。
+- 使用同一压力seed1、B40×25×T1000=1M、C20/A8，持久化后台和脱敏W&B online。预计纯训练约7分钟、内置128约1--2分钟；内部宽screen为reward至少`.60`、outage位于`.05--.40`且全部数值有限，通过才花约3--4分钟做fresh512。
+- 机制门要求后段实际修正/critic RMS比大致位于`[.25,1.25]`且不出现非有限值；性能门仍首先要求fresh512 outage点估计进入`[.18,.22]`，然后reward至少不低于同seed 2M带内参考`.79542`，目标是不低于1M的`.81951`。低于.18且reward下降仍是过度保守，高于.22仍是风险不足，不因接近某条训练曲线放宽。
+- 若rho=.5进带且reward达到参考，先扩seed0/2，不再继续插值找漂亮seed1；若仍低于.18，停止增加trajectory residual，不把rho=.25默认包装成改进，转PID内部setpoint/控制器同步的独立校准；若高于.22但相对rho0明显改善且reward保留，再把rho=.75作为有边界的插值消融记录，不能同时改B80或PID。若训练继续出现相位循环，则controller--actor同步作为下一条正交实验。
