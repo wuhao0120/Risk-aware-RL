@@ -1235,3 +1235,12 @@
 - 主审计区间为`400k--1M`，稳健性区间为`600k--1M`。同时报告逐seed与去除seed均值后的pooled lag-1相关、连续事件同号率、单侧二项检验、last-value与因果EMA预测误差。EMA固定`tau=0.2`，预测事件t时只能使用t之前的偏差，不能偷看当前truth。
 - 只有四项同时成立，才允许实现“校准偏差EMA→自适应PID target”：pooled lag-1相关`>0.25`；同号率`≥0.65`且单侧`p<0.10`；EMA一步MAE相对永远预测零偏差至少改善10%；EMA改善在至少2/3 seed同方向。门槛失败则直接否决这条反馈路线，避免把白噪声放进PID。
 - 本审计预计低于1分钟，不使用GPU、不创建W&B run。输出只写`/vepfs`下本地profile；分析工具若新增必须可复用，使用完的`/tmp`预览与回归文件立即清理。
+
+### E94：prequential偏差不可预测——否决自适应PID margin（2026-07-17）
+
+- 审计按E93原门完成，实际运行约8秒，不启动训练或W&B。三seed共75个B40事件；主区间400k--1M含48个事件/45个lag pair，稳健区间600k--1M含33个事件/30个pair。每个事件恰含两个rollout且`pid_update_due`总数为1，聚合时序验证通过。
+- 主区间去除seed均值后的lag-1相关为`-0.2083`，低于`>0.25`门；连续偏差同号`25/45=55.56%`，单侧二项`p=0.2757`，同时失败于65%和p<0.10。last-value MAE=`0.08125`，比永远预测零偏差的`0.05981`恶化35.8%；因果EMA(0.2) MAE=`0.05664`，只改善5.31%，低于10%门。
+- 逐seed EMA相对零偏差的改善为seed0/1/2=`+4.33%/+18.08%/-3.01%`；只有“2/3方向为正”通过，幅度与相关门均失败。到600k--1M，pooled lag相关进一步变为`-0.3403`、同号率`13/30=43.33%`、`p=0.8192`，EMA从改善转为恶化3.64%；seed0/2分别恶化16.17%/4.73%。因此结果不是早期冷启动拖累。
+- 三seed成熟期mean underestimation仍均为正：`0.03594/0.04014/0.02085`。这说明存在总体低估倾向，但事件级误差快速换符号且常呈反相关；“平均需要安全余量”不能推出“用上一事件偏差动态调下一target”。P-M9已经证明固定更大余量会显著损失reward，自适应反馈又没有可预测输入，故两条都不继续。
+- 预注册四项只通过seed方向一致性，overall严格失败。停止“校准偏差EMA→PID target”，不扫描tau/gain/clip，不把负相关事后改造成反向controller。下一路线必须不依赖上一批偏差预测，优先比较受控单次联合更新与跨rollout critic validation；需先核对既有target-KL、preupdate/target/crossfit消融，避免重复。
+- 新增可复用`audit_prequential_calibration.py`，支持列映射、event cadence、严格因果last/EMA、去seed均值lag相关、符号二项检验、机械gate与逐seed图。正式文件在`_runs/profiles/dqc_pm8_prequential_calibration_audit_2026-07-17/`：`event_series.csv`、`audit_summary.json`和`calibration_audit.png`（`3105×2269`，PIL与目视检查通过）。
