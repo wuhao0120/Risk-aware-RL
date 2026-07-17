@@ -1734,3 +1734,13 @@
 - 正式首轮严格复用C-H8 B40 seed1：`25×40×1000=1M`、C20/A8、actor/PID interval1、QR32、MC cost、risk-discount=.995、detach actor-feature、mean-anchor=.5/scale10、MLP+LSTM512、observation RMS、T1 sigmoid、GAE-PPO、固定old log-prob和经验PI/PID内部target=.15；唯一算法变量为`eta=1`。不同时调整PID、quantile、CDF、网络、replay或guard。预计纯训练7--9分钟、内置128约1--2分钟、fresh512约3--4分钟，全部使用`launch_background.sh`、脱敏W&B online和eval-only禁用W&B。
 - B40已有慢启动和长周期，除NaN/Inf/OOM、ratio断言或确定性工程错误外跑满1M。正式裁决首先要求fresh512真实outage落入双侧工作带`[.18,.22]`，然后要求mean reward至少达到seed1底座`.81951`（预注册简写`.82`），并报告Wilson/Newcombe/Welch区间、末段outage振幅、constraint RMS、critic--MC相关、Brier/AUC/BSS、mean-cost error和crossing。低于.18不因更安全自动晋级，高于.22判风险过大。
 - 分歧路线已预先固定：若eta=1把outage从高风险侧移向或越过目标但reward明显损失，说明真实方向有效而方差/强度过大，才按单变量依次考虑eta=.5、.25的轻量或1M验证；若eta=1仍高于.22且MC信号/尺度正常，减小eta只会增加critic偏置，不做盲扫，转controller cadence或更直接的trajectory baseline；若eta=1同时进带且提高reward，先扩seed0/2而不是继续调参。
+
+### E147：eta=1真实trajectory风险方向没有把闭环校准到0.20（2026-07-17）
+
+- 正式job `DQCAC_DynamicButton_ch13_mcfix_eta1_b40_1m_s1` 由持久化后台正常完成，exit0；W&B online run为`7yu7ublr`并已finished。配置严格复用C-H8 seed1的B40×25×T1000、C20/A8、LSTM512、QR32/MC、GAE-PPO、经验PID target=.15，仅把`cost_actor_mc_correction_coef`从0改为1。纯训练耗时`411.1s`，25条history完整到1M，无NaN/Inf；首epoch behavior ratio最大误差`1.72e-5`，说明失败不是importance-ratio或旧概率覆盖错误。
+- 训练没有进入目标附近稳态。相对eta0基线，末5批reward/outage/lambda由`.7563/.215/.1697`变为`1.288/.410/.7225`；最终训练批为`1.362/.450/.8397`。lambda及risk coefficient持续升到`.8397/.4564`，但outage仍处于`.35--.45`高风险区，不能把结果解释为控制器没有收到违约信号。
+- 内置独立128回合为reward/outage=`1.318/60÷128=.46875`，Wilson95%区间`[.3845,.5548]`，远离名义`.20`和工程带`[.18,.22]`。critic预测`.379`，低估真实outage约`.089`；hard Brier/AUC/BSS为`.2559/.5973/-2.76%`。该点超过预注册宽screen上界`.40`，即使按二项区间下界也明显超标，因此停止约3--4分钟的fresh512，不用更多评估样本确认一个已经明确的失败。
+- eta1不是数值爆炸。末5批MC/blended优势标准差为`.3998`，constraint EMA sigma为`.3542`，二者尺度匹配；PPO末段KL约`.00125`、clip fraction约`.0577`，没有大步越界。真正的问题是信号质量：同批critic优势标准差仅`.00628`，MC优势约为其64倍；critic--MC相关仅`.00294`，几乎正交。eta1把低方差的动作条件方向完全替换成每条trajectory共享的二元标签，得到理论上方向正确、实际方差很大且缺少时刻/动作区分的credit。
+- 不直接运行eta=.5/.25。当前`Aeta=Acritic+eta*residual`随后除以同一`Aeta`的EMA标准差；当residual比critic大两个数量级时，把eta从1缩到.5或.25会让分子和归一化分母近似同比缩小，稳态有效梯度及方向几乎不变。即使eta=.25，MC项标准差仍约是critic的16倍。因此原预注册的“eta扫描”在当前归一化下不是有效强度消融，盲跑1M没有信息价值。
+- 下一候选应让混合参数具有可辨识语义：分别跟踪critic与MC residual的RMS，按`A=Acritic+rho*(sigma_critic/sigma_residual)*residual`配平后再做一次总归一化；rho才控制真实相对贡献。另一条独立路线是把B40提高到B80并保持每次Actor/PID更新的trajectory数增加，同时按总环境步重新标定更新事件数。两条不能同时改；先做默认关闭实现、符号/eta0逐位回归和B80显存smoke，再选择一条正式1M。最终裁决继续是fresh outage进入`[.18,.22]`后最大化mean reward，不以outage更低为优。
+- 完整证据位于`_runs/wandb_export/dqc_ch8b40_vs_ch13_mcfix_eta1_b40_1m_s1_2026-07-17/`和同名`_runs/profiles/`。profile新增trajectory-MC分解曲线，明确显示critic/MC尺度、residual、相关性和label基率；这些绘图改动只扩展离线分析，不影响训练。

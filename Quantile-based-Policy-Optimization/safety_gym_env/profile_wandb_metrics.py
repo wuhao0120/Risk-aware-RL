@@ -63,6 +63,15 @@ KEY_METRICS: Tuple[str, ...] = (
     "advantage/risk_adv_std",
     "advantage/risk_adv_abs_mean",
     "advantage/risk_adv_nonzero_fraction",
+    # trajectory-MC correction decomposition: blended signal remains on the
+    # historical risk_adv keys; the new fields expose bias/variance separately.
+    "advantage/risk_critic_adv_std",
+    "advantage/risk_mc_adv_std",
+    "advantage/risk_mc_residual_std",
+    "advantage/risk_mc_correction_abs_mean",
+    "advantage/risk_critic_mc_correlation",
+    "advantage/risk_mc_outage_label_mean",
+    "advantage/risk_mc_correction_coef",
     "advantage/risk_query_target_online_abs_mean",
     "advantage/risk_query_crossfit_peer_abs_mean",
     "advantage/risk_query_preupdate_postupdate_abs_mean",
@@ -209,6 +218,8 @@ KEY_METRICS: Tuple[str, ...] = (
     "debug/cost_critic_weight_discount",
     "debug/cost_critic_weight_floor",
     "debug/cost_actor_query_is_target",
+    "debug/cost_actor_mc_correction_enabled",
+    "debug/cost_actor_mc_correction_coef",
     "debug/cost_cdf_estimator_is_direct",
     "debug/cost_direct_cdf_query_is_ema",
     "critic/quantile_target_scale",
@@ -324,6 +335,18 @@ PLOT_PANELS: Tuple[Tuple[str, Tuple[str, ...], bool], ...] = (
         "constraint/direct_online_cdf_estimate_initial"), False),
     ("dual lambda", ("lambda/value",), False),
     ("reward advantage scale", ("advantage/mean_adv_std", "norm/return_sigma_ema"), True),
+    # The first panel checks RMS scale matching; the second checks whether the
+    # action-conditioned critic agrees with the realized trajectory event.
+    ("risk advantage decomposition", (
+        "advantage/risk_adv_std",
+        "advantage/risk_critic_adv_std",
+        "advantage/risk_mc_adv_std",
+        "norm/constraint_sigma_ema"), True),
+    ("trajectory risk residual", (
+        "advantage/risk_mc_residual_std",
+        "advantage/risk_mc_correction_abs_mean",
+        "advantage/risk_critic_mc_correlation",
+        "advantage/risk_mc_outage_label_mean"), False),
     ("actor weight scale", ("actor/w_std",), True),
     ("reward critic", ("critic/reward_qr_loss", "ref/r_value_loss"), True),
     ("cost critic", ("critic/cost_qr_loss", "critic/cost_s0_aux_loss"), True),

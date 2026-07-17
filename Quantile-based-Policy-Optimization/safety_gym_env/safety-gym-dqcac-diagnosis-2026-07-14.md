@@ -2050,3 +2050,13 @@ constraint归一化必须随估计器改变。原action-conditioned critic优势
 验证比“能跑”更严格。eta=0补丁前后比较final和三个pre-update checkpoint，共176个tensor/array leaves最大差为0，730个共同数值状态也完全一致。解析测试验证eta端点、.25插值和time-major标签；纯张量PPO测试证明正风险优势对应降低动作概率、负优势对应提高概率。eta=1的recurrent cadence2训练和独立checkpoint恢复均成功，全部tensor有限且首epochratio误差为1.23e-4。MLP路径也完整训练，并顺带修复了两个仅发生在训练后summary/打印阶段的既有可选字段错误。
 
 短测故意把cost limit设为-1以强制产生非零MC修正，只证明作用链，不提供性能结论。正式实验仍使用真实阈值15、alpha=.20和C-H8 B40 seed1配置，唯一变量是eta=1。选择标准不是outage最小：fresh512先要求点估计进入`[.18,.22]`，再比较mean reward是否至少达到0.8195。若eta=1明显把高风险策略推到过度保守侧并损失reward，才有证据测试eta=.5/.25的偏差--方差折中；如果仍然不安全，则不能靠减小真实标签权重做事后参数搜索。
+
+### 13.127 eta系数被RMS归一化近似抵消，eta=1失败不是简单的强度过大（2026-07-17）
+
+eta1在工程上完全正常，但算法表现明确失败。1M训练末5批reward/outage/lambda为`1.288/.410/.7225`，独立128回合为`1.318/.46875`；outage的Wilson95%区间`[.3845,.5548]`整体远高于0.20。lambda已经升到0.84、risk coefficient升到0.456，PPO KL和ratio均健康，因此不是PID没看见违约、IS分母错误或更新步失控。它是一个高reward但违反概率约束的策略，按双侧校准目标不能晋级，也没有必要再用fresh512重复确认。
+
+轨迹标签的理论符号正确不等于有限样本credit有效。末段`I_outage-V`标准差约0.400，而`p_hat-V`只有0.0063，两者相关约0.003。eta1抛弃了critic提供的细粒度动作条件差异，每条1000步trajectory主要共享一个0/1方向；B40只有40个独立事件标签，transition数量40,000并没有把独立风险样本变成40,000个。这解释了为什么风险优势看起来数值充足，策略却继续沿高reward高outage方向移动。
+
+当前eta公式还存在可辨识性问题。constraint RMS跟踪最终混合优势是防止数值爆炸所必需的，但当MC residual主导时，`eta*residual / sigma(eta*residual)`近似与eta无关。把eta改成0.5或0.25不能按比例减小有效风险梯度，也不能明显恢复critic方向；eta=.25时MC标准差仍约为critic的16倍。因此不把这两个值直接当作下一轮超参数扫描。
+
+更合理的收缩估计要先把两个分量配平。可用上一批或EMA统计量构造`Acritic + rho*(sigma_critic/sigma_residual)*(I-p_hat)`，随后总RMS只负责全局数值尺度；这样rho=0恢复critic，rho=1表示“残差与critic具有相当RMS”，而不是完全替换。它有意用少量偏差换取显著方差下降，应作为bias--variance消融诚实报告，不能再声称rho小于完整修正时无偏。并列路线是增加每次更新的独立trajectory数，但必须同时处理固定1M预算下更新事件减半的问题。两条路线应分别验证，最终仍以真实outage落在0.20附近后mean reward最大为唯一性能准则。
