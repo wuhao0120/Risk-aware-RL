@@ -1711,3 +1711,15 @@ critic在最后更新后仍明显退化：hard/smooth CDF error约增加1.28/1.6
 raw critic的hard CDF为0.26786，truth为0.25714，若只看总体误差会认为它已经很准。但hard/smooth ROC-AUC只有0.5198/0.5240，Brier Skill为-6.18%/-5.61%；换言之，它几乎不能把真正outage轨迹排在safe轨迹之前，概率误差还不如始终预测同一经验基率。DQCAC的actor需要的是不同state/action/history之间的风险方向，而不只是全体样本平均风险。因此这组结果把当前瓶颈进一步定位为条件风险表示与泛化，而不是继续微调scalar PID就能解决。
 
 C-H1W将以这些数值作为冻结policy的正式对照，只改变cost critic是否看到policy hidden所需的因果历史。若cost-LSTM不能同时改善prequential误差、独立Brier与AUC，就不进入live闭环；若能改善，才值得把公平MLP+LSTM结构带回DQCAC主线。
+
+### 13.87 cost-LSTM不是没有信息，而是把有限B20记住后不能泛化（2026-07-17）
+
+C-H1W完成600k且行为truth与raw对照30批逐元素完全相同。这个控制很重要：reward、outage、cost和动作统计最大差为0，独立140条也完全相同，所以网络差异不会被policy路径或环境随机性混淆。
+
+结果呈现非常清楚的训练集--下一批分裂。同一批更新后的post-Brier从raw的0.2002降到cost-LSTM的0.05465，改善72.7%；但下一批更新前的pre-Brier从0.2325升到0.3210，恶化38.1%。pre-CDF error也恶化31.7%，聚合mean bias略超过1.0。也就是说，更大的recurrent模型能把当前20条trajectory拟合得很好，却没有学到可迁移到下一批状态/历史的条件分布。
+
+独立评估揭示了一个值得保留的正信号：hard/smooth AUC从约0.52提升到约0.59，说明previous cost/action/reward与hidden history确实包含一部分outage排序信息。但概率值本身严重失准：hard/smooth Brier分别恶化41.2%/31.3%，BSS降到-49.9%/-38.7%，mean-cost error升到1.173，crossing升到0.268。对actor而言，只得到略好的排序而概率尺度、分布均值和quantile顺序同时错误，仍不足以形成可靠风险梯度。
+
+优化健康度给出了直接线索：cost-LSTM末5批每一次critic过程都发生梯度裁剪，raw只有20%；crossing约为raw的5.6倍。当前20次update重复使用同一个B20，对容量更大的LSTM相当于在低独立样本数下做强优化。延长到1.2M不会增加每个policy版本的独立样本，且候选Brier在末5批相对前5批还恶化31.8%，所以“继续跑就会好”没有证据。
+
+因此不做fresh520、不进入live，也不立刻宣布LSTM路线失败。下一步先审计recurrent输入尺度、TBPTT边界、参数量、pre-clip gradient和有效学习率；若接线正确，优先解决独立样本与更新强度失配。可分开验证的路线是：降低recurrent critic学习率、使用跨rollout replay/held-out early stop、或增加num_envs而保持update预算。三者因果不同，必须作为独立消融，不能一次混合。当前证据尤其反对用同批post loss或post Brier做模型选择，因为它会系统性偏爱过拟合的LSTM。

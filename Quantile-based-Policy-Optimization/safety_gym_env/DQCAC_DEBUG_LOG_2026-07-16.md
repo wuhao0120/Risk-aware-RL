@@ -1304,3 +1304,14 @@
 - 随后用持久化eval-only重新评估raw-QR 600k final checkpoint，job正常`exit 0`。reward=`.86576`、outage=`36/140=.25714`、hard/smooth CDF=`.26786/.27331`、mean cost=`11.75714`及crossing=`.05737`均复现旧评估，说明新增只读诊断没有改变策略、环境随机流或既有指标。
 - raw critic的hard Brier/AUC/BSS为`.20282/.51976/-6.18%`，smooth为`.20173/.52399/-5.61%`。总体hard CDF只比truth高`.01071`，但逐轨迹排序仅略高于随机且proper score劣于经验基率常数预测；这确认“总体CDF点准确”不能证明actor拿到了可用的action-risk方向。
 - 该raw结果固定为C-H1W独立140门的正式对照。下一条训练只加入`cost_history_mode=cost_lstm`，W&B使用脱敏online；若history和独立Brier/AUC联合门失败，则不做fresh520、不扫hidden/TBPTT/LR。
+
+### E102：C-H1W 600k结果——history含排序信号，但当前recurrent critic严重同批过拟合（2026-07-17）
+
+- 正式持久化job绑定提交`62fd422`并正常`exit 0`；W&B online run为`a6w3kp7i`，30行history完整到600k，纯训练`281.35s`。远端117个config键未发现绝对路径或敏感键，name/group/tags只含公开算法语义；完结后文件列表仅`config.yaml/output.log/wandb-summary.json`，无源码、Git、requirements或machine metadata。
+- 公平性检查严格通过：30批的env step、iteration、trajectory数、四项reward统计、reward quantile、outage、两种cost mean、逐步reward/cost及budget max/mean/min等16列逐元素exact，最大绝对差均为0。独立140条reward/outage也逐位相同，所以所有critic差异都来自`raw→cost_lstm`，不是policy、环境或RNG漂移。
+- 末5批prequential结果明确失败。raw→cost-LSTM的pre-CDF error为`.10656→.14031`，恶化31.67%；pre-Brier为`.23253→.32103`，恶化38.06%；聚合mean-cost bias为`.18675→1.03960`，也越过≤1.0门。相反，同一B20训练后的post-CDF error为`.03750→.03625`，只改善3.33%，post-Brier却从`.20023→.05465`，表面改善72.71%。这组pre/post反差直接证明LSTM在当前批上拟合很好、到下一独立批泛化很差。
+- 优化诊断支持同一解释：末5批crossing从raw的`.04581`升到`.25516`，gradient clipping fraction从`.20`升到`1.00`。候选前5批到末5批的pre-CDF error改善10.20%，但pre-Brier反而恶化31.84%，方向不一致；因此不满足1.2M长度审计条件，不能把问题归因于单纯训练不足。
+- 独立140条显示history并非完全无信息。hard/smooth AUC从`.51976/.52404`升到`.59014/.58894`，绝对增加`.07038/.06490`；但hard/smooth Brier从`.20282/.20174`恶化到`.28636/.26496`，增加41.19%/31.34%，BSS从`-6.18%/-5.61%`降到`-49.91%/-38.71%`。mean-cost error由`.77573→1.17272`，crossing由`.05737→.26751`。排序略有提升不能抵消概率校准、均值和单调性的全面失败。
+- E100的history门、hard/smooth独立联合门、mean error门、crossing门及持续改善门全部失败。严格裁决为：不做fresh520、不跑1.2M、不进入live PID，也不盲扫hidden/TBPTT/LR。旧C-H1的“history无用”结论需修正为：history可能补充policy hidden信息，但现有`B20×20 update`的recurrent优化无法泛化。
+- 下一步先做零训练开销工程审计：比较raw/LSTM的pre-clip grad norm、loss、参数量、TBPTT状态边界和输入尺度。若没有接线bug，再从三条分歧路线中各做单变量轻量验证：①降低recurrent critic LR/控制有效步长；②用跨rollout replay或留出批做early-stop，直接约束prequential泛化；③增加独立trajectory数而不增加同批update。不能直接把cost-LSTM装进live网络，也不能用同批post-Brier选择checkpoint。
+- 正式表、机械门和图位于`_runs/profiles/dqc_frozen_raw_vs_ch1w_costlstm_600k_2026-07-17/`：`gate_summary.csv`、`gate_decision.json`、`paired_history.csv`、`history_generalization.png`及独立评估比较图；完整W&B导出位于`_runs/wandb_export/dqc_frozen_ch1w_costlstm_qr32_600k_2026-07-17/`。
