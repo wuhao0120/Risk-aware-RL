@@ -432,6 +432,11 @@ def main():
         k, v = kv.split('=', 1)
         overrides[k] = cast(v)
         setattr(args, k, overrides[k])
+    # wandb 已在模块导入阶段加载；只在这里修改 WANDB_MODE 环境变量时，
+    # SDK 0.18.x 可能沿用已经缓存的 online setup。把 CLI 值同时保存在
+    # args，VecAgentBase 会显式传给 wandb.Settings，保证 eval-only 的
+    # disabled 模式不会意外创建远端 run。该字段只控制日志，不进入算法。
+    args.wandb_mode = cli.wandb_mode
     # theta_lr0 便捷覆盖 (按最终 theta_b/c 重算 theta_a)
     if 'theta_lr0' in overrides:
         args.theta_a = (args.theta_b ** args.theta_c) * float(overrides['theta_lr0'])

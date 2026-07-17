@@ -157,7 +157,16 @@ class VecAgentBase(object):
         # W&B默认会采集host、username、Git remote/commit、代码和system stats。
         # 本项目只需要训练指标与公开超参；关闭机器元数据既减少隐私暴露，也不
         # 改变wandb.log的训练曲线。GPU/CPU资源仍由本地nvidia-smi/作业日志监控。
+        # run_experiment.py 在 wandb 被 import 后才解析 CLI；仅修改环境变量
+        # 对 W&B 0.18.x 的全局 setup 不总是生效。显式 settings.mode 才能
+        # 保证 eval-only/测试的 disabled 模式不创建远端 run。其它入口没有
+        # wandb_mode 字段时仍回退到环境变量，保持既有启动方式兼容。
+        wandb_mode = (
+            getattr(args, 'wandb_mode', None)
+            or os.environ.get('WANDB_MODE')
+            or None)
         wandb_settings = wandb.Settings(
+            mode=wandb_mode,
             _disable_machine_info=True,
             _disable_meta=True,
             _disable_stats=True,
