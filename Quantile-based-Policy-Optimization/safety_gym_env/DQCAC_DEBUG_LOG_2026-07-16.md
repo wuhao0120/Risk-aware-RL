@@ -1228,3 +1228,10 @@
 - 下一步优先级据此调整：不实现单纯checkpoint accept/reject guard，也不继续扫固定PID target。先用既有三seed history做零训练开销的prequential校准审计，判断`truth-CDF`的符号和持续时间；若符号具有可预测性，预注册默认关闭的“校准偏差EMA→自适应PID安全余量”单变量路线。若符号不可预测，则转向限制单次联合更新幅度或critic跨rollout验证，而不把噪声直接反馈进PID。
 - 新增可复用工具`compare_eval_snapshots.py`，统一生成单组reward/Wilson区间、Welch/Newcombe差值区间、CDF/Brier/BSS/mean-cost统计及四面板图。正式结果位于`_runs/profiles/dqc_pm9_pre_post_seed0_1m_2026-07-17/`：`comparison.csv`、`statistics.json`与`comparison.png`（`2775×1895`，PIL解码与目视检查通过）。工具和本地文件不向W&B上传路径。
 - 用户再次明确：正式训练允许并应使用W&B在线监控。后续run默认online；run name/group/tags/config只含环境、算法、seed和公开超参数，继续过滤绝对路径、用户名、机器信息、凭据和源码。offline只用于真实断网兜底，不再因一般隐私顾虑默认启用。
+
+### E93：P-M8三种子prequential校准偏差审计预注册（2026-07-17）
+
+- 数据冻结为P-M8 seed0/1/2的既有1M `combined_history.csv`，不新增训练。每两个连续B20 rollout按真实`pid_update_interval=2`聚合成一个B40控制事件；偏差定义为`u=pre-update truth outage - pre-update CDF`，`u>0`表示critic低估风险。post-update CDF不得充当因果预测输入。
+- 主审计区间为`400k--1M`，稳健性区间为`600k--1M`。同时报告逐seed与去除seed均值后的pooled lag-1相关、连续事件同号率、单侧二项检验、last-value与因果EMA预测误差。EMA固定`tau=0.2`，预测事件t时只能使用t之前的偏差，不能偷看当前truth。
+- 只有四项同时成立，才允许实现“校准偏差EMA→自适应PID target”：pooled lag-1相关`>0.25`；同号率`≥0.65`且单侧`p<0.10`；EMA一步MAE相对永远预测零偏差至少改善10%；EMA改善在至少2/3 seed同方向。门槛失败则直接否决这条反馈路线，避免把白噪声放进PID。
+- 本审计预计低于1分钟，不使用GPU、不创建W&B run。输出只写`/vepfs`下本地profile；分析工具若新增必须可复用，使用完的`/tmp`预览与回归文件立即清理。

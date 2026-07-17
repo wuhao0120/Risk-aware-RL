@@ -1645,3 +1645,9 @@ critic退化比策略比例变化更强。pre的hard/smooth CDF error只有0.010
 这仍不是“把critic update从20直接降到10”的充分证据。早期固定策略C10→C20曾改善underfit，而本次暴露的是late live-policy的跨批泛化与联合更新幅度；全局减少update可能重新造成underfit。下一步先审计现有三seed的prequential`truth-CDF`偏差是否在多个事件上有持续符号。如果偏差可预测，就只加入一个默认关闭的自适应安全余量：用更新前CDF的校准偏差EMA，在critic低估时降低PID target、在高估时提高target，并做范围限制；如果偏差近似白噪声，就不反馈给PID，转向跨rollout validation或受控actor step。两条路线均先预注册、轻量机制验证，再决定是否完整1M。
 
 复现实验统计不再依赖一次性脚本。`compare_eval_snapshots.py`读取两份评估JSON，输出统一CSV、JSON和四面板图；P-M9结果保存在`_runs/profiles/dqc_pm9_pre_post_seed0_1m_2026-07-17/`。正式训练继续持久化后台并使用脱敏W&B online：只公开算法语义与数值指标，不公开绝对路径、机器元数据、凭据或源码；offline仅作断网恢复。
+
+### 13.79 自适应安全余量先做可预测性审计（2026-07-17）
+
+“critic低估时让PID更保守、critic高估时让PID更宽松”在直觉上能连接P-M8和P-M9，但它只有在校准偏差具有时间持续性时才成立。如果本批偏差不能预测下一控制事件，把它做成target调节只会向现有PID再注入一层B40采样噪声。因此先冻结已有三seed history做零训练开销审计，而不是直接实现并跑1M。
+
+两个B20聚合为一个真实B40控制事件，使用更新前CDF与随后已观察到的完整trajectory truth定义`u=truth-CDF`。主区间固定400k--1M，600k--1M作稳健性检查；EMA系数固定0.2且严格因果。晋级要求lag-1相关大于0.25、连续同号率至少65%且单侧p<0.10、EMA一步MAE比零偏差基线至少低10%，并且至少2/3 seed同方向。任一关键条件失败就否决自适应PID偏差反馈，下一路线转向不依赖可预测偏差的受控联合更新或跨rollout验证。
