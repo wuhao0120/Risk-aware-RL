@@ -1792,3 +1792,21 @@
 - C-H16严格复用C-H14的rho1，只把reference从ema改为batch；这是单一尺度时序消融，不改rho、PID、B40、网络、critic、PPO或LR。选择rho1而不是事后拟合rho=.67，是因为它把C-H14后段实际比约1.40降低并固定到1.00，同时略高于C-H15的后段实际均值.884；两个既有端点的真实outage位于.135和.232，故该强度有合理机会落在0.20附近。
 - 正式仍用seed1、B40×25×T1000=1M、C20/A8、持久化后台和脱敏W&B online；预计纯训练7分钟、内部128为1--2分钟，宽screen为reward≥.60、outage在.05--.40且全部有限，通过才做fresh512约3--4分钟。机制硬门是每个Actor事件实际比与1的误差小于`1e-3`；若floor/max触发则必须显式报告，不能假装精确。
 - 性能仍先要求fresh outage点估计进入`[.18,.22]`，再要求reward至少`.79542`，目标不低于`.81951`。通过后扩seed0/2；若精确比仍出现跨带周期或终点失败，则优先controller--actor同步，而不是继续无界扫描rho。保留的分歧路线包括EMA-rho=.75有界插值和B80独立trajectory增量，但前者受本次已观察的增益漂移污染，后者同时改变更新时钟，均不与C-H16混合。
+
+
+### E153：C-H16 batch-reference rho1——训练周期显著收缩，但fresh策略仍过度保守（2026-07-17）
+
+- 正式job `DQCAC_DynamicButton_ch16_mcbalance_batchref_rho1_b40_1m_s1`绑定提交`ba44093`，持久化后台正常exit0；W&B run为`5x6gm1nz`且finished。相对C-H14只把`cost_actor_mc_balance_reference=ema→batch`，rho仍为1；B40×25×T1000=1M、C20/A8、LSTM512、QR32/MC、mean-anchor、obs RMS、GAE-PPO、PID target=.15及所有LR不变。纯训练`404.1s`。
+- 机制硬门远超通过：25个Actor事件的`correction_std/critic_std`范围`[.99999994,1.00000012]`，最大绝对误差`1.19e-7`；首epoch behavior IS ratio误差约`1e-5`，没有floor/max异常、NaN或OOM。名义rho与当前批实际相对贡献终于一致。
+- 稳定性得到真实改善。48--76万步的8批outage都在`[.175,.225]`；最后5批均值/标准差为`.235/.03391`，相对EMA-rho1的`.220/.09925`和EMA-rho.5的`.215/.11247`，波动标准差降低约66%--70%。最后一次outage为.175而非单向发散。batch reference因此是有用的减振组件，不因最终性能失败而撤销。
+- 内置128为reward/outage `.7947/.1172`；按宽screen完成fresh512后为`.75667/83÷512=.16211`。outage Wilson95为`[.13272,.19653]`，点估计低于`[.18,.22]`；reward95%为`[.72520,.78813]`，上界仍低于目标`.79542`。所以严格裁决是`reject_overconservative_but_stabilizing`。
+- 相对rho0基线，reward差`-.06284`的Welch95为`[-.11158,-.01410]`，outage差`-.08789`的Newcombe95为`[-.13694,-.03841]`；两项交换都明确。相对EMA-rho1，batch-reference reward提高`.05375`，区间`[.00102,.10647]`，outage增加`.02734`但区间跨0；它在相同rho下减少过度保守并提高reward，却仍未到目标前沿。
+- fresh critic hard-CDF为`.11005`、truth为`.16211`，absolute error`.05206`；Brier/AUC/BSS为`.13933/.5464/-2.57%`，predicted/true mean cost为`6.059/7.525`。它相对rho0的CDF、Brier和mean error分别改善45.5%、29.8%、57.6%，但BSS仍负且AUC偏低，不能宣称条件风险排序已解决。
+- C-H16失败后不能把`controller--Actor同步`写成未测试路线：P-M8已完整实现cadence2并跑三seed，只有seed1 fresh520达到`.870/.198`，seed0/2为`.896/.327`和`.814/.225`；P-M9 target=.10与P-M10 window100也分别完成并暴露reward代价。下一条应针对当前batch-reference的过保守setpoint做单变量校准，不重复旧实验。
+
+### E154：C-H17 PID target=.175预注册——把工程安全余量从.05减到.025（2026-07-17）
+
+- C-H17严格复用C-H16，仅将`pid_target_prob=.15→.175`；真实chance constraint、评估alpha和critic查询阈值始终保持.20，`pid_safety_margin`相应从.05变为.025。batch-reference、rho1、B40、网络、QR、PPO、critic更新和所有PID增益不变。它检验的是控制工作点，不是再次改变trajectory risk credit。
+- 选择.175而非直接.20，是因为C-H16 fresh outage为.162，距双侧带下界.18约.018；一次减半安全余量是有界校准，保留约.025补偿训练--fresh分布差。历史P-M1也预先记录过.175作为过保守时的路线；这不是从无界网格中挑值。
+- 仍用seed1、B40×25×T1000=1M和持久化脱敏W&B online；预计纯训练约7分钟、内部128为1--2分钟，reward≥.60且outage在.05--.40才做fresh512约3--4分钟。机制门要求实际修正/critic比继续在`1±1e-3`、日志PID target准确为.175、IS ratio和数值健康。
+- 性能门不变：fresh outage点估计进入`[.18,.22]`后，reward至少`.79542`，目标不低于`.81951`；outage更低不加分。若通过，立即扩seed0/2而不是继续在seed1调target。若仍低于.18，才把target=.20作为一条预先记录的最后边界校准；若高于.22，则.175方向过强，停止setpoint插值。若进带但reward仍低于.795，则说明该trajectory residual主要沿既有前沿换安全，下一步转P-M8与batch residual的正交组合或重新设计状态动作credit，不用更多PID小数点掩盖前沿未提升。
