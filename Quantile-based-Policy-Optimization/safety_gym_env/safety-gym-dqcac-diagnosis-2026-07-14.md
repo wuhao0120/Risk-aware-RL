@@ -1851,3 +1851,9 @@ C-H6L最终证明“共享梯度确实接通”和“共享梯度有益”是两
 代价是reward初始化敏感性明显增大。seed0/1 reward约0.905/0.996，seed2只有0.628；对应outage又从0.215/0.227降到0.166。它不是所有seed都沿同一Pareto前沿平移，而是把seed2推到低reward安全盆地。虽然hard AUC三seed稳定为`0.579±0.007`，条件风险排序不再像独立cost-LSTM那样反向，critic仍不足以保证策略闭环收敛到同一个工作点。
 
 因此该组合值得保留为新的cost表示基线，但不直接扩5M。下一实验加入P-M8已经独立验证的Actor/PID同频cadence：critic仍逐B20学习，Actor与PID每两批在B40边界共同响应。若它能让seed0保持安全并把seed2 reward恢复到0.75以上，才说明“更好表示+低噪声控制时序”具有互补性；否则回到梯度冲突门控、adapter或跨rollout held-out，而不是继续扫描固定PID target。
+
+### 13.105 低频actor不能只合并旧概率，还必须合并条件风险所用的history feature（2026-07-17）
+
+把actor从每个B20更新改为每两个rollout的B40更新时，固定behavior `old_log_prob`和用PPO ratio/clip修正仍然必要，但对recurrent DQCAC还不充分。cost actor advantage查询的是`Z_c(s,h,a)`；若states/actions按time-major环境维合并，而保存的actor hidden直接按rollout维拼接，则概率分母可以正确，风险权重仍会绑定到错误history，产生一种不会被ratio诊断发现的监督错位。
+
+本次适配把detached actor feature与state/action使用同一个`[T,B,*]→cat(B)→flatten`映射，并显式拒绝shape、宽度或梯度所有权错误。纯张量顺序测试和B2/T32完整smoke均通过；smoke中2次Actor事件和2次PID事件严格对齐，首次PPO ratio误差仅`9.54e-7`。因此正式C-H7C若失败，可以归因于“更好cost表示+同频cadence”本身，而不是漏存当前策略概率或history错位。

@@ -1505,3 +1505,11 @@
 - 机制门：25个Actor事件与25个PID事件一一对应，每次Actor batch=40条；首epochratio误差≤`1e-3`，无NaN/Inf；末200k outage或lambda标准差相对E121同seed下降至少20%，或至少不再出现更大的闭环周期。Brier/AUC不能相对E121恶化10%以上，mean/crossing透明报告。
 - 若seed0安全但seed2仍低reward，说明cadence不能解决策略盆地/初始化方差，停止该组合并转cost-gradient conflict/adapter或held-out replay；若seed2恢复reward但seed0不安全，说明主要缺口仍是risk guard/PID而非表示。只有两条同时通过才运行seed1并以三seedmean±SD裁决。
 - 正式job为`DQCAC_DynamicButton_ch7c_actorfeature_meananchor_cadence2_b20_1m_s0/s2`，W&B online名称、group和tags只含公开算法语义，CLI tag与checkpoint目录均唯一。两条使用`launch_background.sh`持久化；预计并行训练加内置评估约10--14分钟，条件fresh512再约7--9分钟。
+
+### E123：C-H7C构造保护与actor-feature cadence适配（2026-07-17）
+
+- 两条正式任务第一次启动后均在agent构造阶段主动`exit 1`：旧安全检查只允许`actor_update_interval>1`与`MC/raw`组合，seed0/2分别创建了W&B失败run `cndfioye/2k0olnwh`，但没有创建环境训练批、checkpoint或任何性能数据。该事件是工程接线缺失，不是算法负结果，也没有消耗1M训练预算。
+- 审计确认多rollout cadence已有states/actions/old-log-prob/GAE和预抽baseline action的time-major合并，但没有携带`actor_feature`。新适配只在`cost_history_mode=actor_feature`时把每条rollout保存的detached `[T*B,H]`恢复为`[T,B,H]`，沿环境维拼接后重新flatten；同时校验shape、feature宽度和`requires_grad=False`。若直接沿flatten维拼接，会把第二条rollout的`t0`放到第一条rollout的`t1`之后，与merged state/action错位，因此不能只放宽构造检查。
+- 纯张量测试用`T=2,B=2`验证合并顺序精确为`t0:[rollout1 envs, rollout2 envs], t1:[...]`，`states`与`cost_feature`逐位对齐；默认raw分支不生成feature字段，detach防护也按预期拒绝错误输入。源码语法和`git diff --check`通过，默认raw执行路径没有改变。
+- 持久化W&B-disabled完整smoke使用B2、T32、4 rollout、C2/A2、Actor/PID interval2并正常`exit 0`，训练9.5秒。最终checkpoint报告actor/PID事件均为2、每次均合并4条轨迹、缓存余数均为0；首epoch ratio最大误差`9.54e-7`、末KL `3.83e-5`、clip fraction 0，无NaN/Inf。它证明behavior probability、feature对齐与同频事件接线正常，但256环境步不作为性能证据。
+- 正式seed0/2将使用唯一`v2` job/name/tag从头重跑，配置与E122完全相同；以既有实测预计每条1M训练加内置评估约7--10分钟，随后条件fresh512约4--5分钟。失败的远端run保留为可审计工程记录，不与正式结果合并。

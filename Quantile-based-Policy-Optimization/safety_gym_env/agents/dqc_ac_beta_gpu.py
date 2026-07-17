@@ -626,16 +626,20 @@ class DQCACBetaGPU(VecAgentBase):
                 raise ValueError(
                     "cost_actor_query_mode='preupdate' currently requires s0_aux=0 and full-batch")
 
-        # 首个 actor-interval 消融只开放已经完整验证的 P-M3 recurrent/GAE-PPO/
-        # MC/raw/online 路径。两个 rollout 的 behavior actor、log-prob 分母和 obs RMS
-        # 必须完全相同，才能把合并 batch 仍称为 on-policy；其它组合先显式拒绝。
+        # 首个 actor-interval 消融只开放已经完整验证的 recurrent/GAE-PPO/
+        # MC/online 路径。raw 与 actor_feature 都能在 rollout 中保存完整监督输入；
+        # 两个 rollout 的 behavior actor、log-prob 分母和 obs RMS 必须完全相同，
+        # 才能把合并 batch 仍称为 on-policy；其它 history 模式先显式拒绝。
         if self.actor_update_interval > 1 and not self.freeze_policy_updates:
             if not self.recurrent_policy or self.reward_actor_mode != 'gae_ppo':
                 raise ValueError(
                     "actor_update_interval>1 currently requires recurrent gae_ppo")
-            if self.cost_target_mode != 'mc' or self.cost_history_mode != 'raw':
+            if self.cost_target_mode != 'mc':
                 raise ValueError(
-                    "actor_update_interval>1 currently requires MC/raw cost supervision")
+                    "actor_update_interval>1 currently requires MC cost supervision")
+            if self.cost_history_mode not in {'raw', 'actor_feature'}:
+                raise ValueError(
+                    "actor_update_interval>1 currently supports raw or actor_feature history")
             if self.cost_actor_query_mode != 'online' or self.cost_s0_aux_coef > 0.0:
                 raise ValueError(
                     "actor_update_interval>1 currently requires online query and s0_aux=0")
@@ -1363,6 +1367,38 @@ class DQCACBetaGPU(VecAgentBase):
             combined = torch.cat(tensors, dim=1)
             merged[key] = combined.reshape(
                 T * merged['_actor_num_envs'], *combined.shape[2:])
+
+        # actor_feature 是每个 transition 对应的 detached recurrent feature，必须与
+        # states/actions 使用完全相同的 time-major 还原与环境维拼接。直接把两个
+        # [T*B,H] 张量沿 dim=0 拼起来会形成 rollout-major 顺序，而 merged states
+        # 是 [t0:B1+B2, t1:B1+B2, ...]，最终把 cost CDF 查询配到错误的历史上。
+        if self.cost_history_mode == 'actor_feature':
+            feature_batches = []
+            feature_width = None
+            for entry in batches:
+                if 'cost_feature' not in entry:
+                    raise KeyError(
+                        "actor_feature cadence merge requires rollout cost_feature")
+                value = entry['cost_feature']
+                if value.ndim != 2 or value.shape[0] != T * B:
+                    raise ValueError(
+                        "rollout cost_feature must have shape [T*num_envs, feature_dim]")
+                if value.requires_grad:
+                    raise ValueError(
+                        "rollout cost_feature must be detached from the behavior actor")
+                if feature_width is None:
+                    feature_width = value.shape[1]
+                elif value.shape[1] != feature_width:
+                    raise ValueError(
+                        "all cached rollouts must use the same cost_feature width")
+                feature_batches.append(value.reshape(T, B, feature_width))
+
+            combined_features = torch.cat(feature_batches, dim=1).reshape(
+                T * merged['_actor_num_envs'], feature_width)
+            # cost_feature 是 update_actor 的正式接口；actor_feature 保留同一张量别名，
+            # 便于诊断代码明确知道该输入来自 behavior actor，而不复制显存。
+            merged['cost_feature'] = combined_features
+            merged['actor_feature'] = combined_features
 
         baseline_actions = [
             entry['_actor_baseline_actions'].reshape(
