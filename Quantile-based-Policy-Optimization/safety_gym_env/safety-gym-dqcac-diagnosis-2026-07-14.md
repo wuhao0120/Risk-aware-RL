@@ -1915,3 +1915,15 @@ C-H9R的工程实现完全按设计运行：首轮无旧批，此后每个cost s
 guard在每轮开始保存cost head及其独立Adam槽。越过5%+0.002容忍带后，当前坏step的cost权重和动量一起回滚；reward critic参数/Adam不回滚。后续step仍反传cost并参与joint gradient clipping，随后把cost grad设为None，因此reward的裁剪尺度与原双critic路径一致，而PyTorch Adam会完全跳过cost参数。默认关闭60张量逐位回归、T32启用smoke、T1000高LR强制rollback和纯张量Adam状态测试共同覆盖这条作用链。
 
 正式实验只在C-H8 B40 seed2上打开guard。关键判据不是同一个旧批Brier能否下降，而是下一rollout的prequential Brier和fresh512安全性是否改善；否则它只是保存已见样本、没有解决新trajectory校准。通过门及耗时预算详见调试账本E131。
+
+### 13.113 retention guard解决了遗忘，却把闭环推向低reward安全盆地（2026-07-17）
+
+C-H10G证明上一rollout确实可以用于选择cost-critic更新位置。24个有效事件中9次提前停止、21次恢复历史最优状态，最终选择的更新步均值为6.875；只有3次选择step0，实际训练也平均执行了17.08个cost step，所以结果不是“cost critic根本没训练”。PPO的behavior probability仍来自当前批固定old log-prob，ratio误差最大`1.53e-5`；旧批只做critic验证，不需要第二套policy importance ratio。
+
+它对总体概率校准非常有效。fresh512的critic outage预测为0.142，真实为0.141；hard CDF error相对无guard下降97.9%，Brier下降28.1%，mean-cost误差从1.431降到0.956，crossing也从0.157降到0.124。若只看这些指标，会误以为critic问题已经解决。
+
+但条件风险方向没有变好。AUC从0.594降到0.536，Brier Skill仍为负；训练末5批pre-Brier还从0.158升到0.169，mean-cost低估由约1.21扩大到2.77。guard擅长保存上一批已经学过的总体关系，却没有提供区分当前状态/动作风险的新监督，因此不能把“基率对准”转换为更准确的actor risk advantage。
+
+闭环结果是显著的安全--收益交换。fresh512 reward从0.745降到0.579，差值95%区间为`[-0.228,-0.104]`；outage从0.215降到0.141，差值区间为`[-0.121,-0.027]`。两项变化都有统计把握。它不是无效机制，而是优化了错误的单一目标：把策略稳定推到更保守盆地，却远离DQCAC应达到的高reward Pareto区域。
+
+因此不扩seed，也不扫描guard容忍带。当前主要瓶颈已经从“多epoch off-policy”“输入未归一化”“网络没有LSTM”“quantile数量不够”收敛为更具体的问题：action-conditioned cost critic缺乏稳定且有区分力的跨策略监督，现有控制器会放大其基率/排序误差。下一步应隔离cost与reward/PPO表示冲突：先用小adapter并记录梯度cosine，必要时做PCGrad；另一条独立消融是QCPO_refs式Weibull低维尾部辅助。只有同时改善fresh reward、outage和AUC的组件才晋级，多加quantile或继续调PID都不是当前首选。
