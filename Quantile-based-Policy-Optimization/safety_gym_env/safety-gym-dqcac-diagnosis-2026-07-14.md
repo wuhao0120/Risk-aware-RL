@@ -1831,3 +1831,15 @@ QCPO_refs稳定性的关键候选不是“用了LSTM”这一表面结构，而�
 当前新增默认关闭的共享cost辅助目标：DQCAC仍保留理论所需的action-conditioned cost head，但在actor PPO/value epoch中固定该head，只让QCPO_refs单位和归约下的QR+可选mean loss回传actor body/LSTM。两个optimizer继续拥有互斥参数，behavior log-prob在全部PPO epoch固定，feature在actor step后才标记并刷新；这既借用共享多任务表示，又不把DQCAC偷换为state-only QCPO。
 
 默认关闭的60个checkpoint张量逐位回归通过；手算loss逐位一致，feature梯度非零而cost-head梯度为None；全尺寸4k smoke无非有限值，ratio/KL/clip健康。下一裁决是paired seed1 1M：同一个actor-feature+mean-anchor head下只切换共享系数0/1，并用prequential指标和fresh520 reward/outage决定是否扩多seed。详细参数、门槛和耗时估计见调试账本E118–E119。
+
+### 13.103 共享cost梯度带来reward信号，但没有带来可接受的风险性能（2026-07-17）
+
+C-H6L最终证明“共享梯度确实接通”和“共享梯度有益”是两件不同的事。coef1在全部50批都有非零共享loss与body/LSTM梯度，cost head从未被actor optimizer写梯度；每批9次feature刷新、PPO首epochratio误差不超过`2.31e-5`，排除了detach、optimizer重复所有权和多epoch behavior probability接错。该实现不是空操作，也不是off-policy bug。
+
+训练末10批reward从coef0的0.749提高到coef1的0.782，fresh512又从0.996提高到1.068，说明共享cost监督可能给了表示一定的任务信号。但收益只有7.2%，没有达到预注册的10%，且安全代价更大：outage从0.227升到0.295，增加6.8个百分点。hard Brier从0.180升到0.236、AUC从0.571降到0.542；smooth指标方向相同。crossing虽从0.216降到0.163，但单调性改善不能替代条件概率校准。
+
+更重要的是，这不是简单把λ调大就能消除的观测误差。共享版真实mean cost为11.592，critic预测mean只有9.057；它学到的风险概率对outage轨迹与safe轨迹的区分差距更小，PID因而面对一个更危险但仍被critic低估的策略。末5批prequential Brier虽改善11.6%，CDF误差却恶化19.8%，mean bias绝对值扩大到2.67。训练内局部好转没有迁移为fresh安全性。
+
+因此QCPO_refs的共享结构不能机械移植为“把DQCAC的32点action-conditioned QR loss加到PPO backbone”。reference的cost quantile、mean和Weibull head在state/history层面共同约束表示；DQCAC的risk advantage则要求action-conditioned条件分布，QR目标噪声和PPO/reward目标会直接竞争同一LSTM。当前最符合证据的解释是负迁移，而不是共享系数太小、训练太短或IS修正缺失。
+
+后续不把coef1扩到多seed，也不立即扫描0.1/0.25/2.0。优先把两件事解耦：保留detach actor feature作为主cost head输入，再用跨rollout held-out/replay约束其泛化；若仍需cost更新共享表示，只给一个小adapter，或用PCGrad/梯度余弦门控去掉与PPO/value冲突的分量。另一条独立路线是先检验Weibull tail是否能提供比全32点QR更低方差的共享辅助监督。每条都必须先过prequential Brier/AUC和fresh outage门，不能因训练reward上升就晋级。
