@@ -1703,3 +1703,11 @@ critic在最后更新后仍明显退化：hard/smooth CDF error约增加1.28/1.6
 为避免再次把表示变化和闭环路径混在一起，先固定P-M3 seed1成熟policy，用seed101收集与既有raw-QR 600k完全相同的30批轨迹。候选只把raw换成cost-LSTM，MC、time weight、QR32、C20和全部优化参数不变。只有逐批truth严格配对、prequential校准和独立Brier/AUC联合通过，才做fresh520并考虑live；否则停止，不扫hidden和LR。
 
 本轮同时补充hard/smooth Brier Skill、ROC-AUC、预测分离度与概率方差。Brier检验概率误差，AUC检验outage与safe轨迹的排序；两者必须联合，防止总体CDF均值看起来准确但action-risk没有分辨力。正式训练预计9--11分钟并使用脱敏W&B online。
+
+### 13.86 raw critic的总体CDF准确掩盖了近随机风险排序（2026-07-17）
+
+新增指标先通过合成数据和SciPy平均秩交叉验证，再在既有raw-QR 600k checkpoint上做140回合持久化复现。reward、outage、CDF、mean cost和crossing均与旧评估一致，排除了诊断代码改变随机流或行为的可能。
+
+raw critic的hard CDF为0.26786，truth为0.25714，若只看总体误差会认为它已经很准。但hard/smooth ROC-AUC只有0.5198/0.5240，Brier Skill为-6.18%/-5.61%；换言之，它几乎不能把真正outage轨迹排在safe轨迹之前，概率误差还不如始终预测同一经验基率。DQCAC的actor需要的是不同state/action/history之间的风险方向，而不只是全体样本平均风险。因此这组结果把当前瓶颈进一步定位为条件风险表示与泛化，而不是继续微调scalar PID就能解决。
+
+C-H1W将以这些数值作为冻结policy的正式对照，只改变cost critic是否看到policy hidden所需的因果历史。若cost-LSTM不能同时改善prequential误差、独立Brier与AUC，就不进入live闭环；若能改善，才值得把公平MLP+LSTM结构带回DQCAC主线。

@@ -1297,3 +1297,10 @@
 - raw基线末5批pre-CDF error/Brier为`.10656/.23253`，post为`.03750/.20023`，pre predicted/true mean为`13.2968/13.1100`。候选600k screen要求：末5批pre的CDF error至少改善20%或Brier至少改善10%，另一项不得恶化10%，mean-cost absolute bias不超过1.0；独立140条的hard或smooth Brier至少改善10%且AUC至少提高.03，或Brier改善20%且AUC不得下降超过.02，mean-cost error≤0.90、crossing≤0.10。
 - 只有history screen与独立140同时通过才对raw/cost-LSTM做统一fresh520；fresh门沿用Brier至少改善10%与AUC至少提高.03（或Brier改善20%且AUC不退化）的联合证据。若末5批仍相对前5批改善超过10%且方向一致，可预注册一次1.2M长度审计；否则不扫LSTM hidden、TBPTT或LR，也不进入live P-M8/P-M10。
 - 预计单条纯训练7--9分钟、140评估约1--2分钟，总墙钟9--11分钟。正式run使用持久化后台与脱敏W&B online，checkpoint、history和分析产物均写`/vepfs`。
+
+### E101：C-H1W训练前判别指标基线验证（2026-07-17）
+
+- 新增二分类概率指标先通过合成数据边界测试：perfect/constant/inverted预测的ROC-AUC精确为`1/.5/0`，单类别为`NaN`；含重复score的Mann--Whitney平均秩实现与`scipy.stats.rankdata`逐位一致。语法、diff与旧hard-Brier兼容字段检查均通过。
+- 随后用持久化eval-only重新评估raw-QR 600k final checkpoint，job正常`exit 0`。reward=`.86576`、outage=`36/140=.25714`、hard/smooth CDF=`.26786/.27331`、mean cost=`11.75714`及crossing=`.05737`均复现旧评估，说明新增只读诊断没有改变策略、环境随机流或既有指标。
+- raw critic的hard Brier/AUC/BSS为`.20282/.51976/-6.18%`，smooth为`.20173/.52399/-5.61%`。总体hard CDF只比truth高`.01071`，但逐轨迹排序仅略高于随机且proper score劣于经验基率常数预测；这确认“总体CDF点准确”不能证明actor拿到了可用的action-risk方向。
+- 该raw结果固定为C-H1W独立140门的正式对照。下一条训练只加入`cost_history_mode=cost_lstm`，W&B使用脱敏online；若history和独立Brier/AUC联合门失败，则不做fresh520、不扫hidden/TBPTT/LR。
