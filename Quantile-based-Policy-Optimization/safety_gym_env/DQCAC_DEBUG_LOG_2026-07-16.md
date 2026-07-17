@@ -1331,3 +1331,20 @@
 - 预注册主门：末5批prequential CDF absolute error或Brier相对raw至少改善20%，另一项不得恶化超过10%，聚合mean-cost bias绝对值不高于1；独立140条要求hard或smooth Brier至少改善10%且对应AUC至少增加0.03，或Brier改善20%且AUC下降不超过0.02，同时mean-cost error不高于0.90、crossing不高于0.10。只有通过才做fresh520并考虑live。
 - 该路线的判别重点不是同批post loss。若AUC保留C-H1W至少一半增益且Brier回到不差于raw，说明“固定共享history+action head”能抑制encoder过拟合；若仍失败，下一项优先把独立cost-LSTM的C20降到C5，直接检验重复更新强度。跨rollout replay/held-out early stop与B40/B80增加独立轨迹保留为独立消融，不能和C5一次混合。
 - 预计纯训练5--8分钟、独立140条评估约1分钟；只用`launch_background.sh`持久化，W&B online名称、group和tags仅包含算法语义，不包含绝对路径或隐私字段。600k失败且末段无一致改善时不延长到1.2M。
+
+### E105：C-H0.5W结果——共享actor hidden降低容量，但没有保留cost排序信号（2026-07-17）
+
+- 正式job绑定提交`39bd4a8`并正常`exit 0`，W&B run为`yx3hfl78`；600k纯训练`239.7s`，完整30行history与140条独立评估均已完成。公开117个config键无secret/path值，上传文件仅`config.yaml/output.log/wandb-summary.json`。
+- raw、cost-LSTM、actor-feature三条的16个行为/truth字段逐值exact，最大差0；独立reward/outage也同为`.865756/.257143`。因此差异只来自cost表示。actor-feature可训练cost head为206,112参数，移除了独立cost-LSTM的2,393,600参数encoder，但仍大于raw head的86,304参数。
+- 末5批pre-CDF error从raw的`.10656`降到`.09469`，只改善11.14%，未过20%门；pre-Brier从`.23253`升到`.24038`，恶化3.38%，聚合mean-cost bias为`1.44556`，越过≤1门。post-CDF/Brier也相对raw恶化18.33%/2.54%，没有“同批和下一批同时改善”的证据。
+- 独立hard CDF为`.24643`，与truth`.25714`的absolute error仍是`.010714`，恰好与raw从另一侧得到的`.010714`相同。smooth CDF均值误差改善约70%，但hard/smooth Brier只改善0.56%/0.34%，AUC反而`.51976/.52404→.51709/.51709`。mean-cost error`.77573→1.52765`，crossing`.05737→.12189`。总体均值碰巧更近不能替代逐状态排序与proper score。
+- 新诊断揭示旧日志严重低估C20优化压力：actor-feature全程/末5批真实20-update裁剪率为`71.17%/74%`，而旧“最后一次是否clip”为`26.67%/20%`。末5批cost grad first/mean/last=`31.69/16.50/9.56`，QR loss在20步内平均只降约17.9%；多数step仍超过clip=10，只是最后一步常回到阈值下。
+- 裁决：所有主门失败，不做fresh520、不跑1.2M、不进live。固定actor hidden由policy/reward目标学习，未保留独立cost-LSTM得到的AUC信号；单纯共享backbone不是自动的公平性收益。下一条只把独立cost-LSTM的C20改为C5，直接验证同批重复更新过强，不给actor-feature继续扫LR或head宽度。
+
+### E106：C-H2U5独立cost-LSTM、5次update冻结600k预注册（2026-07-17）
+
+- C-H1W的独立AUC增益约`.07`证明可训练cost history encoder学到了信号，但C20使post-Brier异常低、pre/独立Brier恶化；C-H0.5W去掉encoder后Brier回到raw附近，却同时失去AUC增益。最小可证伪假设是：需要cost专用history encoder，但每个B20做20次step过强。
+- C-H2U5复用C-H1W全部配置，只将`updates_per_episode=20→5`。P-M3 seed1成熟策略、rollout seed101、B20×30=600k、T1000、MC、risk-discount=.995、QR32、cost-LSTM、LR、chunk2500、policy/obs冻结均不变；30批行为truth必须与三条既有对照exact。
+- 主门不因观察到C20失败而放宽：末5批pre-CDF error至少改善20%或Brier至少改善10%，另一项不得恶化10%，mean bias≤1；独立hard或smooth Brier至少改善10%且AUC至少比raw提高.03，或Brier改善20%且AUC下降不超过.02，同时mean error≤.90、crossing≤.10。只有通过才做fresh520/live。
+- 机制辅助门：相对C-H1W C20，独立Brier至少改善20%，并保留至少一半AUC增益（hard AUC≥`.55495`）；pre与独立方向必须一致。只改善同批post、只降低最后一步grad或只改善总体CDF均值均不算成功。
+- 这不是actor的off-policy修正实验：policy完全冻结；critic对固定监督标签重复拟合无需importance ratio，改变C20→C5是在控制sample reuse与泛化。预计纯训练1.5--2.5分钟、140评估约1分钟，总墙钟3--5分钟；仍用持久化后台和脱敏W&B online。失败后不扫C2/C10，转向跨rollout replay/held-out validation或增加独立trajectory数。

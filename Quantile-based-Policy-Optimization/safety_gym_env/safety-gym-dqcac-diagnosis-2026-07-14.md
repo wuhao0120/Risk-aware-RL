@@ -1735,3 +1735,13 @@ C-H1W完成600k且行为truth与raw对照30批逐元素完全相同。这个控�
 C-H1W已经证明history有信息：独立评估AUC约从0.52升到0.59；它也证明当前实现不能泛化：Brier、mean误差和crossing全面恶化。独立cost-LSTM的可训练cost路径约2.60M参数，是raw路径的30倍，在同一B20上做20次更新，很容易得到漂亮的同批post指标却损害下一批。
 
 下一条C-H0.5W复用成熟actor真正采用的固定LSTM feature，cost head仍显式输入action。这样既保留QCPO_refs共享history backbone的关键条件信息，又去掉约2.39M个会在B20上快速记忆的独立encoder参数。正式冻结600k只改变`cost_history_mode=actor_feature`，以prequential和独立Brier/AUC为门，不用post loss选模型。通过才做live；失败后优先单独比较独立cost-LSTM的C20与C5，再考虑跨rollout replay或增加num_envs。
+
+### 13.90 固定actor hidden没有变成可用的cost-risk表示（2026-07-17）
+
+C-H0.5W与raw/C-H1W的30批行为truth严格一致。它把可训练cost路径从约2.60M降到206k，但独立hard/smooth AUC为0.517/0.517，没有保留cost-LSTM约0.59的排序信号；Brier仅比raw改善0.56%/0.34%，mean误差近乎翻倍，crossing升到0.122。smooth总体CDF均值更准只是聚合校准，不足以驱动actor选择更安全的action。
+
+新增全过程诊断显示，actor-feature末5批20次update中有74%超过clip阈值，而旧日志只因最后一步常降下来而显示20%。first/mean/last梯度约31.69/16.50/9.56。这证明C20的优化压力比此前看到的更强，也解释了为何不能仅凭最后一步gradient或同批post loss判断健康度。
+
+### 13.91 下一步只减cost-LSTM重复更新，不混入其他变量（2026-07-17）
+
+共享actor feature失败不等于history无用：只有独立cost-LSTM把AUC从约0.52提高到0.59。更精确的假设是，cost专用encoder必要，但B20上20次更新使概率尺度和quantile单调性过拟合。C-H2U5保持完整600k数据、网络、LR和时间权重不变，只把每批critic update从20降到5；它不是actor off-policy实验，也不需要importance ratio。只有prequential与独立Brier/AUC同时通过才进入live，否则转向跨rollout replay或增加num_envs，不继续扫描C2/C10。
