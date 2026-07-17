@@ -1757,3 +1757,15 @@ C5的独立Brier比C20改善约27%，但AUC从0.590降到0.393，说明它只是
 ### 13.94 梯度已拆成quantile head与history encoder两部分（2026-07-17）
 
 旧cost norm把206k参数head与2.39M参数encoder合在一起，不能决定应该调哪一部分。现已增加两支current及first/mean/max/last范数；补丁前后短回归的全部checkpoint tensor与评估语义逐项相同。这是纯诊断，不改变clip、Adam或RNG。B40结果将据此决定后续是encoder专用低LR，还是head/QR目标问题。
+
+### 13.95 B40没有解决recurrent critic的跨批泛化（2026-07-17）
+
+B40/C20给出了一个容易被误读的局部改善。末120条trajectory上的下一批更新前CDF误差从raw的0.10656降到0.08620，改善19.1%，mean-cost bias也降到0.920；训练墙钟和显存几乎不变。因此“更大num_envs工程上可行”成立，“增加每次更新的独立样本会改善部分聚合统计”也成立。但这不等于actor所需的条件风险函数更准。
+
+同一checkpoint在严格配对的140条独立轨迹上给出相反结论。hard Brier从raw的0.20282升到0.29003，AUC从0.51976降到0.38074，mean-cost绝对误差从0.77573升到1.15108，crossing从0.05737升到0.19240。AUC低于0.5意味着模型对outage与safe状态的排序在该样本上呈反方向；即便把某个聚合CDF均值调准，这种方向也不能为actor提供可靠的action-risk梯度。
+
+B40也没有比B20/C20 cost-LSTM更好：独立Brier再恶化1.3%，AUC下降0.209。与此同时，同批post-Brier仍能降到0.0965、末段每个内部update都clip，head和history encoder两支梯度都大。最符合全部证据的解释仍是高容量recurrent critic利用最近有限trajectory形成强拟合，但不同rollout上的概率尺度与排序不稳定；问题不能简化为batch太小，也不能简化为encoder学习率单独过高。
+
+因此按预注册门停止B80和更长冻结训练。已有三点已经覆盖更新强度/样本量两轴：B20/C20能学到部分排序但严重失准，B20/C5欠拟合并反向排序，B40/C20仍反向排序。继续插值扫描C10或扩大B80的信息增益很低。下一步应改变尚未验证的机制：分离reward/cost optimizer与clip以消除live训练中的梯度耦合；用真正跨rollout的held-out信号约束cost critic；或使用受cost辅助监督的小型共享history表示。它们必须逐项验证，避免同时改动后无法归因。
+
+本轮还暴露了向量评估口径：B40下请求140条会按4个batch实际得到160条。所有正式网络比较已经改用同checkpoint、B20、严格140条重评；后续应从代码上截断到精确num_eval，并回归保证B20/B40评估语义一致。统一CSV、裁决JSON和图保存在_runs/profiles/dqc_frozen_history_modes_600k_2026-07-17/。

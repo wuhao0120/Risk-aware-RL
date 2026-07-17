@@ -1371,3 +1371,22 @@
 - 新增当前update及rollout内first/mean/max/last两组裁剪前范数：206,112参数cost quantile head与2,393,600参数history encoder。总cost/joint范数、旧末次clip和真实全update clip保持原义；新增计算只读取已有`.grad`，不参与clip或optimizer。
 - 使用同一policy、seed304、B2、2批×3次update的cost-LSTM任务做补丁前后持久化回归，两个final checkpoint全部tensor逐元素相同，差异数0；除checkpoint目录外非tensor状态相同，独立4条评估语义字段相同，两个job均`exit 0`。
 - 因此B40可以安全回答高梯度主要来自head还是encoder。若encoder占主导，后续优先独立encoder LR/正则；若head占主导，优先修正QR尺度/输出结构。不能继续用合并norm猜测。
+
+### E110：B40/C20标准化裁决——批次内改善没有迁移到独立轨迹（2026-07-17）
+
+- 正式冻结策略run为W&B ahmg534z，配置为cost-LSTM、B40、C20、QR32、600k、seed101；15个rollout批次完整、exit 0，纯训练274.7s。相同B20/C20 cost-LSTM需要281.4s，因此在本环境上把num_envs从20增到40几乎没有增加墙钟；显存约1.95GB/80GB，硬件完全可承受B40。
+- 行为控制仍然严格成立：与raw/B20、cost-LSTM/B20及actor-feature/B20的reward、outage、cost与动作统计逐批对应，独立评估行为的reward/outage也完全相同。网络结果不是策略或环境随机路径差异造成的。
+- 末3个B40批次共120条轨迹，更新前CDF绝对误差为0.08620，相对raw末5个B20批次共100条的0.10656改善19.11%；更新前Brier为0.22336，只改善3.94%；mean-cost bias为0.9201。这解释了训练过程中出现的局部正信号，但未达到预注册CDF至少20%或Brier至少10%的主门。
+- 同批更新后Brier降至0.09650，而更新前下一批仍为0.22336；quantile crossing为0.21559，20/20次内部更新在末3批均触发clip。head/history encoder的平均pre-clip norm约为21.55/29.10，两支都大，不支持“只降低history encoder学习率就能解决”的单一解释。
+- B40原训练进程以40个并行环境评估时，num_eval=140被向上取整为160条，不能与既有140条直接比较。随后从同一final checkpoint以B20、严格140条、eval-only重新评估；reward/outage与raw完全相同，分别为0.86576/0.25714。
+- 严格140条上，raw→B40 cost-LSTM的hard Brier为0.20282→0.29003，恶化43.00%；smooth Brier恶化40.97%；hard/smooth AUC为0.51976/0.52404→0.38074/0.37901，下降0.1390/0.1450，已经不是“接近随机”，而是风险排序方向明显反转。mean-cost绝对误差0.77573→1.15108，恶化48.39%；crossing 0.05737→0.19240，增加235.34%。
+- 相对B20/C20 cost-LSTM，B40的独立hard Brier还恶化1.28%，hard AUC下降0.2094。故增加独立trajectory虽改善了训练末段聚合CDF，却没有修复跨轨迹条件风险泛化；按预注册机制门停止B80，不做fresh520、live或1.2M。
+- 当前最重要结论是：history确实含有风险信息，但“独立2.39M recurrent encoder + 同一批QR目标重复强优化”没有稳定把信息转成校准概率。C20/B20得到AUC约0.59但概率失准，C5欠拟合且AUC约0.39，C20/B40同样发生排序反转。下一阶段不再扫batch/epoch，而优先验证优化耦合和跨批泛化机制。
+
+### E111：五候选统一证据包、W&B隐私与下一路线（2026-07-17）
+
+- 统一数据位于_runs/profiles/dqc_frozen_history_modes_600k_2026-07-17/：independent_eval140_comparison.csv、prequential_tail_comparison.csv、history_curves.csv、decision.json和六面板comparison.png。图已解码并目视核验；所有候选都是同一冻结policy、seed101、600k及同一140条独立行为。
+- W&B run ahmg534z远端状态为finished，15行history完整；公开config共117个键，没有token/secret/password/credential/api_key键，也没有绝对路径值。审计保存在同目录wandb_privacy_audit.json。
+- 下一条最高价值工程/算法假设不是继续扩大网络，而是解除reward critic与cost critic的共同optimizer/共同global clip。当前cost-LSTM的大梯度会通过联合clip缩放reward critic；在冻结policy筛选中这不会改变行为，却会在live训练里直接损害reward value/GAE和actor更新。应先做纯等价回归，再做单变量“reward/cost独立optimizer与独立clip”机制实验。
+- 该改动本身不能保证解决冻结cost校准，所以同时保留两条可区分路线：一是跨rollout held-out/early-stop或小型replay，直接抑制同批记忆；二是共享actor backbone但增加cost辅助监督/小adapter，使history既含cost信号又不新增2.39M自由参数。两条不能与optimizer拆分混跑，分别作为消融。
+- 评估器还需修复“向量环境按batch向上取整episode数”的口径问题：未来应只聚合前num_eval条，确保B20/B40/B80都严格评估同样数量。该工程修复先做随机流/指标回归，不能让此次160条结果反向参与模型选择。
