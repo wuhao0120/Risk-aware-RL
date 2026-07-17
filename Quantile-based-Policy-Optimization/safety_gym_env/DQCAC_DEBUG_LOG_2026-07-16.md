@@ -1067,3 +1067,14 @@
 - 600k门：真实reward/cost/outage的30批history必须与既有QR逐值一致，所有标签不一致率为0且无非有限值；最后5批prequential direct的CDF absolute error或Brier相对同run QR至少改善20%，另一项不得恶化超过10%；独立140条的CDF absolute error或Brier至少改善25%，另一项不得恶化超过10%。140通过后才从同一final checkpoint做fresh520；520也通过才允许P-M3压力seed进入live 1M。
 - 若600k未过效果门但direct关键误差从前5批到末5批仍改善超过10%、且相对QR方向一致，则按E77训练长度规则从头预注册1.2M审计；若只近似持平或后段已平台，则停止当前direct，不扫学习率/隐藏层碰运气。通过live后再决定是否与B40减振组合，不能在第一条run同时打开两个变量。
 - 既有QR600k纯训练417.2秒。direct多一个仅78.6k参数的scalar head，结合smoke开销预计纯训练8--10分钟、含140终评总墙钟9--12分钟，显存增量远小于QR pairwise loss；正式实验只通过`launch_background.sh`，checkpoint/W&B/log全部写入`/vepfs`。
+
+### E79：C-DCF1 600k结果——不是训练太短，而是head追逐上一批噪声（2026-07-17）
+
+- 正式持久化job正常exit 0，W&B run为`2j7wdmq4`；30批、600条完整轨迹、600k环境步全部完成，纯训练`245.2s`，随后完成140条独立评估。final checkpoint为`_runs/checkpoints/dqc_frozen_s1policy_seed101_cdcf_direct_600k_20260717/final_post_update.pt`。
+- 严格配对通过：相对既有QR run `8ry7xn6g`，30批的env step、reward、reward quantile、outage、discounted/undiscounted cost全部逐值exact；direct标签不一致率最大值为0。两个final checkpoint的actor、QR cost online/target、reward online/target和observation normalizer共43个共享state tensor逐位exact，说明新增head没有改变行为或QR基线。
+- 末5批prequential CDF absolute error为direct/QR=`0.05169/0.10656`，direct看似改善51.5%；但Brier为`0.23360/0.23253`，direct反而差0.46%。post-update CDF error为`0.03114/0.03750`，只改善17.0%；post Brier为`0.19186/0.20023`，只改善4.2%。proper score没有支持“条件风险排序显著变好”。
+- 独立140条truth outage为`0.25714`。direct预测`0.32722`，absolute error=`0.07008`；同run QR预测`0.26786`，error=`0.01071`。direct的总体CDF误差约为QR的6.54倍。direct/QR Brier为`0.19937/0.20282`，direct只改善1.70%，远低于25%门。故不做fresh520、不进入live 1M。
+- 末段CDF“改善”不是可靠的慢收敛证据。direct pre预测与当前新批truth的相关仅`0.0196`，却与上一批truth相关`0.8256`；同批更新后的post预测与当前truth相关`0.8844`，一次rollout内20个head update使概率平均移动`0.1070`。QR对应的pre-lag相关为`0.6192`、平均移动`0.0829`，也有追批现象，但明显更弱。
+- 最后5批truth均值恰好由此前5批的`0.23`升到`0.33`。direct复制上一批比例时刚好撞上连续高outage区间，才产生末5批CDF error下降；独立评估分布回到`0.257`后，过估立刻暴露。因此该结果不满足E78“末段改善且相对QR方向一致”的1.2M延长条件；不运行无改动的1.2M，也不事后移动门槛。
+- 对用户“短跑是否误杀”的回答进一步细化：IQN 300k→600k属于真实慢收敛，应延长；C-DCF1则是跨批遗忘/高方差更新，保持同配方增加步数只会继续追逐最近20条轨迹。后续只允许针对已定位机制的单变量改动：首选每个rollout后更新一次EMA query head，让actor/eval读取跨批低通版本；备选是跨rollout replay或减少direct update次数。三条不能同时打开，均需重新预注册并从600k固定策略门开始。
+- 完整history/profile位于`_runs/wandb_export/dqc_frozen_direct_cdf_600k_2026-07-17/`与`_runs/profiles/dqc_frozen_direct_cdf_600k_2026-07-17/`；`overview.png`为`2880×3440`且PIL解码通过。正式checkpoint/history/profile合计约12.6MB，全部位于`/vepfs`。

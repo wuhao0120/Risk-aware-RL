@@ -192,11 +192,14 @@ EVAL_METRICS: Tuple[str, ...] = (
 )
 
 
-# 每个 panel 可叠加一到两个相关指标；缺列时自动跳过，不要求所有算法日志键完全一致。
+# 每个 panel 可叠加同一机制的相关指标；缺列时自动跳过，不要求所有算法日志键完全一致。
 PLOT_PANELS: Tuple[Tuple[str, Tuple[str, ...], bool], ...] = (
     ("discounted reward", ("disc_reward/aver_reward",), False),
     ("reward quantile", ("disc_reward/quantile_reward",), False),
-    ("constraint probability", ("constraint/empirical_prob", "constraint/cdf_estimate_initial"), False),
+    ("constraint probability", (
+        "constraint/empirical_prob",
+        "constraint/cdf_estimate_initial",
+        "constraint/qr_cdf_estimate_initial"), False),
     ("dual lambda", ("lambda/value",), False),
     ("reward advantage scale", ("advantage/mean_adv_std", "norm/return_sigma_ema"), True),
     ("actor weight scale", ("actor/w_std",), True),
@@ -204,11 +207,20 @@ PLOT_PANELS: Tuple[Tuple[str, Tuple[str, ...], bool], ...] = (
     ("cost critic", ("critic/cost_qr_loss", "critic/cost_s0_aux_loss"), True),
     ("s0 holdout probability", (
         "critic/s0_holdout_pre_cdf",
+        "critic/s0_holdout_pre_qr_cdf",
         "critic/s0_holdout_post_cdf",
+        "critic/s0_holdout_post_qr_cdf",
         "critic/s0_holdout_pre_truth"), False),
+    ("s0 holdout CDF absolute error", (
+        "critic/s0_holdout_pre_cdf_abs_error",
+        "critic/s0_holdout_pre_qr_cdf_abs_error",
+        "critic/s0_holdout_post_cdf_abs_error",
+        "critic/s0_holdout_post_qr_cdf_abs_error"), False),
     ("s0 holdout Brier", (
         "critic/s0_holdout_pre_brier",
-        "critic/s0_holdout_post_brier"), False),
+        "critic/s0_holdout_pre_qr_brier",
+        "critic/s0_holdout_post_brier",
+        "critic/s0_holdout_post_qr_brier"), False),
     ("predicted / sampled cost", ("critic/pred_cost_mean", "debug/cost_mean"), False),
     ("reward value", ("reward_value/loss", "reward_value/explained_variance"), True),
     ("PPO health", ("ppo/clip_fraction", "ppo/approx_kl"), True),

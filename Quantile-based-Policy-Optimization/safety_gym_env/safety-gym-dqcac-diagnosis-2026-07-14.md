@@ -1489,3 +1489,15 @@ B40也没有解决最关键的critic偏差。fresh520的hard-CDF预测只有0.08
 正式实验固定P-M3 seed1成熟actor、rollout seed101、B20、600k、20次critic update、MC、time weight .995、chunk2500。既有QR600k run可复用；direct run内部仍训练同一个QR，30批真实行为和QR本身必须与旧run一致。晋级要求末五批prequential至少20%改善，独立140至少25%改善，且另一校准量不明显恶化；随后还要fresh520复核。若600k仍在明显收敛则只允许一次1.2M长度审计，不允许顺手扫描网络宽度或学习率。
 
 即使冻结门通过，也不能直接宣布算法变好。direct进入live后会改变risk advantage、constraint RMS以及可能的critic-dual信号，仍可能发生policy--critic--PID闭环过冲。它必须先在压力seed完整跑1M，再按E77扩2M/多seed；最终候选与QCPO_refs仍按统一5M预算比较。
+
+### 13.65 C-DCF1结果：末段改善是假象，独立评估揭示跨批遗忘（2026-07-17）
+
+C-DCF1完成了严格配对的600k固定策略实验。新增head没有扰动行为或QR：30批reward、cost和outage逐值相同，两个final checkpoint的43个共享网络张量也逐位相同，标签逻辑始终没有不一致。因而结果差异可以归因于direct Bernoulli表示及其优化，而不是随机动作、初始化漂移或代码回归。
+
+只看末五批CDF误差会得到错误的乐观结论：direct为0.05169，QR为0.10656，表面改善51.5%。但proper Brier为0.23360和0.23253，direct没有改善。独立140条中，真实outage为0.25714，direct/QR预测为0.32722/0.26786；absolute error为0.07008/0.01071。direct的Brier只从QR的0.20282降到0.19937，改善1.7%，远低于预注册门。
+
+滞后分析解释了冲突。direct在新批更新前的预测与当前批truth几乎不相关（r=0.0196），却高度相关于上一批truth（r=0.8256）；20次同批更新后的预测与当前标签相关达到0.8844，单批内平均移动0.1070。最后五批outage恰好从前一窗口的0.23升到0.33，所以复制上一批比例偶然降低了末段CDF误差。它不是逐步学到稳定条件风险，而是在600条轨迹仍持续追逐每批20条样本的二项噪声。
+
+因此本次不触发无改动的1.2M长度审计。这个裁决与“训练更长可能反转”并不矛盾：IQN在300k到600k的独立评估和mean-cost误差同步改善，属于真实慢收敛；C-DCF1只有受近期outage streak影响的窗口CDF变好，跨状态Brier和独立总体校准没有同方向证据。增加相同更新只会延长遗忘过程，不能增加每次更新所依据的独立tail样本。
+
+下一路线应直接抑制跨批遗忘，而不是继续加环境步。最小候选是保留online direct head的监督训练，但每个rollout只把其参数以固定tau合入EMA query head，actor、prequential和评估读取EMA；这等价于在参数空间对多个rollout低通，且不会给动作采样引入新随机数。备选消融是保存最近若干rollout做supervised replay，或单独减少direct每批更新次数。它们回答相近问题，首轮只能选一个，固定策略600k不过门就不进入PID闭环。完整history和含direct/QR对照曲线的profile保存在`_runs/wandb_export/dqc_frozen_direct_cdf_600k_2026-07-17/`与`_runs/profiles/dqc_frozen_direct_cdf_600k_2026-07-17/`。
