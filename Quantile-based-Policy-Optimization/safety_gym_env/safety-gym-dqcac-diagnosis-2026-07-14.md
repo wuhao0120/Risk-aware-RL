@@ -1571,3 +1571,17 @@ P-M7必须在压力seed1完整跑1M，因为它只有25次Actor事件，100k/300
 结论仍然直白：P-M7没有过安全门。候选outage的Wilson 95%区间为[0.2183,0.2930]，整体高于alpha=0.20；相对P-M3下降0.05的保守区间上界仍略跨0。它不能据此扩多seed或宣称超过QCPO_refs。与此同时，reward显著提高、六类风险估计指标同向改善，而1M只有25个Actor事件，使“训练时间轴偏短”成为比N64/local更可信的可能性。
 
 因此只允许一次从头2M长度审计。总迭代数不进入学习率公式，前1M应严格复现现有run；这既验证可重复性，也让P-M7获得与P-M3 1M相同的50次Actor事件。2M仍使用原门，不因1M接近就放宽：reward至少0.75、outage不高于0.22，Brier和mean/CDF不能反弹，末400k周期不能变大。若通过，再补同预算P-M3并做多seed；若失败，就停止原样延长，优先检验PID与Actor同步每两批更新，避免controller在一次Actor响应前连续积累两次误差。
+
+### 13.72 P-M7的2M裁决：延长训练暴露了相位跳变，而不是带来晚期收敛（2026-07-17）
+
+2M run的前1M与原1M实验逐checkpoint、逐网络张量和逐训练指标exact，因此它是严格的长度审计。新增1M没有把系统带到稳定平台：后五个200k区间的outage均值为0.280、0.240、0.215、0.255和0.155，lambda均值为0.264、0.382、0.253、0.368和0.207。约束升高后lambda追上、策略回报下降，约束降低后lambda又释放，随后风险再次上升；同一种闭环周期至少重复两次。
+
+最终post-update策略明显失败。140条评估的reward虽从1M的0.9575升到1.1982，outage却从0.3071升到0.4143。更严重的是critic hard-CDF从0.1810降到0.1422，与真实风险反向移动；CDF absolute error从0.1261扩大到0.2721，predicted/true mean cost为7.814/15.700，Brier从0.2387升到0.3186。故这不是“收益尚未涨起来”，而是策略利用了一个越来越低估tail risk的critic。
+
+2M pre-update checkpoint提供了时序反事实。完全相同的140条协议下，最后一次联合更新前reward/outage为1.123/0.307，critic预测0.266，CDF误差0.042，Brier 0.217；更新后reward/outage变为1.198/0.414，critic预测反而降到0.142，误差变为0.272。一次更新增加约0.107真实违例率，却减少约0.123预测违例率。虽然140条不足以把这两个比例差写成最终显著性结论，但两者都远高于0.20目标，且预测与truth反向变化，已经足够拒绝原配置并定位相位问题。
+
+形成循环有三个叠加原因。第一，B20在p=0.2时经验违例率标准差约0.089，观测又按0.05量化，PID会追逐显著采样噪声。第二，PID每B20更新，Actor每B40更新；控制器在执行器响应前已经改变两次，P/I状态带着中间策略误差前进。第三，Actor到期时在最新lambda下做8个PPO epoch，而cost critic也刚对最近20条轨迹重复更新20次；真实策略分布变化要到下一rollout才被PID看到，终点恰好没有下一次纠偏。PPO ratio接线正确只能限制相对behavior policy的位移，不能保证chance constraint对小位移不敏感。
+
+下一步不同时扫PID增益、num_envs和critic结构。首个最小消融把经验PID也改成每两批才更新一次：两批B20的40条cost合并后一次性进入window和episode-scaled leaky-I/P，随后Actor才更新；critic仍逐B20训练。它同时降低当前batch风险率噪声到约0.063，并让controller与Actor执行周期一致。若这仍有极限环，再分别测试anti-windup/更小Kp-Ki与更大num_envs；局部quantile、IQN和direct-CDF已经完成各自表示筛选，不与本次时序修正混合。
+
+本轮正式数据位于`_runs/wandb_export/dqc_pm7_actorint2_seed1_1m_vs_2m_2026-07-17/`和`_runs/profiles/dqc_pm7_actorint2_seed1_2m_lenaudit_2026-07-17/`，后者含完整2M profile与训练曲线。按预注册screen不做fresh520或3M；这是节省预算的失败裁决，不是因为短跑提前终止。

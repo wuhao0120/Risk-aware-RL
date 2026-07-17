@@ -1154,3 +1154,15 @@
 - 预注册一次从头2M：只把`num_iterations=50→100`，其余参数、seed和评估协议不变。LR scheduler只依赖实际Actor事件编号，不依赖总迭代数，所以2M run的前1M理论上应与本run逐点复现；100k与1M checkpoint/history将先做exact/数值对拍，失败则不能解释为纯长度效应。预计纯训练约13～14分钟，内置评估后若仍通过screen再做fresh520，总墙钟约18分钟，全程持久化。
 - 2M不是移动成功门：fresh520仍需reward≥0.75、outage≤0.22，且Brier不得比1M的`0.20203`恶化超过10%、hard/mean error不得反弹；末400k周期不能继续放大。通过后必须补P-M3相同2M预算，才可谈cadence支配；未通过则停止原样延长，不跑3M，转向已记录的“PID与Actor都每两批更新”独立时序消融。
 - 完整history/profile、五阶段CSV和比较图位于`_runs/wandb_export/dqc_pm3_vs_pm7_actorint2_seed1_1m_2026-07-17/`与`_runs/profiles/dqc_pm3_vs_pm7_actorint2_seed1_1m_2026-07-17/`。`fresh520_comparison.png`为`2864×1435`、可由PIL解码；同目录保留`fresh520_comparison.csv/json`和原始`overview.png`。
+
+### E86：P-M7 2M长度审计——不是训练不足，闭环在终点再次失配（2026-07-17）
+
+- 正式持久化job `DQCAC_DynamicButton_pm7_actorint2_timew995_pi_target015_smoothT1_b20_ckpt100k_2m_s1`正常exit 0，W&B run为`mvxemk3z`；100批、2M环境步纯训练`779.4s`，保存50次Actor事件。只相对1M把`num_iterations=50→100`，其余参数和seed不变。
+- 长度因果检查通过：2M run在100k与1M checkpoint的六个网络module、lambda、runtime训练状态和非eval指标都与原1M run逐项exact，最大差为0；前1M控制台/history也一致。因此1M后的变化来自新增训练时间，不是初始化、随机流或代码版本漂移。
+- 2M后五个200k阶段的`reward/outage/lambda`均值依次为`0.9712/0.280/0.2637`、`0.9255/0.240/0.3821`、`0.9224/0.215/0.2531`、`0.8559/0.255/0.3676`、`0.9177/0.155/0.2074`。lambda在约0.21–0.38间随outage反复升降，1.2M和1.7M附近重复出现高风险→高lambda→低reward→低lambda的周期；没有形成稳定平台。
+- 2M post-update内置140条为reward/outage=`1.19819/58÷140=0.41429`，真实mean cost=`15.700`；critic hard/smooth CDF=`0.14219/0.14484`、predicted mean cost=`7.81394`、Brier=`0.31862`。相对同协议1M内置结果`0.95752/0.30714`，reward提高25.1%，但outage恶化34.9%。hard-CDF absolute error从`0.12612`扩大到`0.27210`，mean-cost error从`2.76898`扩大到`7.88606`，Brier从`0.23874`恶化33.5%；crossing虽从`0.10622`降到`0.08733`，不能抵消严重的风险低估。
+- 按E85预注册screen，内部outage `0.414>0.35`且Brier明显反弹，所以不做fresh520、不跑3M、不扩seed。目标是0.20，当前失败幅度远大于140条二项抽样误差；为一个已被screen拒绝的终点再花520条不会改变路线裁决。
+- 额外用同一eval-only协议评估2M的`rollout_step002000000.pt` pre-update快照，持久化job正常exit 0。更新前reward/outage=`1.123/43÷140=0.30714`，critic/truth=`0.26558/0.30714`、absolute error=`0.04157`、Brier=`0.21670`；最后一次critic+8 epoch PPO联合更新后，reward/outage变为`1.198/0.41429`，critic预测却降为`0.14219`。一次更新让真实风险增加`0.10714`，预测风险反向减少约`0.1234`，CDF error扩大约6.55倍。
+- 这个pre/post对拍把极限环定位为真实时序问题，而不只是日志噪声：最后200k rollout policy的平均outage只有0.155，使lambda降到约0.207；终点Actor再依据最新lambda和同批更新后的critic做8次PPO，策略变得更激进，但训练已结束，PID没有下一批轨迹纠正。B20单批在p=0.2附近的二项标准差约0.089，经验率又只能按0.05跳变；当前PID每B20响应两次而Actor每B40才响应一次，控制器与执行器不同频会进一步放大超调。
+- 下一单变量路线为P-M8：critic仍每B20做20次更新，Actor仍每两批合并B40做8 epoch；只把经验PID也改为每两批更新一次，并用两批共40条真实cost一次性更新window、I/P项和lambda。这样lambda在Actor冻结期间不变化，B40当前batch outage标准差约降到0.063，并且Actor看到的是与其响应周期一致的控制量。anti-windup、降低Kp/Ki、增大num_envs和target-KL保持关闭，分别留作后续消融，不能同时叠加。
+- 完整history在`_runs/wandb_export/dqc_pm7_actorint2_seed1_1m_vs_2m_2026-07-17/`，2M profile和`2880×4128`可解码曲线在`_runs/profiles/dqc_pm7_actorint2_seed1_2m_lenaudit_2026-07-17/`。pre-update诊断JSON为`_runs/DQCAC_DynamicButton_pm7_actorint2_2m_s1_preupdate_eval140_s1.json`；2M checkpoints约221MB，均位于`/vepfs`而非20G根目录。
