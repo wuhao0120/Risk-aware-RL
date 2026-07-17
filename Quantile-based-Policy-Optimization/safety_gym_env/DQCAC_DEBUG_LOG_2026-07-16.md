@@ -1439,3 +1439,15 @@
 - 正式C-H5E复用C-H4M2的成熟冻结policy、rollout seed101、B20×30×T1000=600k、C20、MC、risk-discount=.995、QR32、cost-LSTM、mean-anchor .5/S=10、chunk2500与独立140条评估；唯一变量是cost_quantile_output: linear→exp，scale10来自QCPO_refs单位而非调参。30批behavior/truth的16个控制字段及独立reward/outage必须与raw、C-H1W、C-H4M2逐值exact。
 - 晋级门预先固定：所有checkpoint/history有限；末5批prequential CDF error或Brier相对C-H4M2至少改善20%，另一项不得恶化10%；独立hard Brier须从.25822至少改善20%到≤.20658且AUC不低于.55，mean error保持≤.20，crossing降到≤.10。同时记录20-update裁剪率与anchor/QR比；若长期100% clip且独立门失败，不用“exp来自reference”豁免。通过才做fresh520；失败则不扫output scale，因为10由单位固定。
 - 既有同配置C-H4M2纯训练282.8秒；exp仅增加逐元素指数，预计纯训练4.7--5.5分钟、140评估和W&B收尾约1--2分钟，总墙钟6--8分钟。使用launch_background.sh持久化与脱敏W&B online。分歧路线保留为：exp数值失败时跑softplus；exp稳定但Brier/crossing失败时转Weibull tail或共享多任务backbone；二者不与首个exp正式run混改。
+
+### E117：C-H5E 600k结果——exp保留少量排序信号，但放大梯度并破坏mean/shape（2026-07-17）
+
+- 正式job绑定提交a15d0c9，W&B run为wkn3kdn7；30批/600k完整、后台exit0，纯训练282.4秒，与linear mean-anchor的282.8秒相同。checkpoint全部tensor有限，说明10×exp没有发生溢出。W&B远端finished，30行history、121个公开config键，无敏感键和绝对路径值。
+- 公平性控制严格通过：相对C-H4M2，env steps、iteration、trajectory、四项reward、outage、两项cost、两项action与三个budget共15列逐元素exact，最大差0；独立140条reward/outage也同为0.865756/0.257143。差异可以归因于linear→exp输出参数化。
+- 独立140条hard CDF/Brier/AUC为0.20067/0.23193/0.56944，truth为0.25714；smooth Brier/AUC为0.22455/0.56891。相对linear mean-anchor，hard Brier改善10.18%，AUC增加0.0080，但未达到Brier改善20%的机制门；相对raw，hard Brier仍恶化14.35%，AUC增加0.04968。
+- exp破坏了mean-anchor最重要的正收益。predicted/truth mean为10.49095/11.75714，绝对误差1.26619；linear mean-anchor只有0.03444，误差扩大约36.76倍。独立CDF absolute error从0.01585升到0.05647，恶化256.34%；crossing从0.19885升到0.30599，恶化53.88%，远高于0.10门。
+- 末5批prequential没有改善：pre-CDF error为0.17344，相对linear anchor的0.15844恶化9.47%；pre-Brier为0.33271，几乎不变但略恶化0.07%；signed mean bias为-2.2923，绝对值相对1.8008恶化27.29%。post-Brier也从0.08312恶化到0.10198。exp没有关闭“本批拟合、下一批失真”的泛化缺口。
+- 全程和末5批20/20 update均触发clip。末5批cost/head/history的平均裁剪前范数从linear的88.70/63.19/59.50升到exp的144.44/126.77/65.20；总cost增加62.85%，head约翻倍，符合指数导数放大head梯度的作用链。update-mean口径的scaled-anchor/QR比全程0.678、末5批0.655，与linear的0.716/0.674接近，因此失败不是mean项重新压倒QR。
+- 预注册门中只有AUC≥0.55通过；末段pre、独立Brier、mean与crossing门全部失败。因此不做fresh520、不进入live、不扫描output scale；10是QCPO_refs单位，不是自由超参。exp本身数值稳定，所以也不触发“指数溢出才运行softplus”的分支，避免用一个4条smoke更差的近似机制继续消耗600k。
+- 结论：非负cost输出不是QCPO_refs稳定性的充分来源。它保留甚至略增强history排序，但无法把排序变成校准概率，还通过指数几何加重head梯度和quantile crossing。下一路线应改变representation/多任务约束，而不是继续改输出激活：优先审计QCPO_refs共享policy/reward/cost MLP+LSTM的真实梯度耦合；Weibull tail作为独立辅助路线保留，但必须明确其quantile detach后主要通过共享backbone间接起作用。
+- 统一证据位于_runs/profiles/dqc_frozen_ch5e_meananchor_exp10_600k_2026-07-17/：四候选独立与末段CSV、linear/exp完整history、decision、W&B隐私审计和2755×1557对比图。PNG已由PIL完整解码；环境view_image因系统bwrap故障不可用，不影响数值与文件完整性。

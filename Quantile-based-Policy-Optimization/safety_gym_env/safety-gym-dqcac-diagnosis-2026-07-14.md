@@ -1813,3 +1813,13 @@ QCPO_refs的exp不是孤立trick。训练标签和cost limit先除以10，网络
 softplus路线定义为10×softplus(logit)/log(2)，因此与exp在零logit处都有输出10，比较不会把不同初始化均值误当作激活函数优劣。两个4k smoke都有限且冻结行为exact。只有4条终评，不足以评价泛化；它只排除了exp立刻溢出、映射单位错误和漏接评估路径。exp在小样本上的Brier/CDF也优于softplus，且与源算法完全同构，所以600k正式实验选择exp，softplus暂不消耗同等预算。
 
 这条实验检验的是“正值几何是否能在mean已校准后修复条件分布形状”。exp严格单调，单次前向不会自行消除quantile crossing；潜在收益来自优化参数化：低cost区梯度较小，高cost区梯度随输出放大，且不存在负cost解。若600k后mean仍准但Brier/crossing不过门，说明非负约束不是QCPO_refs稳定性的主要来源，下一步应转Weibull tail或共享policy/reward/cost history backbone，而不是扫描任意output scale。若exp导致持续100%裁剪或非有限值，才按预注册改用同初始化尺度的softplus，以区分“正值约束有用”与“指数尾部不稳定”。
+
+### 13.101 exp不是QCPO_refs稳定性的单独答案（2026-07-17）
+
+正式600k结果把“非负输出有帮助”和“它能解决DQCACBeta”区分开了。exp没有溢出，训练耗时也没有增加；它把独立hard Brier从linear mean-anchor的0.258降到0.232，并把AUC从0.561提高到0.569。这说明正值几何不是完全无效，它保留了cost-LSTM中的少量条件排序信息。
+
+但真正需要的联合指标全面失败。raw的Brier仍更低，为0.203。exp的mean-cost误差从mean-anchor的0.034升到1.266，CDF误差从0.0158升到0.0565，crossing从0.199升到0.306。末段下一批pre-Brier仍约0.333，完全没有改善；同批post-Brier约0.102，继续明显好于下一批。这不是一个可以靠更长冻结训练自然修复的慢热迹象，而是与此前相同的跨rollout泛化结构。
+
+优化诊断给出更直接的原因。exp相对linear把末段cost总梯度从88.7提高到144.4，quantile head梯度从63.2提高到126.8，而history梯度只从59.5提高到65.2。指数导数主要放大了输出head，所有update仍被clip；它没有提供新的跨轨迹监督。mean-anchor与QR的相对比值仍接近linear，因此mean退化不是MSE权重突然过大，而是共享clip下的方向与非线性参数化改变。
+
+所以不继续跑softplus全量。softplus只在exp发生非有限值或指数尾部明显失控时才有区分价值；本次exp稳定但统计门失败，换平滑激活不会增加新监督信息。下一项应回到QCPO_refs最本质的结构差异：policy、reward value、cost quantiles、mean与tail heads共享同一个规范化MLP+LSTM，cost辅助损失会约束产生policy action的history representation。当前DQCAC的cost-LSTM是独立大网络，actor-feature消融又把共享feature完全detach，两者都没有复现这种多任务梯度耦合。Weibull可保留为较小消融，但其源实现对quantiles detach，主要价值同样可能来自对共享backbone的辅助梯度，而不是单独给现有quantile head加一个尾部分布公式。
