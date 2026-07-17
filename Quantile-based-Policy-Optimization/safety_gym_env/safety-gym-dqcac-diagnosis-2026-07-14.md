@@ -2037,3 +2037,16 @@ critic也没有全面变好。AUC从0.551升到0.593、CDF误差下降约33%，�
 完整轨迹标签沿时间广播是有依据的：remaining-budget递推使`C_total>=d`与任一时刻`C_remaining>=b_t`等价。仍保留beta时间权重，所以这是DQCACBeta的真实标签校正，而不是声称完全恢复未折扣QCPO梯度。PPO中old log-prob继续固定为采样策略，reward与risk分别做min/max clip；多epoch后不覆盖分母。
 
 工程关键是尺度。critic action advantage的EMA标准差约0.004，而二元residual自然标准差约0.4；若仍除以前者会把风险梯度放大约100倍。因此constraint RMS必须跟随混合后的实际advantage更新，并以eta0逐tensor回归证明默认路径不变。首条正式实验只用eta=1检验“真实方向是否解决跨seed分叉”；若方向正确但过保守，再把eta=.25/.5作为预先记录的消融，而不是扫描PID和eta寻找漂亮终点。
+
+
+### 13.126 trajectory residual的实现保持PPO因果性与默认路径精确兼容（2026-07-17）
+
+实现没有把一项新的离线loss简单叠加到actor。每条on-policy完整轨迹先产生一个真实事件标签，随后根据time-major布局广播到该轨迹的全部状态动作。对于多rollout actor cadence，episode标签先沿环境维合并，保证标签、state、action、budget和behavior log-probability仍按同一`tB+j`索引配对。这个细节是必要的：如果直接拼接两个展平batch，标签会变成rollout-major，而LSTM输入是time-major，算法会在不报错的情况下学习错误的风险credit。
+
+actor首次处理behavior batch时同时冻结critic优势、MC优势和最终混合优势。之后每个PPO epoch继续用采样时保存的old log-probability作分母，只重新计算当前策略的分子；reward分支使用悲观min clip，风险分支使用保守max clip。真实outage标签没有在每次epoch后被当前策略概率覆盖，也不需要为同一on-policy batch存一套“更新后forward probability”。这与此前importance-ratio修复一致：需要永久保存的是behavior log-probability，当前策略probability必须每个epoch重新前向计算。
+
+constraint归一化必须随估计器改变。原action-conditioned critic优势的标准差只有约0.004，而Bernoulli trajectory residual约为0.4。如果eta大于0后仍除以旧尺度，风险项会被意外放大两个数量级，任何低outage都无法区分是算法有效还是数值gain错误。当前实现用同一个`Aeta`更新constraint RMS，再用该RMS归一化actor风险项；eta=0则直接返回原来的`p_hat-V_hat` tensor，不引入无效乘加。
+
+验证比“能跑”更严格。eta=0补丁前后比较final和三个pre-update checkpoint，共176个tensor/array leaves最大差为0，730个共同数值状态也完全一致。解析测试验证eta端点、.25插值和time-major标签；纯张量PPO测试证明正风险优势对应降低动作概率、负优势对应提高概率。eta=1的recurrent cadence2训练和独立checkpoint恢复均成功，全部tensor有限且首epochratio误差为1.23e-4。MLP路径也完整训练，并顺带修复了两个仅发生在训练后summary/打印阶段的既有可选字段错误。
+
+短测故意把cost limit设为-1以强制产生非零MC修正，只证明作用链，不提供性能结论。正式实验仍使用真实阈值15、alpha=.20和C-H8 B40 seed1配置，唯一变量是eta=1。选择标准不是outage最小：fresh512先要求点估计进入`[.18,.22]`，再比较mean reward是否至少达到0.8195。若eta=1明显把高风险策略推到过度保守侧并损失reward，才有证据测试eta=.5/.25的偏差--方差折中；如果仍然不安全，则不能靠减小真实标签权重做事后参数搜索。

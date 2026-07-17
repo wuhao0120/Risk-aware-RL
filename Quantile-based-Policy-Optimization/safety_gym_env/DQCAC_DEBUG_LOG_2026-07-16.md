@@ -1720,3 +1720,17 @@
 - `I_outage`由每条完整on-policy trajectory的`disc_cost>=limit`产生并沿时间广播。budget递推保证同一标签等价于每时刻“remaining cost是否超过remaining budget”。`V_hat`仍由behavior policy下K个独立动作的CDF均值给出，是action-independent control variate；即使不准也不改变score-function期望。eta=1时实际动作的critic预测完全抵消，只保留真实标签方向和critic状态基线。
 - DQCACBeta的`beta^t`时间权重、PPO old log-prob、每epoch重算ratio、reward min/risk max clip、sum normalization与经验PID全部不变。constraint RMS必须改为跟踪真正使用的`Aeta`，否则真实0/1 residual会被旧critic约`.004`的尺度放大；eta=0必须逐tensor exact保持当前路径。
 - 实现先通过解析代数/符号测试、eta0金样本回归、mixed-outage PPO梯度方向、recurrent B40×T1000 smoke和checkpoint恢复。首条live只测试eta=1、seed1、C-H8 B40 1M，预计训练7--9分钟、fresh512约3--4分钟；正式门为outage落入[.18,.22]且reward至少`.82`，并要求末段振荡不放大。eta=.25/.5作为偏差--方差消融保留，只有eta1方向正确但明显过强时才依次轻量验证，不能事后无界扫描。
+
+
+### E146：trajectory outage actor correction实现、严格回归与正式1M启动门（2026-07-17）
+
+- 实现绑定提交`6634e12`。新增默认关闭参数`cost_actor_mc_correction_coef=eta`并强制范围`[0,1]`；启用时要求完整episodic trajectory。核心函数同时构造`Acritic=p_hat-V_hat`、`AMC=I_outage-V_hat`和residual `I_outage-p_hat`。eta=0直接返回原critic tensor，不执行无效加零；eta=1直接返回MC tensor，不通过两次相消形成额外舍入误差；中间值才执行`Acritic+eta*residual`。
+- `disc_cost>=cost_limit`先得到每episode一个二元标签，再按rollout的time-major索引`[t0:B,t1:B,...]`广播到`T*B`。`actor_update_interval>1`时，多个rollout的`disc_cost`沿环境维合并后再广播，避免把rollout-major标签错配给time-major state/action。LSTM与MLP actor都走同一helper；首个PPO epoch缓存blended/critic/MC/residual/label，后续epoch只重算当前log-probability和ratio，不允许critic更新移动同一behavior batch的风险监督。
+- constraint RMS现在跟踪actor真正使用的`Aeta`，不是固定跟踪`Acritic`。W&B新增critic/MC advantage标准差、residual标准差、实际correction绝对均值、critic--MC相关、trajectory标签均值和eta；旧的`risk_adv_*`主键明确代表最终blended信号。beta时间权重、固定old log-prob、每epoch importance ratio、reward min clip、risk max clip、sum normalization和经验PID均未改变。
+- 解析测试覆盖两条轨迹、三时刻的time-major标签`[0,1,0,1,0,1]`，eta=0/1/.25均与手算逐元素相同；合并4条轨迹后的标签顺序同样通过。纯autograd测试在正/负MC advantage下得到log-ratio梯度`[+.2000,-.04975,+.1575,-.0600]`，证明梯度下降会降低高风险动作概率、提高低风险动作概率，beta只缩放不翻转方向。
+- 默认兼容性使用补丁前提交`e2ea6b3`、seed401、B2×T32、3 rollout、C3/A2的持久化金样本，与补丁后显式eta=0复跑逐checkpoint比较。final及64/128/192步四个checkpoint各44个tensor/array leaves完全相同，共176次比较最大绝对差0；730个共同数值状态也全部exact。训练reward/outage、最终随机评估和checkpoint模块均一致，新增诊断没有改变RNG、优化器或浮点更新路径。
+- eta=1的recurrent cadence2强制标签短测用`cost_limit=-1`只为保证非零correction，不用于性能判断。B2×T32、4 rollout、C3/A2训练8.5秒并exit0；44个checkpoint tensor leaves全部有限，2次actor事件都正确使用4条合并trajectory，首epoch ratio最大误差`1.23024e-4<1e-3`。独立持久化eval-only成功从final checkpoint重建eta=1配置并加载256步状态，exit0。
+- MLP eta=1短测的actor更新本身正常，但暴露两个既有终态兼容bug：通用summary直接访问只有recurrent actor才有的`cost_adapter`，统一打印又假定MLP评估一定返回AUC/BSS/smooth字段。前者改为安全可选属性，后者对未提供的纯诊断显示nan；第三次相同短测训练7.2秒、保存final checkpoint、评估和JSON均完整exit0。这两处只影响训练后的汇总/显示，不改变模型或评估数值。
+- 正式首轮严格复用C-H8 B40 seed1：`25×40×1000=1M`、C20/A8、actor/PID interval1、QR32、MC cost、risk-discount=.995、detach actor-feature、mean-anchor=.5/scale10、MLP+LSTM512、observation RMS、T1 sigmoid、GAE-PPO、固定old log-prob和经验PI/PID内部target=.15；唯一算法变量为`eta=1`。不同时调整PID、quantile、CDF、网络、replay或guard。预计纯训练7--9分钟、内置128约1--2分钟、fresh512约3--4分钟，全部使用`launch_background.sh`、脱敏W&B online和eval-only禁用W&B。
+- B40已有慢启动和长周期，除NaN/Inf/OOM、ratio断言或确定性工程错误外跑满1M。正式裁决首先要求fresh512真实outage落入双侧工作带`[.18,.22]`，然后要求mean reward至少达到seed1底座`.81951`（预注册简写`.82`），并报告Wilson/Newcombe/Welch区间、末段outage振幅、constraint RMS、critic--MC相关、Brier/AUC/BSS、mean-cost error和crossing。低于.18不因更安全自动晋级，高于.22判风险过大。
+- 分歧路线已预先固定：若eta=1把outage从高风险侧移向或越过目标但reward明显损失，说明真实方向有效而方差/强度过大，才按单变量依次考虑eta=.5、.25的轻量或1M验证；若eta=1仍高于.22且MC信号/尺度正常，减小eta只会增加critic偏置，不做盲扫，转controller cadence或更直接的trajectory baseline；若eta=1同时进带且提高reward，先扩seed0/2而不是继续调参。
