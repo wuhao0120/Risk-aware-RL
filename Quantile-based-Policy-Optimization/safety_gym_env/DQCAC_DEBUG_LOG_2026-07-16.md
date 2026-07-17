@@ -1575,3 +1575,13 @@
 - 严格裁决为`strict_fail_no_seed_expansion`：不跑seed0/1，不扫replay coef、buffer深度、B60/B80。简单等权训练replay被否决为主路线；它证明跨批标签能改善quantile crossing，却也证明“降低混合训练loss”不能保证下一policy/新trajectory上的概率校准。
 - 下一路线改为上一rollout只做held-out validation，用其选择或早停当前rollout的cost-critic step，而不把旧标签直接写入目标。首版需要保持reward critic继续C20、只冻结cost branch后续梯度，并明确保存/恢复cost参数与Adam状态；否则所谓early stop会暗中改变reward critic或留下optimizer动量污染。小adapter/PCGrad和Weibull仍保留为后续独立消融，不与held-out首轮混合。
 - 完整导出在`_runs/wandb_export/dqc_ch9r_transitionreplay1_actorfeature_meananchor_b40_1m_s2_2026-07-17/`，C-H8/C-H9R共同history与曲线在`_runs/wandb_export/dqc_ch8b40_vs_ch9r_replay1_seed2_1m_2026-07-17/`和同名`_runs/profiles/`。fresh表、门槛JSON、末段表、隐私审计及`2775×1895`比较图位于C-H9R profile的`e121_ch8_comparison/`；全部PNG可由PIL解码。125个公开config键无敏感键或绝对路径，远端只同步标准config/output/summary文件。
+
+### E131：C-H10G上一rollout retention holdout guard实现、验证与1M预注册（2026-07-17）
+
+- 新机制默认关闭，参数为`cost_holdout_guard=False, relative_tolerance=.05, absolute_tolerance=.002`。上一rollout只缓存真实s0处的detached actor feature、behavior a0和完整MC cost；它不进入QR/mean backward，不重放actor/PID/reward，也没有第二套importance ratio。准确说它是“对当前批更新的跨rollout保留性验证”，不是从未被历史critic见过的全局holdout。
+- 每轮step0先在上一批计算T1 smooth-Brier并保存cost head和该组参数的Adam `step/exp_avg/exp_avg_sq`。每个当前批cost step后重算；若超过`best*(1+.05)+.002`，立即恢复best cost参数/Adam状态，同轮余下C-step仍计算完整cost梯度并参与joint clip，但在Adam前把cost grad设为None。这样reward critic继续完成C20且保持相同joint-clip尺度，被拒绝的cost动量不会暗中推进。
+- 默认关闭复跑seed305/4k cost-LSTM金样本，补丁前后60个checkpoint tensor leaves逐元素完全相同，missing/extra/different均为0。启用B2/T32、3 rollout、C3/A2 smoke正常exit0：first active step=3、guard events=2、每次2条holdout、ratio误差`8.63e-5`、44个checkpoint tensor全有限；该零cost短测三步Brier单调改善，因此没有伪造rollback。
+- 另用完整T1000、冻结训练好policy、critic lr=.1和零容忍带做强制回滚压力测试，2个guard event均在step2停止并恢复step1。末轮initial/best/selected smooth-Brier=`.021970/2.94e-9/2.94e-9`，`selected/attempted/stop=1/2/2`。纯张量测试进一步证明cost权重与Adam槽精确恢复、reward更新保留；grad=None后cost权重/Adam step不动而reward Adam继续前进。
+- 正式C-H10G以C-H8 B40 seed2为唯一基线变量：B40×25、1M、C20/A8、QR32、MC、actor-feature、mean-anchor=.5/scale10、LSTM512、obs RMS、T1、经验PI/PID target=.15及全部LR不变；transition replay保持0，只打开guard与`.05/.002`容忍带。预期first-active-step=20、guard events=24、每次samples=40，首轮仍完整C20。
+- 工程门要求events=24、first step=20、至少一次真实restore、ratio≤`1e-3`且无NaN/Inf；透明报告每轮selected/attempted/stop update和cost-update retained fraction，若几乎全选step0则按“critic冻结退化”解释，不包装为early stopping成功。机制门仍要求末5批pre-Brier相对C-H8 `.15842`改善至少10%，pre-CDF error不得恶化10%。
+- fresh512性能门不变：reward≥`.75`、outage≤`.22`、hard Brier≤`.15898`、AUC≥`.56387`、mean-cost error≤1。全部通过才补seed0/1；失败不调容忍带、不与replay叠加，下一独立路线为小cost adapter/PCGrad或QCPO_refs式Weibull低方差辅助。预计纯训练7--9分钟、内置128评估1--2分钟、fresh512约4--5分钟；全部使用持久化后台和脱敏W&B online。

@@ -205,6 +205,12 @@ def base_args(algo, seed, device, env_key):
         # detached actor feature/action/step/MC cost，与当前cost目标做等尺度凸组合。
         a.cost_transition_replay_batches = 0
         a.cost_transition_replay_coef = 1.0
+        # 上一rollout仅作保留性验证的cost guard默认关闭。启用后，当前批仍是唯一
+        # cost梯度来源；若旧批smooth-Brier超过历史最好值的容忍带，就回滚cost
+        # head及其Adam状态，并让本轮剩余C-step只更新reward critic。
+        a.cost_holdout_guard = False
+        a.cost_holdout_relative_tolerance = 0.05
+        a.cost_holdout_absolute_tolerance = 0.002
         # QCPO_refs cost mean MSE 默认关闭；显式0.5时按本实现QR target-sum
         # 尺度自动换算相对权重，不需要随N手动重调。
         a.cost_mean_anchor_coef = 0.0

@@ -359,6 +359,14 @@ class DQCACBetaGPU(VecAgentBase):
             getattr(args, 'cost_transition_replay_batches', 0))
         self.cost_transition_replay_coef = float(
             getattr(args, 'cost_transition_replay_coef', 1.0))
+        # C-H10默认关闭：上一rollout只作为当前批更新的retention holdout，不再
+        # 进入训练目标。相对/绝对容忍带共同避免best Brier接近0时阈值退化为0。
+        self.cost_holdout_guard = bool(
+            getattr(args, 'cost_holdout_guard', False))
+        self.cost_holdout_relative_tolerance = float(
+            getattr(args, 'cost_holdout_relative_tolerance', 0.05))
+        self.cost_holdout_absolute_tolerance = float(
+            getattr(args, 'cost_holdout_absolute_tolerance', 0.002))
         if self.cost_s0_aux_coef < 0.0:
             raise ValueError("cost_s0_aux_coef must be non-negative")
         if self.cost_mean_anchor_coef < 0.0:
@@ -382,6 +390,10 @@ class DQCACBetaGPU(VecAgentBase):
             raise ValueError("cost_transition_replay_batches must be non-negative")
         if self.cost_transition_replay_coef <= 0.0:
             raise ValueError("cost_transition_replay_coef must be positive")
+        if self.cost_holdout_relative_tolerance < 0.0:
+            raise ValueError("cost_holdout_relative_tolerance must be non-negative")
+        if self.cost_holdout_absolute_tolerance < 0.0:
+            raise ValueError("cost_holdout_absolute_tolerance must be non-negative")
         # step feature 默认跟随 episodic: 有限期界下剩余 cost 分布依赖剩余步数 (已验证配方)
         _csf = getattr(args, 'critic_step_feature', None)
         self.critic_step_feature = bool(_csf) if _csf is not None else self.episodic
@@ -583,6 +595,49 @@ class DQCACBetaGPU(VecAgentBase):
             if self.actor_update_interval != 1:
                 raise ValueError(
                     "cost transition replay currently requires actor_update_interval=1")
+
+        # held-out guard与replay回答不同问题：前者只用旧批选择/回滚当前cost step，
+        # 后者把旧标签直接反传。首轮必须互斥，并固定在C-H8的最佳已验证配方上。
+        if self.cost_holdout_guard:
+            if self.cost_transition_replay_batches > 0:
+                raise ValueError(
+                    "cost holdout guard cannot be combined with transition replay")
+            if self.cost_target_mode != 'mc':
+                raise ValueError(
+                    "cost holdout guard currently requires MC cost targets")
+            if self.cost_history_mode != 'actor_feature':
+                raise ValueError(
+                    "cost holdout guard currently requires actor_feature history")
+            if self.cost_distribution_model != 'qr':
+                raise ValueError(
+                    "cost holdout guard currently requires QR cost distribution")
+            if self.cost_quantile_grid_mode != 'uniform':
+                raise ValueError(
+                    "cost holdout guard currently requires uniform quantiles")
+            if self.cost_actor_query_mode != 'online':
+                raise ValueError(
+                    "cost holdout guard currently requires online cost query")
+            if self.cost_cdf_estimator != 'quantile':
+                raise ValueError(
+                    "cost holdout guard currently requires quantile CDF")
+            if self.cost_cdf_mode != 'sigmoid':
+                raise ValueError(
+                    "cost holdout guard currently requires sigmoid cost CDF")
+            if self.cost_quantile_output != 'linear':
+                raise ValueError(
+                    "cost holdout guard currently requires linear cost output")
+            if self.cost_actor_feature_refresh:
+                raise ValueError(
+                    "cost holdout guard first ablation requires feature refresh disabled")
+            if self.cost_s0_aux_coef > 0.0:
+                raise ValueError(
+                    "cost holdout guard currently requires cost_s0_aux_coef=0")
+            if self.cost_shared_backbone_coef > 0.0:
+                raise ValueError(
+                    "cost holdout guard currently requires shared backbone coef=0")
+            if self.actor_update_interval != 1:
+                raise ValueError(
+                    "cost holdout guard currently requires actor_update_interval=1")
 
         # C-H6首轮只改变QCPO_refs式共享表示梯度，不同时混入IQN、局部网格、
         # target/crossfit查询、独立cost-LSTM或actor cadence。严格限制组合使中长跑
@@ -987,6 +1042,13 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_cost_transition_replay_mean_loss = 0.0
         self.cost_transition_replay_update_events = 0
         self.cost_transition_replay_first_active_step = -1
+        # guard缓存仅含上一rollout的s0 feature/action/MC label；从不进入backward。
+        self.cost_holdout_cache = None
+        self.cost_holdout_guard_events = 0
+        self.cost_holdout_guard_stop_events = 0
+        self.cost_holdout_guard_restore_events = 0
+        self.cost_holdout_guard_first_active_step = -1
+        self.last_cost_holdout_guard = {}
         self.last_s0_holdout_pre = {}                          # 最新新批训练前校准
         self.last_s0_holdout_post = {}                         # 同一批critic更新后校准
         self.empirical_cost_window = deque(maxlen=self.pid_window_episodes)
@@ -1030,6 +1092,9 @@ class DQCACBetaGPU(VecAgentBase):
               f"/replay{self.cost_s0_replay_batches}, "
               f"transition_replay={self.cost_transition_replay_batches}"
               f"/coef{self.cost_transition_replay_coef:g}, "
+              f"holdout_guard={self.cost_holdout_guard}"
+              f"/rtol{self.cost_holdout_relative_tolerance:g}"
+              f"/atol{self.cost_holdout_absolute_tolerance:g}, "
               f"cost_mean_anchor={self.cost_mean_anchor_coef:g}"
               f"/scale{self.cost_mean_anchor_cost_scale:g}, "
               f"cost_output={self.cost_quantile_output}"
@@ -1159,6 +1224,8 @@ class DQCACBetaGPU(VecAgentBase):
             actor_updated = False
             actor_updates_completed = 0
             actor_early_stopped = False
+            # 上一rollout在本轮只用于无梯度选择；第一轮cache为空，state=None。
+            cost_holdout_state = self._begin_cost_holdout_guard()
 
             def apply_actor_epoch():
                 """执行一次允许的actor epoch，并统一维护early-stop/scheduler计数。"""
@@ -1197,7 +1264,20 @@ class DQCACBetaGPU(VecAgentBase):
                 if actor_before_critic:
                     apply_actor_epoch()
 
-                critic_info = self.update_critic(batch)
+                cost_update_allowed = (
+                    cost_holdout_state is None
+                    or not cost_holdout_state['stopped'])
+                critic_info = self.update_critic(
+                    batch, apply_cost_update=cost_update_allowed)
+                # 在同一步actor epoch之前完成验证/回滚；因此被拒绝的head不会继续
+                # 驱动本epoch风险优势。reward critic的本步更新按设计保留。
+                cost_update_retained = bool(
+                    critic_info['critic/cost_update_applied'])
+                if cost_holdout_state is not None and cost_update_allowed:
+                    cost_update_retained = self._guard_cost_holdout_after_step(
+                        cost_holdout_state, update_idx + 1)
+                critic_info['critic/cost_update_retained'] = float(
+                    cost_update_retained)
                 # 标量 reward value 在warmup中也训练；actor仍由下面的in_warmup控制。
                 # value每个epoch拟合同一批冻结λ-return，actor复用冻结advantage。
                 if self.reward_actor_mode != 'distributional' and not self.recurrent_policy:
@@ -1216,6 +1296,8 @@ class DQCACBetaGPU(VecAgentBase):
                         critic_info['critic/cost_mean_anchor_loss']),
                     'cost_objective_loss': float(
                         critic_info['critic/cost_objective_loss']),
+                    'cost_update_retained': float(
+                        critic_info['critic/cost_update_retained']),
                 })
                 if actor_epoch_allowed and not actor_before_critic:
                     apply_actor_epoch()
@@ -1235,7 +1317,7 @@ class DQCACBetaGPU(VecAgentBase):
                                 'reward_grad_norm', 'cost_head_grad_norm',
                                 'cost_history_grad_norm', 'grad_clipped',
                                 'cost_qr_loss', 'cost_mean_anchor_loss',
-                                'cost_objective_loss')
+                                'cost_objective_loss', 'cost_update_retained')
                 }
                 cost_grad = diagnostic_sequences['cost_grad_norm']
                 cost_head_grad = diagnostic_sequences['cost_head_grad_norm']
@@ -1292,7 +1374,16 @@ class DQCACBetaGPU(VecAgentBase):
                         cost_objective_loss.min()),
                     'critic/cost_objective_loss_last': float(
                         cost_objective_loss[-1]),
+                    'critic/cost_update_retained_count': float(
+                        diagnostic_sequences['cost_update_retained'].sum()),
+                    'critic/cost_update_retained_fraction': float(
+                        diagnostic_sequences['cost_update_retained'].mean()),
                 })
+
+            # 若最后几个step仍在容忍带内但不是真正best，这里恢复best后再做post
+            # calibration和下一rollout。第一轮/默认关闭只返回全零诊断，不复制参数。
+            critic_info.update(self._finalize_cost_holdout_guard(
+                cost_holdout_state))
 
             if self.cost_actor_query_mode == 'preupdate':
                 # actor缓存发生在首个critic step之前；这里用同一实际动作和budget
@@ -1405,6 +1496,7 @@ class DQCACBetaGPU(VecAgentBase):
             # 若在prequential阶段提前入队，本轮会把同一批同时当current和replay，
             # 既没有新增跨rollout监督，又会破坏预注册的50/50语义。
             self._append_cost_transition_replay(batch)
+            self._append_cost_holdout(batch)
             if actor_updated:
                 self.actor_scheduler.step()                    # 每个有 actor update 的 rollout 推进一步
             if dual_updated and self.dual_update_mode == 'critic_adam':
@@ -2118,6 +2210,251 @@ class DQCACBetaGPU(VecAgentBase):
             'targets': batch['mc_cost'].detach().clone(),
         })
 
+    @torch.no_grad()
+    def _append_cost_holdout(self, batch):
+        """
+        缓存上一rollout的s0监督；该缓存只查询，不进入任何backward。
+
+        feature/action/label都从同一time-major batch的前B行抽取，所以它们严格对应
+        真实初始状态动作。clone只在显式开启guard时发生，默认路径不增加显存复制。
+        """
+        if not self.cost_holdout_guard:
+            return
+        sample_count = int(batch['disc_cost'].numel())
+        features = batch.get('cost_feature')
+        if features is None or features.requires_grad:
+            raise RuntimeError(
+                "cost holdout guard requires detached cost_feature")
+        self.cost_holdout_cache = {
+            'features': features[:sample_count].detach().clone(),
+            'actions': batch['actions'][:sample_count].detach().clone(),
+            'targets': batch['disc_cost'].detach().clone(),
+        }
+
+    @torch.no_grad()
+    def _cost_holdout_metrics(self):
+        """
+        在上一rollout真实a0上计算hard/smooth Brier与mean-cost误差。
+
+        smooth-Brier是选择指标，因为正式actor同样使用T=1 sigmoid CDF；hard-Brier
+        和两种总体CDF仍完整记录，避免“平滑分数改善”掩盖离散查询概率的退化。
+        """
+        if self.cost_holdout_cache is None:
+            return None
+        cached = self.cost_holdout_cache
+        inputs = self._cost_inputs(None, 0, cached['features'])
+        quantiles = self._cost_quantiles(
+            self.cost_critic, inputs, cached['actions'])
+        labels = (cached['targets'] >= float(self.cost_limit)).float()
+        hard_probability = self._cost_tail_probability(
+            quantiles, float(self.cost_limit), mode='hard')
+        smooth_probability = self._cost_tail_probability(
+            quantiles, float(self.cost_limit), mode='sigmoid')
+        predicted_mean, _ = self._cost_quantile_moments(quantiles)
+        return {
+            'hard_brier': float(
+                (hard_probability - labels).pow(2).mean().item()),
+            'smooth_brier': float(
+                (smooth_probability - labels).pow(2).mean().item()),
+            'hard_cdf': float(hard_probability.mean().item()),
+            'smooth_cdf': float(smooth_probability.mean().item()),
+            'truth': float(labels.mean().item()),
+            'pred_cost_mean': float(predicted_mean.mean().item()),
+            'truth_cost_mean': float(cached['targets'].mean().item()),
+            'samples': float(cached['targets'].numel()),
+        }
+
+    @torch.no_grad()
+    def _snapshot_cost_holdout_state(self):
+        """
+        只复制cost head及其Adam槽；reward critic和Adam状态不属于回滚范围。
+
+        critic_optimizer是joint Adam，但state按Parameter独立存放。逐cost参数复制
+        step/exp_avg/exp_avg_sq即可恢复cost优化时间轴，同时保留已经完成的reward步。
+        """
+        parameters = list(self.cost_critic.parameters())
+        model_state = {
+            key: value.detach().clone()
+            for key, value in self.cost_critic.state_dict().items()
+        }
+        optimizer_state = []
+        for parameter in parameters:
+            state = self.critic_optimizer.state.get(parameter)
+            optimizer_state.append(
+                None if state is None else {
+                    key: (value.detach().clone() if torch.is_tensor(value)
+                          else copy.deepcopy(value))
+                    for key, value in state.items()
+                })
+        return {'model': model_state, 'optimizer': optimizer_state}
+
+    @torch.no_grad()
+    def _restore_cost_holdout_state(self, snapshot):
+        """
+        恢复选择到的cost参数/Adam时钟，保留已经完成的reward critic更新。
+
+        对没有Adam槽的初始参数使用pop；已有槽则整体替换，不能只恢复权重却留下
+        坏step产生的动量，否则下一次梯度仍会沿被拒绝的方向更新。
+        """
+        parameters = list(self.cost_critic.parameters())
+        saved_optimizer = snapshot['optimizer']
+        if len(parameters) != len(saved_optimizer):
+            raise RuntimeError(
+                "cost holdout optimizer snapshot lost parameter alignment")
+        self.cost_critic.load_state_dict(snapshot['model'], strict=True)
+        for parameter, saved_state in zip(parameters, saved_optimizer):
+            if saved_state is None:
+                self.critic_optimizer.state.pop(parameter, None)
+                continue
+            self.critic_optimizer.state[parameter] = {
+                key: (value.detach().clone() if torch.is_tensor(value)
+                      else copy.deepcopy(value))
+                for key, value in saved_state.items()
+            }
+
+    def _begin_cost_holdout_guard(self):
+        """
+        用上一rollout建立step-0基线；第一轮无缓存，因此不改变历史C20路径。
+
+        best_snapshot在每次真正改善smooth-Brier时替换；容忍带只决定是否允许继续，
+        不会把“略差但未越界”的参数误记成best。
+        """
+        if not self.cost_holdout_guard or self.cost_holdout_cache is None:
+            return None
+        metrics = self._cost_holdout_metrics()
+        self.cost_holdout_guard_events += 1
+        if self.cost_holdout_guard_first_active_step < 0:
+            self.cost_holdout_guard_first_active_step = self.learning_steps
+        return {
+            'best_score': metrics['smooth_brier'],
+            'best_metrics': metrics,
+            'best_snapshot': self._snapshot_cost_holdout_state(),
+            'initial_metrics': metrics,
+            'last_metrics': metrics,
+            'best_update': 0,
+            'attempted_updates': 0,
+            'stop_update': -1,
+            'stopped': False,
+            'restored': False,
+            'current_is_best': True,
+        }
+
+    def _guard_cost_holdout_after_step(self, state, update_number):
+        """
+        超过step-0/best容忍带时立即回滚，使同一步后续actor查询恢复后的head。
+
+        update_critic已经保留reward Adam step；这里只恢复cost参数与cost Adam槽。
+        后续C-step仍计算完整cost梯度用于相同joint-clip尺度，但在Adam前设为None。
+        """
+        if state is None or state['stopped']:
+            return False
+        metrics = self._cost_holdout_metrics()
+        score = metrics['smooth_brier']
+        state['attempted_updates'] += 1
+        allowed = (
+            state['best_score']
+            * (1.0 + self.cost_holdout_relative_tolerance)
+            + self.cost_holdout_absolute_tolerance)
+        if not np.isfinite(score) or score > allowed:
+            self._restore_cost_holdout_state(state['best_snapshot'])
+            restored_metrics = self._cost_holdout_metrics()
+            if abs(restored_metrics['smooth_brier']
+                   - state['best_score']) > 1e-6:
+                raise RuntimeError(
+                    "cost holdout rollback did not restore best score")
+            state.update({
+                'last_metrics': restored_metrics,
+                'stop_update': int(update_number),
+                'stopped': True,
+                'restored': True,
+                'current_is_best': True,
+            })
+            self.cost_holdout_guard_stop_events += 1
+            self.cost_holdout_guard_restore_events += 1
+            return False
+        state['last_metrics'] = metrics
+        state['current_is_best'] = score < state['best_score']
+        if state['current_is_best']:
+            state['best_score'] = score
+            state['best_metrics'] = metrics
+            state['best_snapshot'] = self._snapshot_cost_holdout_state()
+            state['best_update'] = int(update_number)
+        return True
+
+    def _finalize_cost_holdout_guard(self, state):
+        """
+        回滚到全轮best（若末step仅在容忍带内），并返回可直接写W&B的机械证据。
+
+        immediate stop和end-of-loop selection分开记录：early_stopped只表示越过容忍带，
+        restored还包括末step合法但不是best的最终选择。
+        """
+        if state is None:
+            info = {
+                'critic/cost_holdout_guard_active': 0.0,
+                'critic/cost_holdout_guard_samples': 0.0,
+                'critic/cost_holdout_initial_smooth_brier': 0.0,
+                'critic/cost_holdout_best_smooth_brier': 0.0,
+                'critic/cost_holdout_selected_smooth_brier': 0.0,
+                'critic/cost_holdout_selected_hard_brier': 0.0,
+                'critic/cost_holdout_selected_update': 0.0,
+                'critic/cost_holdout_attempted_updates': 0.0,
+                'critic/cost_holdout_stop_update': -1.0,
+                'critic/cost_holdout_early_stopped': 0.0,
+                'critic/cost_holdout_restored': 0.0,
+            }
+        else:
+            if not state['stopped'] and not state['current_is_best']:
+                self._restore_cost_holdout_state(state['best_snapshot'])
+                state['last_metrics'] = self._cost_holdout_metrics()
+                state['restored'] = True
+                state['current_is_best'] = True
+                self.cost_holdout_guard_restore_events += 1
+            initial = state['initial_metrics']
+            selected = state['last_metrics']
+            info = {
+                'critic/cost_holdout_guard_active': 1.0,
+                'critic/cost_holdout_guard_samples': selected['samples'],
+                'critic/cost_holdout_initial_smooth_brier': (
+                    initial['smooth_brier']),
+                'critic/cost_holdout_best_smooth_brier': state['best_score'],
+                'critic/cost_holdout_selected_smooth_brier': (
+                    selected['smooth_brier']),
+                'critic/cost_holdout_selected_hard_brier': (
+                    selected['hard_brier']),
+                'critic/cost_holdout_selected_update': float(
+                    state['best_update']),
+                'critic/cost_holdout_attempted_updates': float(
+                    state['attempted_updates']),
+                'critic/cost_holdout_stop_update': float(
+                    state['stop_update']),
+                'critic/cost_holdout_early_stopped': float(state['stopped']),
+                'critic/cost_holdout_restored': float(state['restored']),
+                'critic/cost_holdout_selected_cdf': selected['smooth_cdf'],
+                'critic/cost_holdout_truth': selected['truth'],
+                'critic/cost_holdout_selected_pred_cost_mean': (
+                    selected['pred_cost_mean']),
+                'critic/cost_holdout_truth_cost_mean': (
+                    selected['truth_cost_mean']),
+            }
+        info.update({
+            'critic/cost_holdout_guard_configured': float(
+                self.cost_holdout_guard),
+            'critic/cost_holdout_guard_events': float(
+                self.cost_holdout_guard_events),
+            'critic/cost_holdout_guard_stop_events': float(
+                self.cost_holdout_guard_stop_events),
+            'critic/cost_holdout_guard_restore_events': float(
+                self.cost_holdout_guard_restore_events),
+            'critic/cost_holdout_guard_first_active_step': float(
+                self.cost_holdout_guard_first_active_step),
+            'critic/cost_holdout_relative_tolerance': (
+                self.cost_holdout_relative_tolerance),
+            'critic/cost_holdout_absolute_tolerance': (
+                self.cost_holdout_absolute_tolerance),
+        })
+        self.last_cost_holdout_guard = dict(info)
+        return info
+
     def _backward_cost_transition_replay(self, replay_scale, mean_anchor_scale):
         """
         对旧rollout cost监督反传一次加权目标，并返回与当前批分离的诊断。
@@ -2407,13 +2744,15 @@ class DQCACBetaGPU(VecAgentBase):
 
         return loss_value, mean_loss_value
 
-    def update_critic(self, batch):
+    def update_critic(self, batch, apply_cost_update=True):
         """
         更新 reward/cost 两个 QR-TD critic；可选 transition chunking 降低 N² 峰值显存。
 
         chunk 路径对每块 mean loss 乘 `chunk_size/total_size` 后 backward，所有块
         共享一次 zero_grad/clip/optimizer.step。因此它与整批 mean loss 的梯度定义
-        相同，不会因为块数增加而偷偷放大学习率。
+        相同，不会因为块数增加而偷偷放大学习率。apply_cost_update=False仍计算
+        完整cost梯度并参与joint clip，但在Adam.step前把cost grad设为None；这样
+        reward梯度缩放保持可比，cost参数和Adam动量/step都不会暗中前进。
         """
         # 共享backbone或显式current-refresh下，每个actor epoch后表示都会变化；
         # head更新前必须在no_grad下刷新。两项均关闭时不增加actor forward。
@@ -2722,6 +3061,11 @@ class DQCACBetaGPU(VecAgentBase):
         joint_grad_norm = gradient_norm(joint_parameters)
         if self.critic_grad_clip and self.critic_grad_clip > 0:
             nn.utils.clip_grad_norm_(joint_parameters, self.critic_grad_clip)
+        # Adam对grad=None的参数完全跳过：不改weight、不推进step、也不应用旧动量。
+        # 必须在joint clip之后清除，reward梯度仍使用与完整双critic相同的缩放因子。
+        if not apply_cost_update:
+            for parameter in cost_parameters:
+                parameter.grad = None
         self.critic_optimizer.step()
 
         # Bernoulli查询head使用独立optimizer/clip；默认关闭时不执行forward/backward，
@@ -2801,6 +3145,7 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/cost_history_grad_norm': float(
                 cost_history_grad_norm.item()),
             'critic/cost_grad_norm': float(cost_grad_norm.item()),
+            'critic/cost_update_applied': float(apply_cost_update),
             'critic/joint_grad_norm': float(joint_grad_norm.item()),
             'critic/grad_clip_fraction': float(
                 joint_grad_norm.item() > self.critic_grad_clip
@@ -4209,6 +4554,8 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_actor_feature_refresh),
             'debug/cost_transition_replay_enabled': float(
                 self.cost_transition_replay_batches > 0),
+            'debug/cost_holdout_guard_enabled': float(
+                self.cost_holdout_guard),
             'debug/cost_history_cost_lstm': float(
                 self.cost_history_mode == 'cost_lstm'),
             'debug/cost_critic_time_weighted': float(
@@ -4607,6 +4954,19 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_transition_replay_update_events),
             'cost_transition_replay_first_active_step': (
                 self.cost_transition_replay_first_active_step),
+            'cost_holdout_guard': self.cost_holdout_guard,
+            'cost_holdout_relative_tolerance': (
+                self.cost_holdout_relative_tolerance),
+            'cost_holdout_absolute_tolerance': (
+                self.cost_holdout_absolute_tolerance),
+            'cost_holdout_guard_events': self.cost_holdout_guard_events,
+            'cost_holdout_guard_stop_events': (
+                self.cost_holdout_guard_stop_events),
+            'cost_holdout_guard_restore_events': (
+                self.cost_holdout_guard_restore_events),
+            'cost_holdout_guard_first_active_step': (
+                self.cost_holdout_guard_first_active_step),
+            'cost_holdout_guard_last': dict(self.last_cost_holdout_guard),
             'cost_mean_anchor_coef': self.cost_mean_anchor_coef,
             'cost_mean_anchor_cost_scale': self.cost_mean_anchor_cost_scale,
             'cost_mean_anchor_scale': self._cost_mean_anchor_scale(

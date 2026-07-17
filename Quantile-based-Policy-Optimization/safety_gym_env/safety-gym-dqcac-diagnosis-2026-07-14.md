@@ -1907,3 +1907,11 @@ C-H9R的工程实现完全按设计运行：首轮无旧批，此后每个cost s
 训练时序解释了为什么。replay不是无偏地增加独立样本，而是把“上一policy、上一hidden坐标、上一批cost基率”的监督持续注入当前head。mean anchor又强迫同一head同时追随混合均值。末5批pre-Brier恶化85%、pre-CDF error恶化81%，lambda均值从0.087升到0.562；最后一批pre预测mean 18.577，真实只有10.550。它把上一批的高cost记忆变成了跨policy持续偏置，quantile更少crossing不代表查询点概率更准。
 
 因此不应继续扫描replay系数或堆更多旧批。下一项要把旧rollout从training target改成validation set：当前rollout仍负责梯度，上一rollout只判断cost head在哪个更新step开始对未见批次变坏，并在此后停止cost梯度或恢复最佳cost参数及相应Adam状态；reward critic仍完成原定C20，Actor/PID/环境步不变。这个实验区分“跨批信息本身有用”与“把跨批标签直接混进目标会产生分布滞后”。若held-out选择仍失败，再分别测试小cost adapter/PCGrad或QCPO_refs式Weibull低方差辅助，不能同时混合。
+
+### 13.112 retention holdout guard用旧批选择当前cost step，不把分布滞后写入训练目标（2026-07-17）
+
+实现采用上一rollout的s0 feature、真实a0和MC标签计算T1 smooth-Brier。该批曾在上一轮训练critic，所以它不是统计学上从未见过的独立验证集；它检验的是当前批更新是否破坏刚刚学到的跨rollout关系。这个名称边界很重要：若它成功，结论只能是“抑制catastrophic forgetting有用”，不能声称得到无偏泛化误差估计。
+
+guard在每轮开始保存cost head及其独立Adam槽。越过5%+0.002容忍带后，当前坏step的cost权重和动量一起回滚；reward critic参数/Adam不回滚。后续step仍反传cost并参与joint gradient clipping，随后把cost grad设为None，因此reward的裁剪尺度与原双critic路径一致，而PyTorch Adam会完全跳过cost参数。默认关闭60张量逐位回归、T32启用smoke、T1000高LR强制rollback和纯张量Adam状态测试共同覆盖这条作用链。
+
+正式实验只在C-H8 B40 seed2上打开guard。关键判据不是同一个旧批Brier能否下降，而是下一rollout的prequential Brier和fresh512安全性是否改善；否则它只是保存已见样本、没有解决新trajectory校准。通过门及耗时预算详见调试账本E131。
