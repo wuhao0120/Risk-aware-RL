@@ -1561,3 +1561,13 @@ N64出现了一个值得记录但不能选择性放大的结果：独立hard-CDF
 P-M7必须在压力seed1完整跑1M，因为它只有25次Actor事件，100k/300k的更新次数更少，早期落后很可能只是学习时间轴变化。1M后先看内置screen，再以fresh520相对P-M3的0.8622 reward和0.3058 outage裁决；正式门为outage不高于0.22且至少降低0.08、reward不低于0.75，并要求末200k没有更强闭环振荡。通过后扩两个seed，接近门且仍在改善才延2M；论文最终比较仍是5M、多seed、统一独立评估。
 
 若P-M7失败，结论只针对“Critic/PID每B20、Actor每B40”这一时序，不能外推为所有低频更新都无效。PID同步到B40、skip-and-drop、多个critic初始化、interval4以及B40与cadence组合都记录为独立路线；它们改变的机制不同，应作为轻量机制验证或消融分别预注册，不能事后叠加成无法归因的组合。
+
+### 13.71 P-M7的意义：有用但未达标，值得一次2M而不是立即扩seed（2026-07-17）
+
+完整1M推翻了两个过度简单的说法。第一，重复PPO update并没有因为旧概率处理错误而天然off-policy：P-M7全程首epoch ratio最大误差不超过2.2e-5，旧log-prob固定、当前log-prob逐epoch重算、clip链路正常。第二，降低Actor事件频率也不会自动消除振荡：末200k训练outage标准差反而从P-M3的0.0678升到0.1044，KL和clip几乎不变，600k和800k后都能看到PID风险周期。
+
+但这个组件不是无效。统一当前evaluator的520回合中，reward从0.8342升到0.9614，outage从0.3038降到0.2538；hard/smooth CDF误差下降67%/69%，mean-cost误差下降64%，Brier下降18.7%，crossing也略降。它与N64的“一个总体CDF点变漂亮”不同，proper score和分布矩都给出同方向证据。最直接的解释是：同一个behavior policy收集40条而不是20条独立轨迹，改善了risk advantage所依赖的critic泛化。
+
+结论仍然直白：P-M7没有过安全门。候选outage的Wilson 95%区间为[0.2183,0.2930]，整体高于alpha=0.20；相对P-M3下降0.05的保守区间上界仍略跨0。它不能据此扩多seed或宣称超过QCPO_refs。与此同时，reward显著提高、六类风险估计指标同向改善，而1M只有25个Actor事件，使“训练时间轴偏短”成为比N64/local更可信的可能性。
+
+因此只允许一次从头2M长度审计。总迭代数不进入学习率公式，前1M应严格复现现有run；这既验证可重复性，也让P-M7获得与P-M3 1M相同的50次Actor事件。2M仍使用原门，不因1M接近就放宽：reward至少0.75、outage不高于0.22，Brier和mean/CDF不能反弹，末400k周期不能变大。若通过，再补同预算P-M3并做多seed；若失败，就停止原样延长，优先检验PID与Actor同步每两批更新，避免controller在一次Actor响应前连续积累两次误差。
