@@ -1260,3 +1260,22 @@
 - fresh520强门：reward≥.75、outage≤.22，且相对P-M8 seed0的`170/520=.32692`至少下降.08；hard/smooth CDF、mean-cost error和Brier Skill不得出现类似P-M9的数量级发散。机制门为400k--1M的window probability或lambda mean absolute jump相对P-M8 seed0至少下降20%，并报告新增滞后。
 - seed0通过才原样扩seed1/2；失败则window100保留为“信号减振但无性能收益”消融，不扫描75/125/150/200。若只通过机制门且fresh接近安全门，仍不移动门槛，先检查是否为窗口滞后造成reward或风险代价。
 - 独占A100预计纯训练6.5--8分钟、140评估约1分钟、条件fresh520约4--5分钟，总墙钟12--14分钟。正式job只用`launch_background.sh`持久化，W&B使用脱敏online；run name/tags/config只含公开算法语义，checkpoint与绝对路径不上传。
+
+
+### E97：P-M10结果——控制信号显著减振，但以可重复的reward损失换取安全（2026-07-17）
+
+- 正式持久化job正常`exit 0`，绑定提交`08a806a`；W&B online run为`p5tv7sij`，50行history完整到`1,000,000`步，纯训练`396.77s`。远端name/group/tags只含算法公开语义；115个公开config键中未发现绝对路径、机器/源码/Git字段或token/secret/password/credential类字段。评估使用`wandb_mode=disabled`，没有为纯评估创建远端run。
+- 单变量因果检查成立：P-M8和P-M10从初始化到`420k`的全部训练输出一致，首次差异出现在`440k`同一reward下的lambda `0.0691→0.0138`。如果在300k或400k裁决，本实验会被错误地报告为“没有作用”；窗口属于慢闭环变量，完整1M是必要的。
+- 五个固定200k阶段中，P-M8→P-M10的`reward/outage/lambda`均值依次为：`0.0256/0.005/0→0.0256/0.005/0`、`0.3825/0.100/0→0.3825/0.100/0`、`0.6763/0.255/0.1555→0.7969/0.275/0.1087`、`0.8263/0.205/0.1253→0.7290/0.290/0.3393`、`0.9294/0.335/0.3731→0.7088/0.205/0.3455`。window100在400--600k先提高reward，随后更早维持安全惩罚并落入低reward、低outage轨迹；它不是简单让所有阶段都变慢。
+- 预注册机制门明确通过。400k--1M的实际P-M10相对实际P-M8 seed0，window probability mean absolute jump由`0.07600→0.03267`，下降`57.02%`；lambda jump由`0.09026→0.04286`，下降`52.51%`。预测下一B40 raw outage的MAE还由`0.09100→0.05333`，改善`41.39%`，没有出现离线window200那种明显迟滞。logged window100按正式leaky-PI公式重放lambda的最大误差仅`8.41e-9`。
+- 1M内部140回合screen为`reward/outage=0.71810/29÷140=0.20714`，通过宽松的`.60/.40`门；随后持久化fresh520评估正常`exit 0`。正式结果为`reward=0.73771±0.43746`、`outage=104÷520=0.20000`，reward均值95%区间`[0.70011,0.77531]`，outage Wilson区间`[0.16788,0.23652]`。点估计恰好满足名义alpha=.20和工程门.22，但reward比预注册`.75`下限低`.01229`。
+- 相对P-M8 seed0 fresh520，reward差为`-0.15820`，Welch 95%区间`[-0.20883,-0.10758]`；outage差为`-0.12692`，Newcombe 95%区间`[-0.17937,-0.07355]`。两项交换都远大于评估抽样误差：窗口平滑确实让策略更安全，也确实损失reward，不能称为免费稳定性提升。
+- critic没有发生P-M9那种数量级崩溃，但也没有变成可靠条件风险模型。hard-CDF error `0.07885→0.07506`改善`4.80%`，smooth error `0.07630→0.07713`恶化`1.08%`，mean-cost error `1.5165→1.7297`恶化`14.06%`；raw Brier因outage基率下降而改善`25.57%`，但Brier Skill从`-3.44%→-5.89%`，反而下降`2.45`个百分点。crossing由`0.07463→0.06408`略降，仍不能替代校准证据。
+- 严格裁决：机制门、安全门和相对outage改善门通过，校准未发散，但reward门失败；因此不扩seed1/2、不扫描window75/125/150/200，也不因reward区间包含.75而改用区间上界。P-M10被保留为“有效控制减振组件/安全--reward消融”，不是当前主配置。它说明controller噪声是问题的一部分，但平滑scalar lambda不能修复BSS持续为负的action-conditioned risk方向。
+- 正式history位于`_runs/wandb_export/dqc_pm10_pid_window100_seed0_1m_2026-07-17/`；机制审计位于`_runs/profiles/dqc_pm10_pid_window100_mechanism_seed0_2026-07-17/`；P-M8/P-M10训练和fresh520比较位于`_runs/profiles/dqc_pm8_pm10_pid_window_seed0_2026-07-17/`。`comparison.png/overview.png/pid_window_replay.png`尺寸分别为`2775×1895/2880×4128/3105×773`，均由PIL解码；fresh比较图已目视检查，标签、区间和alpha参考线正常。
+
+### E98：P-M10终点pre-update轻量诊断预注册（2026-07-17）
+
+- P-M10 fresh520的reward只比门低`.01229`，但末200k训练reward长期均值也只有`.70883`。为区分“最后一次B40联合更新造成终点跳变”与“window100在后400k已形成持续低reward路径”，只对`rollout_step001000000.pt`做同一seed、同一当前evaluator的140回合eval-only诊断；不新增训练，不修改正式E97失败裁决。
+- 只比较pre/post的reward、outage、CDF/Brier/mean-cost和crossing。若pre相对post的reward至少高`.08`且outage不恶化超过`.03`，则把“限制单次Actor/critic联合移动”列为下一候选；否则认为主要是跨多个控制事件的路径/风险表示问题，优先保守action-risk不确定性或跨rollout critic validation。无论结果如何，本诊断不触发seed扩展、window扫描或事后checkpoint择优fresh520。
+- 预计140回合约1--2分钟，使用`launch_background.sh`持久化、`wandb_mode=disabled`，结果与checkpoint均留在`/vepfs`。

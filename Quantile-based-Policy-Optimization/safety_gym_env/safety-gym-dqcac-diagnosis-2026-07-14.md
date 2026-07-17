@@ -1671,3 +1671,18 @@ P-M8修正了PID与Actor频率，却保留50条episode窗口。每次PID事件�
 离线重放不能预测策略反事实，所以P-M10必须完整跑1M。它以P-M8 seed0为基线，仅将window50改为100；target仍为0.15，不混入P-M9失败的0.10，不加target-KL、critic early stop或新网络。目标是检验平滑P项输入能否让高风险seed减少闭环跳变，同时避免固定更大margin造成的reward损失。
 
 正式520门保持reward至少0.75、outage不高于0.22，并要求比P-M8 seed0至少改善0.08；critic校准不能数量级发散。机制上要求成熟期window probability或lambda jump至少下降20%。通过才扩其他seed，失败不扫描中间窗口。预计独占训练6.5--8分钟，含评估12--14分钟，使用持久化后台与脱敏W&B online。
+
+
+### 13.83 P-M10裁决：平滑PID输入有效，但不能单独成为更好的算法（2026-07-17）
+
+P-M10完整1M并不是“没有作用”。相对P-M8 seed0，400k--1M的window probability平均跳变下降57.0%，lambda平均跳变下降52.5%，预测下一B40 raw outage的误差还改善41.4%。因此window100确实减少了controller追逐有限B40样本的噪声，而且没有用明显新增滞后换取平滑。P-M8与P-M10到420k完全一致、440k才首次分叉，也再次证明300k短跑不够裁决PID闭环参数。
+
+但性能交换同样明确。统一fresh520中，P-M8→P-M10的reward为`0.89591→0.73771`，差`-0.15820`且95%区间`[-0.20883,-0.10758]`；outage为`170/520=0.32692→104/520=0.20000`，差`-0.12692`且区间`[-0.17937,-0.07355]`。P-M10恰好到达名义alpha=.20，却比预注册reward门.75低0.01229。安全改善和reward损失都不是520条抽样噪声。
+
+训练动态表明这不是单纯“收敛更慢”。P-M10在400--600k的reward反而高于P-M8（0.797对0.676），随后在600--800k维持更高lambda和outage，末200k才落到reward/outage=`0.709/0.205`；P-M8末200k则是`0.929/0.335`。窗口改变了闭环经过的策略盆地，使高风险seed从高reward高风险端移动到低reward安全端，而不是提高同一前沿上的整体效率。
+
+distributional critic仍是主要上限。hard/smooth总体CDF误差基本不变，mean-cost误差恶化14%；raw Brier随更低outage基率下降，但Brier Skill从-3.44%降到-5.89%。也就是说，controller更平稳并未让逐状态条件风险预测超过常数基率。只调PID窗口可以移动reward--safety工作点，不能修复actor所依赖的action-risk方向。
+
+因此按预注册规则不扩seed、不扫中间窗口，也不把“只差0.012”当成移动门槛的理由。window100保留为有效减振消融，未来只有在条件risk估计真正改善后才值得重新组合。当前只补一个140回合pre-update诊断，判断最终reward损失是否集中在最后一次联合更新；该诊断不改变P-M10失败裁决，也不用于事后选择漂亮checkpoint。若终点更新不是主因，下一主线应从保守action-risk不确定性或跨rollout validation入手，而不是继续微调scalar PID。
+
+正式数据和图位于`_runs/wandb_export/dqc_pm10_pid_window100_seed0_1m_2026-07-17/`、`_runs/profiles/dqc_pm10_pid_window100_mechanism_seed0_2026-07-17/`与`_runs/profiles/dqc_pm8_pm10_pid_window_seed0_2026-07-17/`。正式训练W&B online run为`p5tv7sij`，公开字段隐私审计通过；纯评估不创建远端run。
