@@ -2087,3 +2087,22 @@ rho0的fresh outage为0.25，rho1为0.135；两端跨过了0.20，且rho1的crit
 实验仍跑满B40×25×T1000=1M，预计训练约7分钟、内部评估1--2分钟，内部宽screen通过后fresh512约3--4分钟。性能按双侧工作带[0.18,0.22]裁决：进带后reward至少达到同seed 2M参考0.7954，目标超过1M基线0.8195；机制上要求修正/critic RMS处于有界范围且PPO ratio、KL和所有张量有限。
 
 分歧路线预先固定。rho=.5成功就扩seed而不继续针对seed1插值；仍过保守则停止靠增加trajectory residual追求更低风险，转独立PID setpoint或controller--actor同步；仍不安全但方向和reward都保留，才允许一次rho=.75有界插值。B80、PID增益和rho不能在同一实验中一起改变，否则无法知道改进来自独立trajectory数量、控制器还是风险credit。
+
+
+### 13.131 rho=.5只给出方向性中间点，没有达到双侧outage目标（2026-07-17）
+
+C-H15的独立512条reward/outage为0.8000/0.2324。它相对rho0的0.8195/0.2500沿正确方向移动且保住了2M参考reward 0.7954，但reward和outage差的95%区间都跨0，点估计仍高于[0.18,0.22]。因此严格结论是“未通过但提供有信息的中间点”，不是因为0.232接近0.22就宣布成功。
+
+rho1到rho=.5的变化则显著：reward增加约0.097、outage增加约0.098，两者差区间都不跨0。结合rho0、.5、1三个端点，可以确认trajectory residual强度在移动reward--risk工作点。问题仍是周期：最后五批outage在0.10到0.375之间跳变，训练均值约0.215不能代表最终独立策略风险。
+
+更重要的是当前rho还不是严格的当前策略相对增益。rho=.5后段实际修正/critic标准差比均值0.884、末批1.541；rho1后段均值1.402。component EMA只以0.1权重跟随新批，critic advantage尺度却可在一次联合更新后快速变化，所以历史scale会把相同名义rho转换成时变风险增益。这解释了为什么简单把EMA-rho插值到0.75仍不能回答真正的“相对贡献是多少”。
+
+### 13.132 先固定实际风险增益，再判断剩余循环是否来自controller（2026-07-17）
+
+新增batch reference后，scale直接来自当前behavior batch的critic和residual标准差，并在首个PPO epoch冻结。正常情况下实际correction/critic标准差比精确等于rho；component EMA继续作为诊断，但不再把历史尺度反馈给actor。这个方案可能比EMA承受更多批间尺度噪声，所以它不是先验必胜，只是把控制变量变得可解释。
+
+实现保持默认ema。改前/改后四个checkpoint的176个公共tensor与数组叶子完全一致，解析rho1比为0.99999994，循环smoke、全部有限性、behavior IS ratio和独立checkpoint重载均通过。由此可以把后续差异归因于scale reference，而不是新增参数改变了随机初始化或旧路径。
+
+C-H16使用batch-reference rho1，相对C-H14只改变EMA与当前批的尺度时序。选择1而不是事后拟合0.67，是为了保持一个可复现实验假设：把已观察的后段实际比1.40固定到1.00。fresh512仍必须先落入[0.18,0.22]，然后reward至少0.7954。若实际比已稳定而outage仍在0.10--0.35循环，下一主因就更可能是B40二项噪声、PID每批积分和Actor响应滞后；这时转controller--actor同步比继续调rho更有解释力。
+
+另一条路线是保留EMA并试rho=.75，它利用两个端点插值但不消除时变实际增益；还有B80提高独立trajectory数，但会减少固定预算内更新事件。两条都记录为消融备选，不与当前尺度时序实验同时改变。

@@ -303,6 +303,13 @@ class DQCACBetaGPU(VecAgentBase):
         if self.cost_actor_mc_correction_mode not in {'raw', 'rms_balanced'}:
             raise ValueError(
                 "cost_actor_mc_correction_mode must be 'raw' or 'rms_balanced'")
+        # ema是C-H14/C-H15的历史低通参考；batch使用当前冻结behavior batch，
+        # 在没有floor/max触发时使std(rho*s*residual)/std(critic)精确等于rho。
+        self.cost_actor_mc_balance_reference = str(getattr(
+            args, 'cost_actor_mc_balance_reference', 'ema')).lower()
+        if self.cost_actor_mc_balance_reference not in {'ema', 'batch'}:
+            raise ValueError(
+                "cost_actor_mc_balance_reference must be 'ema' or 'batch'")
         self.cost_actor_mc_balance_std_floor = float(
             getattr(args, 'cost_actor_mc_balance_std_floor', 1e-4))
         self.cost_actor_mc_balance_ratio_max = float(
@@ -1355,7 +1362,8 @@ class DQCACBetaGPU(VecAgentBase):
               f"ppo_target_kl={self.ppo_target_kl:g}, "
               f"actor_cost_query={self.cost_actor_query_mode}"
               f"/mcfix{self.cost_actor_mc_correction_coef:g}"
-              f":{self.cost_actor_mc_correction_mode}, "
+              f":{self.cost_actor_mc_correction_mode}"
+              f"/ref{self.cost_actor_mc_balance_reference}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}"
               f"/interval{self.pid_update_interval}"
               f"/target{self.pid_target_prob:g}, "
@@ -4168,8 +4176,9 @@ class DQCACBetaGPU(VecAgentBase):
         residual_batch_var = float(
             mc_residual.var(unbiased=False).item())
 
-        # raw模式的reference只用于日志，不维护新状态。balanced模式先把当前
-        # behavior批矩合入EMA，再用同一冻结scale构造本批全部PPO epoch的risk target。
+        # raw模式的reference只用于日志，不维护新状态。balanced模式仍把当前
+        # behavior批矩合入EMA作跨批诊断，但配平scale可选择历史EMA或当前batch。
+        # 两种scale都在首个actor epoch冻结，后续PPO epoch绝不随策略前向而改变。
         std_floor = self.cost_actor_mc_balance_std_floor
         critic_scale_reference = max(critic_batch_var, 0.0) ** 0.5
         residual_scale_reference = max(residual_batch_var, 0.0) ** 0.5
@@ -4187,10 +4196,20 @@ class DQCACBetaGPU(VecAgentBase):
                 raise RuntimeError(
                     "rms_balanced component scales must be initialized by "
                     "the first behavior-batch actor query")
-            critic_scale_reference = max(
-                self.cost_actor_critic_adv_rms.std, std_floor)
-            residual_scale_reference = max(
-                self.cost_actor_mc_residual_rms.std, std_floor)
+
+            if self.cost_actor_mc_balance_reference == 'ema':
+                # 兼容C-H14/C-H15：decay=.1的历史尺度可降低单批噪声，但会滞后。
+                critic_scale_reference = max(
+                    self.cost_actor_critic_adv_rms.std, std_floor)
+                residual_scale_reference = max(
+                    self.cost_actor_mc_residual_rms.std, std_floor)
+            else:
+                # 当前batch含实际actor查询的critic/residual。正常尺度高于floor且
+                # ratio_max未触发时，下面的实际correction/critic标准差恰好为rho。
+                critic_scale_reference = max(
+                    critic_scale_reference, std_floor)
+                residual_scale_reference = max(
+                    residual_scale_reference, std_floor)
             balance_scale = min(
                 critic_scale_reference / residual_scale_reference,
                 self.cost_actor_mc_balance_ratio_max)
@@ -5378,6 +5397,8 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_actor_mc_correction_coef),
             'debug/cost_actor_mc_correction_rms_balanced': float(
                 self.cost_actor_mc_correction_mode == 'rms_balanced'),
+            'debug/cost_actor_mc_balance_reference_is_batch': float(
+                self.cost_actor_mc_balance_reference == 'batch'),
             'debug/cost_actor_mc_balance_std_floor': (
                 self.cost_actor_mc_balance_std_floor),
             'debug/cost_actor_mc_balance_ratio_max': (
@@ -5782,6 +5803,8 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_actor_mc_correction_coef),
             'cost_actor_mc_correction_mode': (
                 self.cost_actor_mc_correction_mode),
+            'cost_actor_mc_balance_reference': (
+                self.cost_actor_mc_balance_reference),
             'cost_actor_mc_balance_std_floor': (
                 self.cost_actor_mc_balance_std_floor),
             'cost_actor_mc_balance_ratio_max': (

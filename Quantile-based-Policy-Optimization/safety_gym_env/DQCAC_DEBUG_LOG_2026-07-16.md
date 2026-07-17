@@ -1773,3 +1773,22 @@
 - 使用同一压力seed1、B40×25×T1000=1M、C20/A8，持久化后台和脱敏W&B online。预计纯训练约7分钟、内置128约1--2分钟；内部宽screen为reward至少`.60`、outage位于`.05--.40`且全部数值有限，通过才花约3--4分钟做fresh512。
 - 机制门要求后段实际修正/critic RMS比大致位于`[.25,1.25]`且不出现非有限值；性能门仍首先要求fresh512 outage点估计进入`[.18,.22]`，然后reward至少不低于同seed 2M带内参考`.79542`，目标是不低于1M的`.81951`。低于.18且reward下降仍是过度保守，高于.22仍是风险不足，不因接近某条训练曲线放宽。
 - 若rho=.5进带且reward达到参考，先扩seed0/2，不再继续插值找漂亮seed1；若仍低于.18，停止增加trajectory residual，不把rho=.25默认包装成改进，转PID内部setpoint/控制器同步的独立校准；若高于.22但相对rho0明显改善且reward保留，再把rho=.75作为有边界的插值消融记录，不能同时改B80或PID。若训练继续出现相位循环，则controller--actor同步作为下一条正交实验。
+
+
+### E151：C-H15 rho=.5——reward基本保留但outage仍在目标带上方（2026-07-17）
+
+- 正式job `DQCAC_DynamicButton_ch15_mcbalance_rho05_b40_1m_s1`绑定预注册提交`9e5a4fb`，由持久化后台正常完成，exit0；W&B run为`z40u5ajt`且已finished。相对C-H14只把rho从1减到.5，其余B40×25×T1000=1M、C20/A8、LSTM512、QR32/MC、GAE-PPO、mean-anchor、obs RMS、PID target=.15和LR完全相同。纯训练`408.3s`，所有数值有限。
+- 因果时序正确：lambda为0的前400k与rho0/rho1轨迹逐点相同；44万步lambda首次激活后才分叉。训练仍有明显周期，52万步outage为0，64/84/100万步又分别为`.30/.325/.375`。末20% reward/outage/lambda均值为`.72060/.215/.16282`，outage标准差`.11247`，所以rho减半没有消除闭环振荡。
+- 内置128为reward/outage `.8150/.2500`，通过宽screen后完成fresh512。最终rho0→rho.5为reward `.81951→.79999`、outage `128/512=.25000→119/512=.23242`。reward差`-.01952`的Welch95为`[-.07285,+.03382]`；outage差`-.01758`的Newcombe95为`[-.06986,+.03482]`，两项都不能排除随机差异。rho.5自身outage Wilson95为`[.19791,.27092]`；点估计高于`[.18,.22]`，严格未过双侧工作带，但reward超过预注册最低参考`.79542`。
+- rho1→rho.5的变化更明确：reward增加`.09707`，95%区间`[.04008,.15406]`；outage增加`.09766`，区间`[.05038,.14460]`。三个端点rho0/.5/1的reward/outage依次为`.8195/.2500`、`.8000/.2324`、`.7029/.1348`，说明配平残差强度确实沿reward--risk前沿移动工作点，但rho=.5仍未把点校准到0.20。
+- critic证据相对rho0是混合的：Brier改善5.17%、mean-cost error改善5.37%，hard/smooth CDF error却恶化8.0%/15.8%，crossing增加.0088；相对rho1则所有校准量明显变差。不能把rho=.5写成distributional critic全面改进。
+- 关键机制缺口是名义rho与实际贡献仍不相等。rho=.5后20%的`correction_std/critic_std`均值为`.8842`、范围`[.5725,1.5407]`；rho1后20%均值也为`1.4016`。原因是component EMA decay=.1用历史critic尺度配平，而当前critic advantage会快速收缩或扩张。EMA降低单批尺度噪声，却让风险修正相对当前critic发生滞后增益，可能加重相位循环。因此不直接运行EMA-rho=.75；它的实际强度仍不可控。
+
+### E152：current-batch配平实现、回归与C-H16预注册（2026-07-17）
+
+- 新增默认`cost_actor_mc_balance_reference=ema`，逐位保留C-H14/C-H15；显式`batch`时用当前冻结behavior batch的critic/residual标准差构造scale。只要两者高于`1e-4` floor且scale ratio不触及max1，就有`std(correction)/std(critic)=rho`。component EMA仍更新并记录，只是不再驱动batch模式的scale；同一batch后续PPO epoch继续复用首epoch冻结信号。
+- 改动前先以seed407生成EMA rho1金样本，改动后不显式设置reference复跑。final及64/128/192四个checkpoint共有176个公共tensor/array leaves逐元素完全一致，最大差0；唯一新增summary路径是`cost_actor_mc_balance_reference=ema`。说明默认路径、随机流、优化器、模型和旧EMA公式没有改变。
+- 解析测试使用两轨迹×三时刻，batch rho1实际比为`.99999994`，time-major标签为`[0,1,0,1,0,1]`；第二次PPO式查询的输出完全相同且两个EMA状态不推进。recurrent batch-rho1 smoke训练`7.1s`、exit0，四个checkpoint共172个模块tensor leaves全部有限，首epochratio最大误差`4.57e-5`；独立eval-only成功重建`reference=batch`并加载final checkpoint。
+- C-H16严格复用C-H14的rho1，只把reference从ema改为batch；这是单一尺度时序消融，不改rho、PID、B40、网络、critic、PPO或LR。选择rho1而不是事后拟合rho=.67，是因为它把C-H14后段实际比约1.40降低并固定到1.00，同时略高于C-H15的后段实际均值.884；两个既有端点的真实outage位于.135和.232，故该强度有合理机会落在0.20附近。
+- 正式仍用seed1、B40×25×T1000=1M、C20/A8、持久化后台和脱敏W&B online；预计纯训练7分钟、内部128为1--2分钟，宽screen为reward≥.60、outage在.05--.40且全部有限，通过才做fresh512约3--4分钟。机制硬门是每个Actor事件实际比与1的误差小于`1e-3`；若floor/max触发则必须显式报告，不能假装精确。
+- 性能仍先要求fresh outage点估计进入`[.18,.22]`，再要求reward至少`.79542`，目标不低于`.81951`。通过后扩seed0/2；若精确比仍出现跨带周期或终点失败，则优先controller--actor同步，而不是继续无界扫描rho。保留的分歧路线包括EMA-rho=.75有界插值和B80独立trajectory增量，但前者受本次已观察的增益漂移污染，后者同时改变更新时钟，均不与C-H16混合。
