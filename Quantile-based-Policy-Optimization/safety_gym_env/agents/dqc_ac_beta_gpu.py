@@ -404,6 +404,11 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_shared_cost_mean_loss = 0.0
         self.last_shared_cost_weighted_loss = 0.0
         self.last_shared_cost_feature_refresh_abs_mean = 0.0
+        # 独立保存通用refresh终态；disabled/offline smoke也能从checkpoint
+        # 证明interval合并batch在每个actor step后真正触发了feature重算。
+        self.last_actor_feature_refresh_abs_mean = 0.0
+        self.last_actor_feature_refresh_applied = 0.0
+        self.last_actor_feature_refresh_count = 0
         self.last_shared_cost_body_grad_norm = 0.0
         self.last_shared_cost_lstm_grad_norm = 0.0
         self.last_shared_cost_policy_head_grad_norm = 0.0
@@ -500,6 +505,10 @@ class DQCACBetaGPU(VecAgentBase):
         # - cost_lstm：C-H1，用 cost QR loss 独立训练同输入协议的 MLP+LSTM。
         self.cost_history_mode = str(
             getattr(args, 'cost_history_mode', 'raw')).lower()
+        # 默认False逐式复现C-H0.5/C-H6L；True只修正detach actor_feature的
+        # 表示时序，不把cost梯度写回policy，也不改变raw/cost_lstm路径。
+        self.cost_actor_feature_refresh = bool(
+            getattr(args, 'cost_actor_feature_refresh', False))
         valid_cost_history_modes = {'raw', 'actor_feature', 'cost_lstm'}
         if self.cost_history_mode not in valid_cost_history_modes:
             raise ValueError(
@@ -511,6 +520,15 @@ class DQCACBetaGPU(VecAgentBase):
         # t+N 构造 target cost history，是另一项独立算法改动，不能混入本消融。
         if self.cost_history_mode == 'cost_lstm' and self.cost_target_mode != 'mc':
             raise ValueError("cost_history_mode='cost_lstm' currently requires cost_target_mode='mc'")
+        if self.cost_actor_feature_refresh:
+            if self.cost_history_mode != 'actor_feature':
+                raise ValueError(
+                    "cost_actor_feature_refresh requires cost_history_mode='actor_feature'")
+            # n-step target还依赖t+N处的boot feature；首轮只开放不含boot查询的
+            # 完整MC监督，避免只刷新current input却留下陈旧target input。
+            if self.cost_target_mode != 'mc':
+                raise ValueError(
+                    "cost_actor_feature_refresh currently requires cost_target_mode='mc'")
         if self.cost_s0_aux_coef > 0.0:
             if self.cost_target_mode != 'mc':
                 raise ValueError("cost_s0_aux_coef>0 currently requires cost_target_mode='mc'")
@@ -941,6 +959,7 @@ class DQCACBetaGPU(VecAgentBase):
               f"d(cost_limit)={self.cost_limit}, cost_gamma={self.cost_gamma}, episodic={self.episodic}, "
               f"step_feature={self.critic_step_feature}, N={self.num_quantiles}, B={self.num_envs}, T={self.n}, "
               f"cost_target={self.cost_target_mode}, cost_history={self.cost_history_mode}, "
+              f"cost_feature_refresh={self.cost_actor_feature_refresh}, "
               f"cost_model={self.cost_distribution_model}"
               f"/train{self.cost_iqn_train_quantiles}"
               f"/query{self.cost_iqn_query_quantiles}"
@@ -1094,6 +1113,11 @@ class DQCACBetaGPU(VecAgentBase):
                 if update_applied:
                     actor_updated = True
                     actor_updates_completed += 1
+                    # interval>1时actor_batch是合并后的新dict，而critic仍更新当前
+                    # rollout batch；显式把后者也标脏，下一critic step才能重算新坐标。
+                    if (self.cost_shared_backbone_coef > 0.0
+                            or self.cost_actor_feature_refresh):
+                        batch['_shared_cost_feature_dirty'] = True
                 if bool(actor_info.get('ppo/early_stop', 0.0)):
                     actor_early_stopped = True
 
@@ -1278,8 +1302,15 @@ class DQCACBetaGPU(VecAgentBase):
 
             # 最后一个actor epoch发生在最后一次critic刷新之后；post holdout必须查询
             # 当前共享表示，而不是最后一次head update前的陈旧feature。RMS此时仍冻结。
-            if self.cost_shared_backbone_coef > 0.0:
+            if (self.cost_shared_backbone_coef > 0.0
+                    or self.cost_actor_feature_refresh):
                 self._refresh_shared_actor_cost_features(batch)
+            self.last_actor_feature_refresh_abs_mean = float(
+                batch.get('_shared_cost_feature_refresh_abs_mean', 0.0))
+            self.last_actor_feature_refresh_applied = float(
+                batch.get('_shared_cost_feature_refresh_applied', 0.0))
+            self.last_actor_feature_refresh_count = int(
+                batch.get('_shared_cost_feature_refresh_count', 0))
 
             # 与 pre 指标使用完全相同的 s0/a0/真实回报；这里只改变 critic 版本。
             # 放在 actor.obs_rms 合并前，避免把输入统计变化混入 pre/post 差值。
@@ -1490,7 +1521,8 @@ class DQCACBetaGPU(VecAgentBase):
         在陈旧表示上训练，下一轮共享backbone更新又在新表示上查询，制造额外off-policy
         feature drift。detach边界确保本函数本身不把critic梯度写入actor。
         """
-        if self.cost_shared_backbone_coef <= 0.0:
+        if (self.cost_shared_backbone_coef <= 0.0
+                and not self.cost_actor_feature_refresh):
             return
         if self.cost_history_mode != 'actor_feature':
             raise RuntimeError(
@@ -2207,9 +2239,10 @@ class DQCACBetaGPU(VecAgentBase):
         共享一次 zero_grad/clip/optimizer.step。因此它与整批 mean loss 的梯度定义
         相同，不会因为块数增加而偷偷放大学习率。
         """
-        # 共享backbone每个actor epoch后都会变化；head更新前必须在no_grad下刷新
-        # 当前表示。默认coef=0时函数立即返回，不增加一次actor forward。
-        if self.cost_shared_backbone_coef > 0.0:
+        # 共享backbone或显式current-refresh下，每个actor epoch后表示都会变化；
+        # head更新前必须在no_grad下刷新。两项均关闭时不增加actor forward。
+        if (self.cost_shared_backbone_coef > 0.0
+                or self.cost_actor_feature_refresh):
             self._refresh_shared_actor_cost_features(batch)
         states, actions = batch['states'], batch['actions']
         boot_states, boot_mask = batch['boot_states'], batch['boot_mask']
@@ -2493,6 +2526,15 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/shared_actor_feature_refresh_applied': float(
                 batch.get('_shared_cost_feature_refresh_applied', 0.0)),
             'critic/shared_actor_feature_refresh_count': float(
+                batch.get('_shared_cost_feature_refresh_count', 0)),
+            # 新名称描述真实语义；保留上面shared前缀三项兼容既有history/profile。
+            'critic/actor_feature_refresh_enabled': float(
+                self.cost_actor_feature_refresh),
+            'critic/actor_feature_refresh_abs_mean': float(
+                batch.get('_shared_cost_feature_refresh_abs_mean', 0.0)),
+            'critic/actor_feature_refresh_applied': float(
+                batch.get('_shared_cost_feature_refresh_applied', 0.0)),
+            'critic/actor_feature_refresh_count': float(
                 batch.get('_shared_cost_feature_refresh_count', 0)),
             'critic/cost_time_weighted': float(
                 cost_sample_weights is not None),
@@ -3152,7 +3194,7 @@ class DQCACBetaGPU(VecAgentBase):
             else:
                 grad_norm = torch.zeros((), device=self.device)
             self.actor_optimizer.step()
-            if shared_cost_enabled:
+            if shared_cost_enabled or self.cost_actor_feature_refresh:
                 # 下一次critic head update必须先重算actor step后的共享表示。
                 batch['_shared_cost_feature_dirty'] = True
             with torch.no_grad():
@@ -3910,6 +3952,8 @@ class DQCACBetaGPU(VecAgentBase):
             'dual/sum_norm_enabled': float(self.sum_norm),
             'debug/cost_history_actor_feature': float(
                 self.cost_history_mode == 'actor_feature'),
+            'debug/cost_actor_feature_refresh_enabled': float(
+                self.cost_actor_feature_refresh),
             'debug/cost_history_cost_lstm': float(
                 self.cost_history_mode == 'cost_lstm'),
             'debug/cost_critic_time_weighted': float(
@@ -4278,6 +4322,13 @@ class DQCACBetaGPU(VecAgentBase):
             'reward_actor_mode': self.reward_actor_mode,
             'policy_arch': self.policy_arch,
             'cost_history_mode': self.cost_history_mode,
+            'cost_actor_feature_refresh': self.cost_actor_feature_refresh,
+            'actor_feature_refresh_abs_mean_last': (
+                self.last_actor_feature_refresh_abs_mean),
+            'actor_feature_refresh_applied_last': (
+                self.last_actor_feature_refresh_applied),
+            'actor_feature_refresh_count_last': (
+                self.last_actor_feature_refresh_count),
             'cost_critic_time_weighting': self.cost_critic_time_weighting,
             'cost_critic_weight_discount': self.cost_critic_weight_discount,
             'cost_critic_weight_floor': self.cost_critic_weight_floor,

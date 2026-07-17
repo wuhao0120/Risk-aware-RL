@@ -1513,3 +1513,31 @@
 - 纯张量测试用`T=2,B=2`验证合并顺序精确为`t0:[rollout1 envs, rollout2 envs], t1:[...]`，`states`与`cost_feature`逐位对齐；默认raw分支不生成feature字段，detach防护也按预期拒绝错误输入。源码语法和`git diff --check`通过，默认raw执行路径没有改变。
 - 持久化W&B-disabled完整smoke使用B2、T32、4 rollout、C2/A2、Actor/PID interval2并正常`exit 0`，训练9.5秒。最终checkpoint报告actor/PID事件均为2、每次均合并4条轨迹、缓存余数均为0；首epoch ratio最大误差`9.54e-7`、末KL `3.83e-5`、clip fraction 0，无NaN/Inf。它证明behavior probability、feature对齐与同频事件接线正常，但256环境步不作为性能证据。
 - 正式seed0/2将使用唯一`v2` job/name/tag从头重跑，配置与E122完全相同；以既有实测预计每条1M训练加内置评估约7--10分钟，随后条件fresh512约4--5分钟。失败的远端run保留为可审计工程记录，不与正式结果合并。
+
+### E124：C-H7C完整结果——seed0减振但丢reward，seed2校准与性能同时失败（2026-07-17）
+
+- 修复后两条正式job均正常`exit 0`，seed0/2纯训练分别`746.87/740.45s`；W&B run为`ra0sd0yn/5ff083c7`，各50行完整到1M且远端finished。122个config键没有绝对路径或敏感字段，name/group/tags仅含公开算法语义；每条远端只上传`config.yaml/output.log/wandb-summary.json`。
+- 机制接线全部通过：seed0/2均为25个Actor事件和25个PID事件，每次40条轨迹；全程首epoch ratio误差最大`2.00e-5/2.28e-5`，无NaN/Inf。相对E121同seed，seed0末200k outage std和mean-absolute-jump下降`32.19%/34.48%`，lambda jump下降`42.35%`；seed2 outage std只降`10.27%`且lambda std增加`94.13%`，没有稳定减振。
+- fresh512 seed0为`reward/outage=.68557/.20313`，相对E121 `.90480/.21484`少`.21924` reward、只少`.01172` outage；虽Brier `.17908→.16265`、AUC `.57845→.62603`、crossing `.20735→.13180`，仍未过reward≥`.8143`门。seed2为`.42735/.23828`，相对E121 `.62779/.16602`少`.20045` reward且outage多`.07227`；Brier `.14452→.28361`恶化96.24%，AUC `.58611→.57605`。
+- 两个压力seed的性能门没有任何一个通过，因此严格不补seed1、不扩2M/5M。Actor/PID同频cadence可以在部分seed平滑控制，却会改变闭环盆地，不能作为actor-feature+mean-anchor的免费稳定组件。
+- 完整history/profile在`_runs/wandb_export/dqc_ch7c_actorfeature_meananchor_cadence2_1m_stressseeds_2026-07-17/`与同名`_runs/profiles/`；E121配对表、裁决JSON和目视检查通过的8面板图在profile的`e121_comparison/`子目录。
+
+### E125：C-H7C pre/post与actor×critic四格诊断——终点爆炸来自最后一批critic过拟合（2026-07-17）
+
+- 同一fresh512协议下，seed0 pre→post为`reward/outage=.63021/.16211→.68557/.20313`；seed2为`.51750/.25781→.42735/.23828`。最后一次联合更新使seed2 reward下降`.09015`、outage改善`.01953`，但pre本身仍远未过`.75/.22`门，所以简单回滚不是解决方案。
+- seed2最后训练B20的cost均值约`20.2`。pre→post critic预测均值`10.06→19.77`，fresh真实cost却`11.18→9.73`；Brier `.19738→.28361`。为分解actor hidden变化和critic变化，额外构造只交换module state的两个临时hybrid，并保持相同512条评估随机协议。
+- 四格结果非常明确：pre actor+pre critic预测mean/Brier=`10.06/.19738`；final actor+pre critic=`10.03/.18254`；pre actor+final critic=`19.93/.28496`；final actor+final critic=`19.77/.28361`。固定critic换actor几乎不动预测，固定actor换final critic立即翻倍；主因是B20×C20把最后一批高cost标签写进head，而不是actor feature坐标漂移。
+- 因此下一主实验不启用feature refresh与cadence2叠加，而回到E121 interval1并单独测试`num_envs=40`：同一1M预算下每次critic看到40条独立轨迹、总iteration从50降到25。若仍出现同样的pre/post泛化断裂，再实现跨rollout replay或held-out early stop。
+
+### E126：默认关闭的current actor-feature刷新开关已实现并通过机制测试（2026-07-17）
+
+- 新参数`cost_actor_feature_refresh=False`默认逐式保持旧actor-feature结果；True仅在MC/actor-feature/recurrent路径开放。每个PPO optimizer step后把当前critic batch标脏，下一critic step用当前actor和保存的chunk h0/c0重算detach feature；interval2合并dict与当前rollout dict分别处理，cost梯度仍不能进入actor。
+- 纯张量测试证明关闭时严格no-op，开启时正确更新feature、drift、dirty与count。B2/T32、C3/A2、interval2持久化smoke正常`exit 0`：2个Actor事件、2个PID事件，每个due batch恰好3次刷新；首epoch ratio误差`9.54e-7`、末KL `7.87e-5`、clip=0，无非有限值。
+- hybrid证据说明它是正确性/独立消融，而不是本次C-H7C失败的主要修复；因此暂不和B40混合。若B40解决最后一批过拟合但仍有跨epoch feature失配，再单独打开该开关。
+
+### E127：C-H8B40更多独立trajectory预注册（2026-07-17）
+
+- C-H8B40回到E121 seed2，只改`num_envs=20→40`并把`num_iterations=50→25`，总预算仍为1M。Actor/PID interval均回到1；每次critic C20、actor A8、QR32、MC、risk-discount、actor-feature、mean-anchor、LSTM512、obs RMS、sigmoid T1、PID target=.15和所有LR不变，feature refresh保持False。
+- 该变量同时让每个critic optimizer step看到40而非20条独立轨迹，并把每1M的critic/actor事件减半；每条trajectory仍被同一事件的20/8个epoch使用。这是扩大`num_envs`的真实工程语义，不通过C40偷偷增加总sample reuse。
+- 首轮只跑压力seed2完整1M，不用300k早停。性能门为fresh512 reward≥`.75`且outage≤`.22`；相对E121 seed2，末5批pre-Brier不得恶化10%，fresh Brier不得恶化10%、AUC不得下降超过`.03`、mean error≤1.0。机制门为25个Actor/PID事件、batch40、ratio≤`1e-3`、无NaN/Inf，并检查final pre/post critic均值是否仍被单批推移超过5。
+- seed2通过才扩seed0/1；失败则不扫B60/B80，直接实现跨rollout replay/held-out选择。单条B40预计训练加内置评估约8--13分钟，fresh512约4--5分钟；只用持久化后台和脱敏W&B online。

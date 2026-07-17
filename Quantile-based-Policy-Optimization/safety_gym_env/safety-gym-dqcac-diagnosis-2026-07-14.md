@@ -1857,3 +1857,21 @@ C-H6L最终证明“共享梯度确实接通”和“共享梯度有益”是两
 把actor从每个B20更新改为每两个rollout的B40更新时，固定behavior `old_log_prob`和用PPO ratio/clip修正仍然必要，但对recurrent DQCAC还不充分。cost actor advantage查询的是`Z_c(s,h,a)`；若states/actions按time-major环境维合并，而保存的actor hidden直接按rollout维拼接，则概率分母可以正确，风险权重仍会绑定到错误history，产生一种不会被ratio诊断发现的监督错位。
 
 本次适配把detached actor feature与state/action使用同一个`[T,B,*]→cat(B)→flatten`映射，并显式拒绝shape、宽度或梯度所有权错误。纯张量顺序测试和B2/T32完整smoke均通过；smoke中2次Actor事件和2次PID事件严格对齐，首次PPO ratio误差仅`9.54e-7`。因此正式C-H7C若失败，可以归因于“更好cost表示+同频cadence”本身，而不是漏存当前策略概率或history错位。
+
+### 13.106 Actor/PID同频cadence能减振，但不能稳定修复策略盆地（2026-07-17）
+
+C-H7C把E121的actor-feature+mean-anchor与B40同频Actor/PID结合后，seed0末段outage波动和lambda跳变分别下降约32%和42%，Brier/AUC也改善；但fresh reward从0.905降到0.686。seed2则从0.628/0.166退化到0.427/0.238，Brier接近翻倍。两条都没有过预注册门，说明低频控制只能改变闭环响应，不会自动把所有初始化带到同一个高reward安全盆地。
+
+这也排除了“此前只是actor更新太频繁”的单因解释。seed0得到的是更平滑但更保守的路径；seed2甚至同时损失reward和安全。后续不能继续扫描interval3/4或PID target，而应修复给Actor提供方向的cost critic跨rollout泛化。
+
+### 13.107 seed2终点cost爆炸是最后一批过拟合，不是hidden坐标漂移（2026-07-17）
+
+seed2最后B20的平均cost约20.2，C20后fresh predicted mean从10.06跳到19.77，真实fresh cost只有9.73。actor×critic四格hybrid提供了直接因果证据：固定pre critic，从pre actor换到final actor只让预测10.06→10.03；固定pre actor，把critic换成final则立刻10.06→19.93。Brier同样只有换critic时从0.197恶化到0.285。
+
+所以移动actor feature在理论上确实是非平稳输入，但它几乎没有解释这次终点数量级错误。主要问题是20条高度相关的完整轨迹被重复拟合20次，mean anchor又把当前批均值快速写入head。pre-update policy也只有reward/outage=0.517/0.258，说明简单回滚最后一次更新或挑checkpoint都不能得到目标性能。
+
+### 13.108 下一步先扩大独立trajectory，而不是再调PID或quantile形式（2026-07-17）
+
+最小直接实验是保持1M预算，把B20×50轮改为B40×25轮。这样每次QR/mean更新看到两倍独立轨迹，同时每条轨迹仍只在本事件内复用C20次；Actor和经验PID也自然在40条样本上响应。它检验“有效样本数不足”而不同时引入replay权重、held-out恢复或新的分布参数化。
+
+current actor-feature刷新已做成默认关闭的独立开关并通过interval2 smoke，但四格诊断表明它不是C-H7C终点爆炸主因，所以C-H8B40不打开它。若B40仍让最后一批把fresh预测推移超过5 cost units，下一步应直接缓存跨rollout监督或用上一rollout held-out选择critic step，而不是扫描B60/B80、PID参数或更多quantiles。

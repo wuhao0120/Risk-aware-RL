@@ -217,6 +217,9 @@ def base_args(algo, seed, device, env_key):
         # cost history 消融：raw=历史 Markov critic；actor_feature=C-H0.5 共享并
         # detach policy feature；cost_lstm=C-H1 独立同输入 MLP+LSTM（当前要求 MC）。
         a.cost_history_mode = 'raw'
+        # 默认保留旧actor_feature语义：整轮C20都使用rollout时缓存的behavior hidden。
+        # True显式在每个PPO step后重算detach feature，使cost head不追逐陈旧坐标。
+        a.cost_actor_feature_refresh = False
         # C-Q1 查询点平滑默认关闭；sigmoid 只替换 actor risk CDF surrogate，
         # hard 校准/经验 outage/QR critic 均保留，便于无歧义消融。
         a.cost_cdf_mode = 'hard'
