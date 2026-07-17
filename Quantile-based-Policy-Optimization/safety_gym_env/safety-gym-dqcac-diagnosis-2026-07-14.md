@@ -2001,3 +2001,9 @@ DQCAC适配去掉了论文公式中会被中心化抵消的冗余首gap，只用
 这与当前查询公式有关。DQCAC用超过budget的quantile个数估计CDF，`N^{-1}Σ_i1[q_i≥d]`只依赖每个输出位于budget哪一侧，不依赖这些输出的排列；quantile均值同样对排列不变。单纯排序QR输出会得到零crossing，却不会改变actor使用的risk probability。NQ改变的是输出间的参数耦合，而不是给critic增加真实风险信息；本实验中这种耦合降低了hard Brier和AUC意义下的质量。
 
 ReLU-NQ仍产生非零方差分布，CDF、Ghat和均值也持续变化，没有证据表明失败来自所有gap死亡。因此不运行强迫严格正gap的ELU+1。对离散累计cost而言，ELU+1还会拆开本应相等的quantile原子，不能把它当成默认修复。NQ作为“保证non-crossing但未改善查询质量”的消融保留，主线转向action-conditioned条件排序、actor风险credit及在表示固定后的PID setpoint校准。最终裁决继续以真实outage落入[0.18,0.22]后最大化mean reward为准，不能因某个结构指标变漂亮就晋级。
+
+### 13.121 在继续发明组件前，先补齐当前Pareto底座的训练seed证据（2026-07-17）
+
+C-H8的单seed fresh512为reward 0.745、outage 0.215，是现有DQCAC中最接近“outage约0.20后最大化reward”的点。它当时因比0.75预注册门少0.005而没有扩seed；该门的严格裁决仍保留。但此后旧批replay、retention guard、adapter cost监督、Weibull和NQ均没有得到更好的reward--outage联合结果，继续只在seed2上堆结构会比补基本方差证据更容易过拟合实验选择。
+
+因此原样补C-H8 seed0/1各1M，连同seed2形成三seed底座。这个实验不修改PID、quantile、network或优化器，也不根据内置128决定是否做fresh512。B40存在明显慢启动，短跑不足以裁决，所以除工程失败外跑满1M；三条都用同一512回合协议报告outage相对0.20的偏差和reward。若结果稳定，才有资格决定是否延长到与QCPO_refs更接近的预算；若仍形成高reward高风险与低reward安全的seed分叉，则下一项应校准闭环setpoint或风险增益，而不是把任何单seed最好值称为算法提升。

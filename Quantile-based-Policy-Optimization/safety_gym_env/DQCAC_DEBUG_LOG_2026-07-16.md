@@ -1680,3 +1680,10 @@
 - ReLU gap没有发生“全部dead”的退化：独立评估预测分布std仍为`7.0328`、CDF为`.1616`，训练中的Ghat和mean均持续变化。因此不触发预注册的ELU+1补救路线；ELU+1会强迫离散cost原子之间严格正gap，反而可能制造不存在的插值。严格裁决为`strict_fail_no_live_policy`：不跑ELU+1、不跑live 1M、不扩seed，也不扫描gap bias。
 - 更关键的算法结论是，当前hard-CDF定义为`N^{-1}Σ_i 1[q_i≥d]`，对quantile排列是置换不变的；把同一组QR输出排序或仅消除crossing不会直接改变CDF或mean。NQ只有通过改变联合参数化和训练轨迹才可能间接改善概率，本实验表明这种耦合反而损害Brier/AUC。因此crossing不是当前DQCAC查询误差的主因，下一主线应转向action-conditioned风险credit/条件泛化与闭环setpoint，而不是继续优化分位数顺序。
 - 完整导出在`_runs/wandb_export/dqc_cnq1_nqrelu_frozen_b40_600k_s312_2026-07-17/`；QR/NQ配对history、`comparison.json`和profile位于`_runs/wandb_export|profiles/dqc_ch12_qr_vs_cnq1_nqrelu_frozen_seed312_600k_2026-07-17/`。`overview.png`为`2880×4128`且通过PIL解码。NQ公开config共139个键，无敏感键名或绝对路径值；W&B name/group/tags只含公开算法语义。
+
+### E141：C-H8 B40补齐seed0/1——把当前Pareto底座的稳定性测清（2026-07-17）
+
+- NQ、Weibull、adapter、retention guard和training replay均未通过各自机制/性能门，当前唯一同时接近最终双侧目标的配置仍是C-H8 seed2：fresh512 reward/outage=`.74496/.21484`。E128因reward比事前`.75`门少`.00504`而严格未晋级，这个裁决不撤销；但在后续候选全部被同一底座支配后，补seed0/1的目的变成“测量当前最好底座的训练seed方差”，不是事后把E128包装成成功。
+- 两条完全复用C-H8：B40×25=1M、T1000、C20/A8、actor/PID interval1、QR32/MC、risk-discount=.995、detach actor-feature、mean-anchor=.5/scale10、LSTM512、obs RMS、T1 sigmoid、经验PI/PID内部target=.15及所有LR不变；只改训练seed、唯一tag/checkpoint和脱敏W&B name。当前提交上的NQ/Weibull/adapter/guard等新参数全部保持默认关闭，已有逐位回归覆盖默认路径。
+- 由于B40 seed2前300k几乎不涨而后段明显恢复，两条不以100k/300k reward早停；只有NaN/Inf/OOM、ratio断言或确定性工程错误才停止。每条纯训练按seed2实测约7--9分钟，内置128约1--2分钟；单A100串行。随后无论内置128好坏都做独立fresh512，每条约4分钟，以免小评估集选择性扩算。
+- 最终报告每seed相对`.20`的有符号outage偏差、Wilson区间和reward，并同时给3-seed mean±SD及合并事件率。工作带仍是fresh512点估计[.18,.22]；低于.18记为过度保守，高于.22记为风险过大。只有进入工作带后才按reward排序；更低outage不自动加分。若B40跨seed仍分叉，下一步优先做固定QR表示后的PID setpoint/risk-gain校准或延长当前底座，而不是继续增加quantile结构。
