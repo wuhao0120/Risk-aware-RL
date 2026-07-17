@@ -1027,3 +1027,15 @@
 - P-M6 seed1 1M训练和160条内置评估正常exit 0；内置reward/outage为`0.93045/34÷160=0.2125`，通过screen。critic CDF为`0.08320`，相对truth仍低估`0.12930`，所以必须做fresh520。
 - E74写成统一`num_envs=20`是启动前发现的记录错误。既有P-M3 seed1正式fresh520命令实际为`num_eval=512,num_envs=40`，得到严格520条；为复用完全相同的并行布局与动作RNG协议，P-M6也使用`512/40`。这是查阅既有run.sh后的协议校正，不改变checkpoint、门槛或训练结果。
 - fresh520仍只做eval-only，门保持outage`≤0.22`且相对P-M3降低至少`.08`、reward`≥0.75`；不根据内置160调阈值。
+
+### E76：P-M6 B40 结果——方向有益但未过安全门，160条产生false positive（2026-07-17）
+
+- P-M6 1M训练`398.24s`、W&B `ksw0hwvv`、训练与内置评估均exit 0；fresh520 eval-only也exit 0。B40+N32实测显存约3.5GB，无OOM/NaN，证明当前128 CPU/A100 80GB可承载。
+- B20→B40的分段reward/outage为：0–300k `0.2571/0.1033→0.0237/0.0179`，300–600k `0.7835/0.2433→0.4718/0.1406`，600–800k `0.8233/0.2600→0.6534/0.1800`，800k–1M `0.8253/0.1800→0.8034/0.1450`。B40明显减慢早期reward学习，但后段追上并降低训练outage。
+- 末200k lambda/KL/clip从P-M3的`0.22057/0.002459/0.12929`降到`0.03244/0.001222/0.05425`。更大batch与更少policy update确实减小闭环振幅和PPO位移，不是无作用改动。
+- 内置160条给出reward/outage=`0.93045/34÷160=0.2125`，看似通过；同一final checkpoint的正式fresh520为`0.92628±0.41427`、`137/520=0.26346`。因此160条安全结论是false positive，不能据此扩seed。
+- 同协议P-M3 seed1为`0.86220±0.58095`、`159/520=0.30577`。B40 reward增加`0.06408`（约7.4%，非配对近似95%区间`[0.00276,0.12541]`）；outage下降`0.04231`，保守差值95%区间`[-0.11924,0.03525]`仍跨0。B40的Wilson区间为`[0.22743,0.30296]`，下界已高于0.22门。
+- critic仍系统低估：hard-CDF absolute error只从`0.20150`降到`0.17710`（改善12.1%），mean-cost error从`5.74198`降到`4.84288`（改善15.7%）。增加每次policy版本的轨迹数缓解但没有解决initial-state泛化。
+- 预注册裁决：reward门通过，但outage既未到`≤0.22`、也未下降`.08`；不扩seed0/2，不扫B30/B50/B60。B40定级为“降低更新方差、略提高reward并略降风险，但不足以成为主配置”。
+- 下一路线不再单纯增大B或重复同批QR epoch。优先实现直接查询点exceedance/CDF critic：用MC remaining-cost与remaining-budget的二元标签直接拟合`P(C_remaining≥budget|s,a)`，先在固定policy 600k配对校准；只有跨状态CDF泛化显著优于QR，才进入live闭环。
+- 正式history/profile在`_runs/wandb_export/dqc_pm3_b20_vs_pm6_b40_seed1_1m_2026-07-17/`与`_runs/profiles/dqc_pm3_b20_vs_pm6_b40_seed1_1m_2026-07-17/`；后者含phase/eval CSV、置信区间JSON和`1872×1277`的fresh520比较图。

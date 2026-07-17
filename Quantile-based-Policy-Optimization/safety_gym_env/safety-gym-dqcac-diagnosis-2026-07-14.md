@@ -1451,3 +1451,15 @@ distributional critic却显著变准：hard/smooth CDF error分别改善69.4%/66
 所以后续优先级应从“再加critic epoch”转为“增加同一policy版本下的独立轨迹”。最小改动是总环境步仍为1M，把`num_envs=20→40`、iteration减半，使每次actor/PID决策看到40条轨迹并降低policy更新频率；硬件128 CPU/A100 80GB足以承载单条B40，cost update继续用chunk避免显存随B线性峰值增长。若B40有效，再实现默认关闭的`actor_update_interval=2`做机制分离：critic每个B20 rollout更新，actor每两个rollout才更新。二者都应在压力seed1完整跑1M，而不是用300k早停；通过后再扩seed0/2。
 
 正式对齐history、profile、CSV/JSON和三面板端点图保存在`_runs/wandb_export/dqc_frozen_qr32_vs_iqn32q128_600k_lenaudit_2026-07-17/`及`_runs/profiles/dqc_frozen_qr32_vs_iqn32q128_600k_lenaudit_2026-07-17/`。
+
+### 13.62 B40 live检验：更多独立轨迹能减振，但不能单独修复critic低估（2026-07-17）
+
+P-M6在固定1M总步下把B20改为B40、policy update从50次减到25次，其余完全沿用P-M3 seed1。它没有数值或资源问题：训练398.2秒，实测显存约3.5GB。末200k训练reward只从P-M3的0.8253小降到0.8034，outage从0.180降到0.145；lambda、KL和clip分别从0.2206/0.00246/0.1293降到0.0324/0.00122/0.0542。更大batch确实降低了policy–PID振幅，但早期学习明显更慢，300k以前reward均值只有0.0237。
+
+内置160条给出reward 0.9305、outage 0.2125，若沿用小样本点估计会宣布通过。相同final checkpoint的统一fresh520却是reward 0.9263、outage 137/520=0.2635；Wilson下界0.2274已经高于0.22门。与P-M3 seed1的0.8622/159÷520=0.3058相比，reward增加0.0641，outage只下降0.0423，且outage差的保守区间跨0。这个结果再次说明，训练曲线和140/160条screen只能决定是否继续评估，不能决定安全结论。
+
+B40也没有解决最关键的critic偏差。fresh520的hard-CDF预测只有0.0864，对truth 0.2635低估0.1771；P-M3误差为0.2015，只改善12.1%。mean-cost误差从5.742降至4.843，也只改善15.7%。这与冻结长度审计一致：增加独立轨迹有益，但live policy每批仍在移动，QR必须同时学习整个分布，initial-state查询点仍是困难的covariate区域。
+
+因此不扩B40多seed，也不继续扫B。下一条单变量应直接针对用户真正需要的查询量：训练action-conditioned exceedance/CDF head，输入state、action和remaining budget，用MC remaining cost产生二元标签，直接最小化校准BCE/Brier，而不是先回归32个quantile再数阈值。distributional QR仍保留用于mean/quantile诊断，首个冻结600k实验只比较CDF head与QR的跨批/独立初始状态误差；不过门就不进入actor/PID。这个设计也自然消除IQN的quantile crossing问题。
+
+完整B20/B40曲线、phase CSV、fresh520比较表、区间JSON和图位于`_runs/wandb_export/dqc_pm3_b20_vs_pm6_b40_seed1_1m_2026-07-17/`与`_runs/profiles/dqc_pm3_b20_vs_pm6_b40_seed1_1m_2026-07-17/`。
