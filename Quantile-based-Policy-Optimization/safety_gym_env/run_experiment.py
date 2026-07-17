@@ -163,9 +163,11 @@ def base_args(algo, seed, device, env_key):
         a.lambda_min = 0.0
         a.outer_interval = 1
         a.num_quantiles = 32
-        # cost-only distribution family。qr 保持所有历史结果；iqn 连续采样 τ，
-        # 训练仍用32点控制计算量，查询用128个确定性点提高 CDF 积分分辨率。
+        # cost-only distribution family。qr 保持历史结果；iqn 连续采样τ；nq用
+        # mean+非负gap强制固定网格单调。ReLU对齐论文离散回报NQ-Net*，elu1
+        # 作为严格正gap独立消融，默认配置仍是qr所以不改变任何历史训练。
         a.cost_distribution_model = 'qr'
+        a.cost_nq_gap_activation = 'relu'
         a.cost_iqn_train_quantiles = 32
         a.cost_iqn_query_quantiles = 128
         a.cost_iqn_cosines = 64

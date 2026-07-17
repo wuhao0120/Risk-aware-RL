@@ -9,6 +9,7 @@ common.py —— ∞-horizon setting 内 GPU 智能体共享的可复用件。
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def lr_lambda(k, a, b, c):
@@ -95,6 +96,57 @@ class DistributionalCritic(nn.Module):
         for layer in list(self.net.children())[:-1]:
             x = layer(x)
         return x                                             # [B,hidden[-1]]
+
+
+class NonCrossingDistributionalCritic(DistributionalCritic):
+    """
+    NQ-Net 风格固定网格 critic：显式预测均值与非负相邻分位数 gap。
+
+    为了与现有 QR critic 做同容量因果对照，最后一层仍只输出 N 个 raw 值：
+    第一个是 N 个 quantile 的均值 v，其余 N-1 个是相邻 gap 的 pre-activation。
+    累积 gap 后减去行均值，保证输出均值严格等于 v，同时保证相邻输出不下降。
+    这是论文 K+1 输出公式去掉完全不可辨识首 gap 后的非冗余等价形式。
+    """
+
+    def __init__(self, state_dim, action_dim, num_quantiles, hidden=None,
+                 gap_activation='relu'):
+        """
+        构造与 DistributionalCritic 完全同形状、同初始化顺序的 NQ critic。
+
+        gap_activation='relu' 对齐论文用于离散 Atari 回报的 NQ-Net*；'elu1'
+        对齐一般 NQ-Net 的 ELU(x)+1 严格正 gap。两者必须独立消融，不能混用。
+        """
+        selected_hidden = [64, 64] if hidden is None else list(hidden)
+        super().__init__(state_dim, action_dim, num_quantiles, selected_hidden)
+        self.num_quantiles = int(num_quantiles)
+        self.gap_activation = str(gap_activation).lower()
+        if self.num_quantiles <= 0:
+            raise ValueError("num_quantiles must be positive")
+        if self.gap_activation not in {'relu', 'elu1'}:
+            raise ValueError("NQ gap_activation must be 'relu' or 'elu1'")
+
+    def _activate_gaps(self, raw_gaps):
+        """把 [B,N-1] pre-activation 映射为非负相邻 quantile 差值。"""
+        if self.gap_activation == 'relu':
+            # 离散 cost 允许相邻 quantile 完全相等；ReLU 精确表示这些原子区间。
+            return torch.relu(raw_gaps)
+        # ELU(x)+1 在 x<0 时等于 exp(x)，因此 gap 严格大于 0。
+        return F.elu(raw_gaps) + 1.0
+
+    def forward(self, state, action):
+        """
+        输入 state/action 与 QR 相同，返回 [B,N] 单调非降 quantile。
+
+        positions 的第一列固定为 0，后续列为相邻 gap 的累计和；按行中心化只
+        平移整条 quantile 曲线，不改变任何 gap，最后再由 v 决定分布位置。
+        """
+        raw = super().forward(state, action)                   # [B,N]，与 QR raw 同初始化
+        mean = raw[:, :1]                                      # [B,1]，目标 quantile 均值
+        gaps = self._activate_gaps(raw[:, 1:])                 # [B,N-1]，逐项非负
+        first = torch.zeros_like(mean)                         # 第一个 quantile 的相对位置
+        positions = torch.cat([first, torch.cumsum(gaps, dim=-1)], dim=-1)
+        centered = positions - positions.mean(dim=-1, keepdim=True)
+        return mean + centered                                 # mean(output)=v，q_i<=q_{i+1}
 
 
 class WeibullTailHead(nn.Module):

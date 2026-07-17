@@ -1661,3 +1661,13 @@
 - 更贴近reference的“把Weibull梯度写入共享actor history”保留为次级分歧路线，但不优先：完整共享QR和adapter共享监督已经一致损害reward，而本轮又证明tail自蒸馏没有先改善QR概率。若未来测试，必须单独记录PPO/value与Weibull在共享参数上的梯度冲突，不能把它和non-crossing结构同时加入。
 - 两条W&B run为control `k3pbid7r`、candidate `bdqi1v4s`，各15行、138个公开config键、293个summary键；隐私审计无敏感键和绝对路径值，只同步3个标准文件。完整导出/profile位于`_runs/wandb_export|profiles/dqc_ch12_weibull_frozen_pair_600k_s312_2026-07-17`，含history、CSV/JSON/Markdown和1.4MB overview图。
 - 下一优先路线转向尚未验证且直接对应现有失败模式的non-crossing quantile结构。此前uniform-IQN在600k固定策略下使CDF/mean error改善约16.1%/19.4%，但crossing恶化到.234；NQ-Net式单调头可能保留连续tau/局部分辨率收益并消除伪crossing。先审计同仓库NQ-Net源码与损失，再做默认关闭、固定策略600k机制门；不与Weibull、PID或shared actor梯度混合。
+
+### E139：C-NQ1 NQ-Net论文审计、非交叉cost critic实现与固定策略预注册（2026-07-17）
+
+- 本地Deep-Distributional-Learning-with-Non-crossing-Quantile-Network是空gitlink，外层只记录commit 4cacd436ddd391711c23248bb08058bcb08ae312；没有.gitmodules、内层.git或memory所述stash，整个vepfs也没有另一份NQ源码。因此没有向空gitlink写入伪恢复内容，公式直接审计官方arXiv 2504.08215。论文一般NQ-Net输出mean与pre-activated gaps，用ELU+1保证严格正gap；Atari的NQ-Net*明确改为ReLU，因为离散游戏回报的相邻quantile差经常接近0。我们的episode cost同样是离散/原子型，首个候选预注册为ReLU，elu1保留为机制失败后的独立激活消融。
+- 实现使用非冗余等价参数化：最后Linear仍输出N个raw值，第一个为全部quantile的mean，余下N-1个为相邻gap；[0,cumsum(gaps)]按行中心化后加mean。于是mean(q)=v且q[i+1]-q[i]=activation(gap[i])。论文K+1公式中的首gap会被中心化完全抵消；去掉它既不改变可表示quantile集合，也让NQ32与QR32保持相同206112个参数、相同state_dict形状和相同初始化RNG消耗。
+- 新配置为cost_distribution_model=nq,cost_nq_gap_activation=relu|elu1，默认仍是qr。NQ首轮只允许uniform32、MC、detach actor-feature、linear output、online quantile CDF、full-batch critic，并与IQN、local grid、direct CDF、feature refresh、replay、guard、Weibull、shared backbone及adapter互斥；reward critic、GAE/PPO、PID和观测归一化完全不变。
+- 纯张量门通过：相同seed的QR/NQ共6个state张量逐位相等；ReLU crossing精确0，输出均值误差最大2.76e-7，相邻gap公式误差最大4.77e-7；ELU+1最小gap 0.3618>0，N=1边界和全部梯度有限。默认QR持久化4k金样本训练12.9秒并exit 0，相对补丁前checkpoint的60个tensor leaves missing/extra/different=0/0/0、最大差0。
+- 启用NQ的B2×T1000×3 rollout、C3、actor-feature smoke训练16.6秒并exit 0；43个模块tensor全有限，训练/8条评估crossing均为0。随后eval-only持久化任务正常重建nq/relu并加载6000步checkpoint，证明config、保存和恢复链路完整。短测CDF仍为0只说明6k监督不足，不用于性能裁决。
+- 正式机制门复用C-H12的冻结成熟policy与seed312：B40×15=600k、C20、QR/NQ32、MC、risk-discount=.995、actor-feature、mean-anchor=.5/scale10、LSTM512、obs RMS和T1完全相同，只把QR head换成ReLU-NQ。QR控制已由run k3pbid7r给出；默认回归证明可直接复用，不再重复消耗同一控制预算。NQ训练预计4--6分钟、内置128评估约1--2分钟，fresh512仅在机制门过后再花4--5分钟。
+- 晋级要求首先是crossing从QR约.185降到精确0；更重要的是末5批prequential Brier或CDF absolute error至少改善10%，另一项不得恶化10%，独立128条hard Brier不能恶化、AUC至少不低于QR .5773且mean-cost误差下降。若只消除crossing而proper score/AUC不改善，则严格失败，不跑live 1M；若ReLU出现大量dead gap并在早期100--200k明显欠拟合，记录后才运行ELU+1固定策略轻量消融，不能事后扫描未预注册gap bias。

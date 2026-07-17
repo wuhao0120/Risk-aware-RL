@@ -41,8 +41,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from utils import RecurrentActorValue, RecurrentCostEncoder, RunningMeanStd
 from .vec_base import VecAgentBase
 from .common import (DistributionalCritic, ExceedanceProbabilityCritic,
-                     ImplicitQuantileCritic, ScalarValueCritic, WeibullTailHead,
-                     lr_lambda, indicator_ge)
+                     ImplicitQuantileCritic, NonCrossingDistributionalCritic,
+                     ScalarValueCritic, WeibullTailHead, lr_lambda, indicator_ge)
 
 
 def _build_cost_quantile_grid(num_quantiles, mode, query_tau, half_width,
@@ -185,13 +185,19 @@ class DQCACBetaGPU(VecAgentBase):
         self.outer_interval = max(1, int(getattr(args, 'outer_interval', 1)))
         self.num_quantiles = getattr(args, 'num_quantiles', 32)
 
-        # cost-only distribution family：qr 是所有历史实验的固定输出头；iqn 用
-        # 连续 τ cosine embedding。reward critic 仍保持固定 QR，确保实验只改变
-        # 约束分布估计，不把 reward GAE/PPO 主干一起换掉。
+        # cost-only distribution family：qr 是历史固定输出头；iqn 用连续 τ
+        # cosine embedding；nq 用均值+非负相邻gap强制固定网格单调。reward critic
+        # 始终保持固定QR，确保实验只改变约束分布估计，不改GAE/PPO主干。
         self.cost_distribution_model = str(
             getattr(args, 'cost_distribution_model', 'qr')).lower()
-        if self.cost_distribution_model not in {'qr', 'iqn'}:
-            raise ValueError("cost_distribution_model must be 'qr' or 'iqn'")
+        if self.cost_distribution_model not in {'qr', 'iqn', 'nq'}:
+            raise ValueError("cost_distribution_model must be 'qr', 'iqn', or 'nq'")
+        # ReLU 对齐论文在离散 Atari 回报使用的 NQ-Net*；elu1 保留为严格正gap
+        # 路线。该参数在qr/iqn下只记录配置，不参与forward或随机数消耗。
+        self.cost_nq_gap_activation = str(
+            getattr(args, 'cost_nq_gap_activation', 'relu')).lower()
+        if self.cost_nq_gap_activation not in {'relu', 'elu1'}:
+            raise ValueError("cost_nq_gap_activation must be 'relu' or 'elu1'")
         self.cost_iqn_train_quantiles = int(
             getattr(args, 'cost_iqn_train_quantiles', self.num_quantiles))
         self.cost_iqn_query_quantiles = int(
@@ -833,6 +839,37 @@ class DQCACBetaGPU(VecAgentBase):
             if self.cost_actor_query_mode == 'crossfit':
                 raise ValueError("cost IQN does not yet support crossfit critics")
 
+        # C-NQ1首轮只替换C-H8已验证的action-conditioned actor-feature/MC cost
+        # critic。所有可能改变监督、查询或共享梯度的机制先互斥，冻结策略配对门
+        # 通过后才允许进入live/PID实验，避免把“无crossing”与其它trick混为一谈。
+        if self.cost_distribution_model == 'nq':
+            if self.cost_quantile_grid_mode != 'uniform':
+                raise ValueError("cost NQ currently requires uniform quantiles")
+            if self.cost_target_mode != 'mc':
+                raise ValueError("cost NQ currently requires MC cost targets")
+            if self.cost_history_mode != 'actor_feature':
+                raise ValueError("cost NQ currently requires actor_feature history")
+            if self.cost_quantile_output != 'linear':
+                raise ValueError("cost NQ first ablation requires linear output")
+            if self.cost_cdf_estimator != 'quantile':
+                raise ValueError("cost NQ currently requires quantile CDF")
+            if self.cost_actor_query_mode != 'online':
+                raise ValueError("cost NQ currently requires online actor query")
+            if self.cost_actor_feature_refresh:
+                raise ValueError("cost NQ first ablation requires feature refresh disabled")
+            if self.cost_s0_aux_coef > 0.0:
+                raise ValueError("cost NQ currently requires cost_s0_aux_coef=0")
+            if self.cost_transition_replay_batches > 0 or self.cost_holdout_guard:
+                raise ValueError("cost NQ cannot combine with replay or holdout guard")
+            if self.cost_shared_backbone_coef > 0.0 or self.cost_adapter_width > 0:
+                raise ValueError("cost NQ first ablation cannot share actor gradients")
+            if self.cost_weibull_tail_coef > 0.0:
+                raise ValueError("cost NQ first ablation cannot combine with Weibull tail")
+            if self.critic_minibatch_size != 0:
+                raise ValueError("cost NQ first ablation requires full-batch critic")
+            if self.actor_update_interval != 1:
+                raise ValueError("cost NQ first ablation requires actor_update_interval=1")
+
         # C-X2 首轮只检验严格的两折样本隔离。按完整环境轨迹拆 fold，要求偶数 B；
         # MC/raw/full-batch 限制把 n-step target、历史 encoder、recent replay 与
         # transition chunking 都排除，避免一次实验混入四种尚未对拍的分支语义。
@@ -1024,7 +1061,7 @@ class DQCACBetaGPU(VecAgentBase):
             list(hidden)).to(self.device)
         self.reward_target_critic.load_state_dict(self.reward_critic.state_dict())
         # cost critic 保持 action conditioning。qr 分支逐式保留历史构造/RNG；
-        # iqn 分支把 τ 作为输入，训练采样和 CDF 查询点数可以彼此独立。
+        # nq使用完全同形状/同初始化的head，只改变raw输出解释；iqn把τ作为输入。
         if self.cost_distribution_model == 'qr':
             self.cost_critic = DistributionalCritic(
                 cost_cdim, self.action_dim, self.num_quantiles,
@@ -1032,6 +1069,13 @@ class DQCACBetaGPU(VecAgentBase):
             self.cost_target_critic = DistributionalCritic(
                 cost_cdim, self.action_dim, self.num_quantiles,
                 list(hidden)).to(self.device)
+        elif self.cost_distribution_model == 'nq':
+            self.cost_critic = NonCrossingDistributionalCritic(
+                cost_cdim, self.action_dim, self.num_quantiles, list(hidden),
+                gap_activation=self.cost_nq_gap_activation).to(self.device)
+            self.cost_target_critic = NonCrossingDistributionalCritic(
+                cost_cdim, self.action_dim, self.num_quantiles, list(hidden),
+                gap_activation=self.cost_nq_gap_activation).to(self.device)
         else:
             self.cost_critic = ImplicitQuantileCritic(
                 cost_cdim, self.action_dim, list(hidden),
@@ -5027,6 +5071,10 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_direct_cdf_query_mode == 'ema'),
             'debug/cost_distribution_is_iqn': float(
                 self.cost_distribution_model == 'iqn'),
+            'debug/cost_distribution_is_nq': float(
+                self.cost_distribution_model == 'nq'),
+            'debug/cost_nq_gap_is_elu1': float(
+                self.cost_nq_gap_activation == 'elu1'),
             'debug/cost_quantile_output_is_exp': float(
                 self.cost_quantile_output == 'exp'),
             'debug/cost_quantile_output_is_softplus': float(
@@ -5488,6 +5536,7 @@ class DQCACBetaGPU(VecAgentBase):
                 self.last_direct_online_cdf_initial),
             'qr_cdf_estimate_initial': self.last_qr_cdf_initial,
             'cost_distribution_model': self.cost_distribution_model,
+            'cost_nq_gap_activation': self.cost_nq_gap_activation,
             'cost_iqn_train_quantiles': self.cost_iqn_train_quantiles,
             'cost_iqn_query_quantiles': self.cost_iqn_query_quantiles,
             'cost_iqn_cosines': self.cost_iqn_cosines,

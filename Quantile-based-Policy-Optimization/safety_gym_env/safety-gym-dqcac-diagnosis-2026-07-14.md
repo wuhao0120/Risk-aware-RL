@@ -1983,3 +1983,11 @@ DQCAC首版因此保持actor使用原quantile CDF，只把Weibull作为action-co
 因此不运行live 1M，也不扫描coef、tail比例或alpha上界。把相同Weibull loss直接写进共享actor LSTM更贴近reference，但风险更高：此前共享QR和adapter都把策略推向低reward端，而本轮未证明tail信号本身更准。该路线作为独立消融保留，只有在共享梯度诊断和non-crossing主线之后才考虑。
 
 下一步选择non-crossing quantile不是随意换模型。600k uniform-IQN已经给出中等CDF/mean改善，但crossing从QR约0.057恶化到0.234；固定N64/local grid也因分位输出非单调和proper score不足失败。NQ-Net式单调结构直接约束这个已观测瓶颈，且仓库已有可审计实现。首轮仍只改变cost distribution head，固定策略、真实MC监督、B40和双侧outage目标都不变；过固定策略proper-score门后才允许进入live闭环。
+
+### 13.119 非交叉结构必须改善真实标签上的概率质量，不能只把crossing改成0（2026-07-17）
+
+官方NQ-Net把网络拆成quantile mean与相邻正gap，累计gap后再中心化。一般回归采用ELU+1保证严格正序；论文在Atari离散回报上改用ReLU，因为真实相邻quantile经常相等。Safety-Gym的累计cost也有大量原子，首条路线因此使用ReLU-NQ-Net*，同时把ELU+1作为有分歧时的独立路线记录下来。当前本地NQ子模块为空且历史stash已经不存在，所以没有假装恢复参考代码，迁移依据是官方论文公式和现有QR接口的逐项测试。
+
+DQCAC适配去掉了论文公式中会被中心化抵消的冗余首gap，只用一个mean和N-1个相邻gap生成N个quantile。这让NQ32与QR32拥有完全相同的最终Linear形状、参数量和初始化随机流；区别只有forward把raw logits解释为单调分布。默认qr的4k训练checkpoint仍有60个tensor逐位相同，说明新增类没有暗改历史基线。启用后的张量测试、6k训练和eval-only恢复均证明均值守恒、相邻差公式、零crossing、有限梯度与checkpoint重建成立。
+
+但零crossing本身不是成功标准。之前replay也把crossing明显降低，却让Brier、CDF和outage恶化；单调结构同样可能把若干quantile压成无区分力的平台。固定成熟policy的600k门会使用完全相同的真实MC轨迹比较QR与NQ，要求prequential proper score、独立Brier/AUC和mean-cost误差一起改善。只有这种改善才说明NQ把结构先验转化成更准确的action-conditioned风险信号，才值得进入live 1M闭环；如果只得到crossing=0，则作为形状消融保留并停止扩算。
