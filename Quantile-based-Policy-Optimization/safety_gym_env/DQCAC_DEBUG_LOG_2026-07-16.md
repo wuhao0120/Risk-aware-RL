@@ -1091,3 +1091,15 @@
 - 机制门：末5批selected EMA的prequential CDF error或Brier相对same-run online至少改善20%，另一项不得恶化超过10%；selected的平均post-pre概率漂移需不高于online的50%，且对上一批truth的滞后相关不能高于online。主效果门保持不变：末5批selected相对QR至少一项改善20%、另一项不恶化超过10%；独立140条至少一项改善25%、另一项不恶化超过10%。
 - 只有140通过才做fresh520，520通过才允许live 1M。若600k未过主门，只有在selected相对QR的末段与独立评估方向一致、且关键prequential误差从此前5批到末5批仍改善超过10%时，才允许一次从头1.2M长度审计；否则停止EMA005，不扫tau，也不同时加入replay/减少update。
 - C-DCF1纯训练245.2秒。EMA多一个78.6k参数的无梯度forward/lerp，预计纯训练4.5--5.5分钟、含140终评总墙钟5.5--7分钟；正式任务只由`launch_background.sh`持久化，checkpoint/W&B/history继续写入`/vepfs`。
+
+
+### E81：C-DCF2 600k结果——EMA修复追批，但没有超过QR（2026-07-17）
+
+- 正式持久化job正常exit 0，W&B run为`z5f8b2zb`；600k纯训练`245.3s`，与C-DCF1的245.2s近似相同，随后完成140条评估。30批behavior reward/cost/outage逐值exact，标签不一致率0；相对C-DCF1，actor、online direct、QR online/target、reward online/target及normalizer共50个共享checkpoint tensor逐位exact，runtime和env_steps也exact。唯一新增权重是7个EMA state tensor。
+- EMA确实完成预定的稳定化机制。prequential预测对上一批truth的相关由online的`0.8256`降到`-0.0084`；全程平均post-pre概率漂移由`0.10701`降到`0.00717`，比例仅6.7%，末5批为`0.00150/0.03079`。因此“减少追逐最近20条轨迹”不是失败点。
+- 机制收益幅度仍未过门。末5批pre CDF error为EMA/online=`0.04471/0.05169`，只改善13.5%；Brier为`0.22398/0.23360`，只改善4.1%，都低于20%。EMA相对QR的末5批CDF改善58.0%，但Brier只改善3.7%，说明总体概率更平滑，不代表逐状态条件风险排序明显更准。
+- 独立140条truth仍为`0.25714`。EMA/online/QR预测分别为`0.33237/0.32722/0.26786`，CDF absolute error为`0.07523/0.07008/0.01071`；EMA在总体校准上甚至略差于online，约为QR误差的7.0倍。Brier为`0.19363/0.19937/0.20282`，EMA相对online/QR只改善2.9%/4.5%，远低于25%独立门。
+- 不做1.2M：末5批EMA CDF相对QR更好，但独立CDF更差，方向不一致；EMA Brier从此前5批`0.20194`恶化到末5批`0.22398`，没有“仍以>10%速度改善”的证据。600次EMA step后初始化只剩约4.9%；即使把`0.5`先验残余的量级粗略扣除，仍不足以把0.332拉到比QR 0.268更准。继续同配方主要消耗预算，不满足E80延长条件。
+- 裁决：EMA005保留为“成功减少更新方差、但未改善到足以替代QR”的正机制/负性能消融；不做fresh520、不进live 1M、不扫tau。replay或减少direct update仍作为有分歧的可选路线记录，但两版direct均未在独立proper score上接近25%收益，优先级降到QR主路线和actor更新频率之后。
+- 这再次回答训练长度问题：300k时EMA仍约0.41，确实太短；完整600k后才能看到它稳定到0.33附近。但“更长才看清”不等于“更长会成功”。当独立评估、proper score和末段趋势不一致时，继续延长会放大选择性报告风险。
+- 正式history/profile在`_runs/wandb_export/dqc_frozen_direct_cdf_ema005_600k_2026-07-17/`与`_runs/profiles/dqc_frozen_direct_cdf_ema005_600k_2026-07-17/`；`overview.png`为`2880×3440`、约1.2MB且PIL解码通过，checkpoint约12MB，均在`/vepfs`。
