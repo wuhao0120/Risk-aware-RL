@@ -1623,3 +1623,13 @@ fresh评估进一步支持这一点。三个seed的hard-CDF都低于真实outage
 P-M9只将经验PID target从0.15降到0.10，名义chance constraint仍是0.20；改变的是工程安全余量0.05→0.10。先在最差seed0完整跑1M，其余网络、PPO、GAE、IS ratio、B20合并、QR32和PID增益全部不动。正式fresh520要求reward至少0.75、outage不高于0.22且比seed0基线至少下降0.08。通过才扩seed1/2；失败就停止固定target扫描，转向Wilson-UCB PID、自适应校准margin或更保守的action-risk估计。这个顺序能回答“lambda作用量不够”与“risk方向本身不准”哪一个更接近主要矛盾。
 
 训练继续使用持久化后台和在线W&B，但只上传指标与公开实验语义。提交18b28ca过滤绝对路径、checkpoint位置和疑似凭据字段，并关闭机器信息、system stats、Git、源码、job与requirements上传；本地checkpoint和轨迹不上传。seed0/2既有离线history已经以脱敏run完整回放，远端均为50行并到1M。此前联网问题不是W&B存储满，而是执行层默认权限；部分seed2 run只到120k，明确排除。P-M9预计训练6.5～8分钟，含评估总计12～14分钟。
+
+### 13.77 P-M9结论：lambda并非无效，但固定0.10用安全换掉了reward和校准（2026-07-17）
+
+P-M9完整1M的fresh520 outage从P-M8 seed0的0.32692降到0.19615，差-0.13077且95%区间[-0.18305,-0.07754]。这直接否定“risk penalty完全不起作用”：只改变PID target就能显著移动最终策略风险。代价是reward从0.89591降到0.74188，差-0.15403且区间[-0.20742,-0.10064]；它比预注册0.75门低0.00812，所以不能扩seed。
+
+更关键的是安全没有伴随更准的distributional critic。hard/smooth CDF误差分别恶化76%/87%，mean-cost误差从1.52增到5.11，Brier Skill从-3.44%降到-33.65%。critic在P-M8危险策略上低估风险，在P-M9保守策略上又高估风险。固定target 0.10依靠更大lambda把系统推到保守侧，但没有解决条件风险泛化；因此事后扫描0.11、0.12、0.13只是用一个seed寻找reward-risk交点，不是稳健算法改进。
+
+P-M9末次PPO的KL和clip明显偏高，且lambda在终点升到0.602。为判断reward损失是否集中在最后一次更新，预先固定一个轻量pre/post规则：同seed140回合评估更新前checkpoint；只有pre/post outage绝对变化至少0.08，或pre策略在140条同时满足reward≥0.75/outage≤0.22，才做额外520。无论诊断结果如何，P-M9 final的预注册失败不改写。下一主路线应是confidence-aware/adaptive PID或保守risk uncertainty，而不是继续固定target网格。
+
+评估时发现CLI disabled仍被W&B 0.18全局setup缓存成online；意外run只有1行且隐私审计无路径/源码/requirements。提交3c3379e已把mode显式传入Settings，完整1回合eval-only烟雾测试证明不再创建远端run，临时产物已清理。

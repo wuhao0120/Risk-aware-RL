@@ -1209,3 +1209,11 @@
 - P-M9只把P-M8的pid_target_prob=0.15→0.10，其它网络、seed0、B20、Actor/PID interval2、QR32、20 critic updates、8 PPO epochs、Kp=1、Ki=.1、window50、1M步和评估协议全部冻结。它不是把论文约束alpha改成0.10，而是把controller安全余量由0.05增到0.10，检验较早维持更大lambda能否抵消seed0约0.079的tail风险低估与闭环滞后。
 - 只先跑压力seed0完整1M；除NaN/OOM/确定性错误外不以100k/300k早停，因为P-M7/P-M8已证明闭环方向可在后半段改变。内置140 screen为reward≥0.60,outage≤0.40，只用于发现灾难性退化；通过后fresh520正式门为reward≥0.75,outage≤0.22且相对P-M8 seed0的0.32692至少下降0.08，CDF/mean/Brier不得出现新的明显发散。过门才原参数扩seed1/2，失败则停止固定target下调，不扫0.08/0.12/0.13追端点。
 - 单条独占训练预计6.5～8min，内置140约1min，条件fresh520约4～5min，总墙钟12～14min。使用launch_background.sh持久化后台与脱敏在线W&B，checkpoint/log全部留在/vepfs。若路线存在分歧，保留为独立消融：Wilson-UCB/置信上界PID让margin随样本量变化；按独立校准误差自适应target；降低Kp/Ki或anti-windup；以及增强action-risk排序的ensemble/保守查询。它们不与P-M9混合，以保留因果归因。
+
+### E91：P-M9 seed0结果与终点pre/post诊断触发规则（2026-07-17）
+
+- 正式run k4obc0u9、job均exit 0，1M纯训练397.1s，25次PID/Actor事件完整；远端50行history且只含config/output/summary，隐私审计通过。前400k与P-M8几乎相同，target差异生效后末200k P-M8→P-M9的reward/outage/lambda为0.929/0.335/0.373→0.741/0.285/0.394；固定更低target确实压低风险，但降低reward并提高PPO KL。
+- fresh520从P-M8的reward/outage=0.89591/170÷520=0.32692变为0.74188/102÷520=0.19615。reward差-0.15403，Welch 95%区间[-0.20742,-0.10064]；outage差-0.13077，Newcombe 95%区间[-0.18305,-0.07754]。安全门和下降0.08门通过，但reward比0.75低0.00812，严格失败。
+- 校准门也明确失败：hard/smooth CDF误差0.07885/0.07630→0.13912/0.14231，恶化76%/87%；mean-cost误差1.5165→5.1150，恶化237%；Brier Skill从-3.44%降到-33.65%。P-M9安全并不是critic更准，而是更大lambda与保守风险高估换来的。故不扩seed、不扫其它固定target。
+- 终点P-M9的KL/clip=0.00975/0.405，P-M8为0.00457/0.241，且最后lambda升到0.602。为区分“整体target过保守”和“最后一次强PPO过冲”，只对rollout_step001000000.pt做同协议140回合pre/post诊断。只有abs(outage delta)≥0.08，或pre在140条同时reward≥0.75且outage≤0.22，才触发pre-checkpoint fresh520；否则停止。该诊断不能推翻P-M9 final的预注册失败，只决定post-update guard是否值得继续。
+- 正式历史、CSV、decision JSON和图位于_runs/wandb_export/dqc_pm8_vs_pm9_pid_target_seed0_1m_2026-07-17/及_runs/profiles/dqc_pm8_vs_pm9_pid_target_seed0_1m_2026-07-17/；overview、phase、fresh三张PNG均可解码并完成目视检查。
