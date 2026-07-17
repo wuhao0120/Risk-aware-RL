@@ -1585,3 +1585,13 @@ P-M7必须在压力seed1完整跑1M，因为它只有25次Actor事件，100k/300
 下一步不同时扫PID增益、num_envs和critic结构。首个最小消融把经验PID也改成每两批才更新一次：两批B20的40条cost合并后一次性进入window和episode-scaled leaky-I/P，随后Actor才更新；critic仍逐B20训练。它同时降低当前batch风险率噪声到约0.063，并让controller与Actor执行周期一致。若这仍有极限环，再分别测试anti-windup/更小Kp-Ki与更大num_envs；局部quantile、IQN和direct-CDF已经完成各自表示筛选，不与本次时序修正混合。
 
 本轮正式数据位于`_runs/wandb_export/dqc_pm7_actorint2_seed1_1m_vs_2m_2026-07-17/`和`_runs/profiles/dqc_pm7_actorint2_seed1_2m_lenaudit_2026-07-17/`，后者含完整2M profile与训练曲线。按预注册screen不做fresh520或3M；这是节省预算的失败裁决，不是因为短跑提前终止。
+
+### 13.73 P-M8：让经验PID和Actor在同一个B40边界响应（2026-07-17）
+
+P-M8只修正一个时序变量。P-M7中Actor冻结两批，但经验PID在第一批和第二批各更新一次；P-M8新增`pid_update_interval=2`，第一批只缓存20个完整trajectory cost，第二批把40个cost一次加入滑窗并更新一次P/I和lambda，紧接着Actor才用该lambda做一次B40 PPO。critic仍逐B20训练，所以这不是P-M6的“所有组件都用B40”，也不是简单降低critic数据频率。
+
+实现对默认路径是可逆的：interval1相对旧提交的两个rollout和final checkpoint六个module、lambda、共享runtime、eval与summary全部逐项exact。interval2的快照证明第一批Actor和lambda都不动，第二批PID/Actor事件同时从0变1。人工100% outage的闭式测试中，deadband后误差0.83、episode scale 0.4、I限幅0.02，理论lambda 0.85与实际误差仅2.38e-8。全尺寸B20×T1000/LSTM512 smoke也通过，B40事件包含40条轨迹，首epoch ratio误差1.43e-5，没有OOM或非有限值；checkpoint恢复后的20条评估逐字段exact。
+
+这项改动能消除“controller在执行器不动时先响应两次”，但不能保证解决所有极限环。B40当前batch经验率的二项标准差从约0.089降到0.063，然而50条滑窗仍重叠、Kp=1仍可能过强，cost critic也仍会在每批20个标签上更新20次。因此先单独跑完整1M，而不是在同一实验顺手加入anti-windup或更小增益。
+
+正式P-M8与P-M7 seed1完全同配置，只多`pid_update_interval=2`；预计训练6.5–8分钟，含条件fresh520总计12–14分钟。screen为140条reward≥0.60/outage≤0.35；正式fresh520要求reward≥0.75、outage≤0.22且相对P-M7至少下降约0.03，Brier和mean/CDF不能明显反弹。机制上还要求PID/Actor事件一一对应、每次40条，并使末段周期幅度实质下降。通过后扩seed；接近且仍收敛才做一次2M；失败则按日志在anti-windup/降Kp-Ki、增大num_envs和post-update risk guard之间选择下一条单变量路线。

@@ -259,6 +259,9 @@ def base_args(algo, seed, device, env_key):
         a.log_std_max = 2.0
         a.dual_update_mode = 'critic_adam'              # 旧 cost-critic CDF + Adam dual（兼容默认）
         a.dual_pid_signal = 'outage'                    # empirical_pid 可选 outage / cost_quantile
+        # 经验PID默认逐rollout更新；显式设为2时累计两批真实cost后只响应一次。
+        # 该开关与actor_update_interval分离，便于先验证“Actor低频”再验证“控制器同频”。
+        a.pid_update_interval = 1
         # None 时 PID 目标就是真实 alpha；显式更小值提供有限样本 safety margin，
         # 只改变控制器设点，不改变论文约束、critic 查询点或最终评估口径。
         a.pid_target_prob = None

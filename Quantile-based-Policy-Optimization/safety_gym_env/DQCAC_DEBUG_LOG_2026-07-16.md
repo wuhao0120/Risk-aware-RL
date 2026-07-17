@@ -1166,3 +1166,16 @@
 - 这个pre/post对拍把极限环定位为真实时序问题，而不只是日志噪声：最后200k rollout policy的平均outage只有0.155，使lambda降到约0.207；终点Actor再依据最新lambda和同批更新后的critic做8次PPO，策略变得更激进，但训练已结束，PID没有下一批轨迹纠正。B20单批在p=0.2附近的二项标准差约0.089，经验率又只能按0.05跳变；当前PID每B20响应两次而Actor每B40才响应一次，控制器与执行器不同频会进一步放大超调。
 - 下一单变量路线为P-M8：critic仍每B20做20次更新，Actor仍每两批合并B40做8 epoch；只把经验PID也改为每两批更新一次，并用两批共40条真实cost一次性更新window、I/P项和lambda。这样lambda在Actor冻结期间不变化，B40当前batch outage标准差约降到0.063，并且Actor看到的是与其响应周期一致的控制量。anti-windup、降低Kp/Ki、增大num_envs和target-KL保持关闭，分别留作后续消融，不能同时叠加。
 - 完整history在`_runs/wandb_export/dqc_pm7_actorint2_seed1_1m_vs_2m_2026-07-17/`，2M profile和`2880×4128`可解码曲线在`_runs/profiles/dqc_pm7_actorint2_seed1_2m_lenaudit_2026-07-17/`。pre-update诊断JSON为`_runs/DQCAC_DynamicButton_pm7_actorint2_2m_s1_preupdate_eval140_s1.json`；2M checkpoints约221MB，均位于`/vepfs`而非20G根目录。
+
+### E87：P-M8 同频PID实现、精确回归与1M预注册（2026-07-17）
+
+- 新增默认关闭的`pid_update_interval`，默认1逐位保持历史路径。只允许正interval在`empirical_pid`、`outer_interval=1`且与`actor_update_interval`相等时启用，防止把不同policy版本或不同控制边界混在一个无法解释的PID batch中。
+- interval2时第一条B20 rollout只把`disc_cost`的20个MC标量加入cache，lambda、window和P/I状态不动；第二条到期后沿episode维拼成B40，一次调用经验PID，随后同一边界才执行B40 actor PPO。critic仍对两条B20各自立即做20次更新，Actor权重/obs RMS仍按P-M7冻结两批；新增cache不保存state/action，显存开销仅40个标量。
+- episode-scaled控制语义保持：B40配`pid_reference_episodes=10`得到scale=4，leak为`rho^4`，I增量和`delta_max`按40条轨迹缩放；Kp只在Actor响应边界输出一次。日志/checkpoint/summary新增PID interval、due、累计rollout、batch episode数与事件计数，能直接证明controller与actor是否一一对齐。
+- 默认回归使用旧提交`f4315f0`与当前代码跑同seed、同两批tiny recurrent PPO。两个rollout checkpoint和final的六个module、全部tensor、lambda、所有共享runtime字段、eval和summary公共字段逐项exact，最大差0；当前只多出五个PID cadence诊断字段。旧worktree在比较后已删除。
+- interval2 tiny时序通过：第一/第二个pre-update checkpoint的Actor参数最大差0，cost critic差`0.00200`；final Actor参数发生变化。runtime从`events=0, accumulated=1, due=0`变为`events=1, accumulated=2, due=1, batch_episodes=4`，首epoch ratio误差`5.58e-5`。
+- 强制`cost_limit=0`使4条tiny轨迹outage全为1：理论filtered error=`1-.15-.02=.83`、episode scale=.4、限幅后`delta I=.02`、lambda=`.02+.83=.85`；实际`pid_i=.020000000000000004`、lambda=`.8500000238`，仅float32误差`2.38e-8`。两个pre快照lambda都为0，证明第一批没有偷跑PID。
+- 全尺寸smoke覆盖`B20×T1000`、QR32、LSTM512、20次critic step、8次PPO epoch和B40合并，纯训练`21.65s`、exit 0、无NaN/OOM。PID/Actor事件均为1且batch均为40；两批间Actor参数差0，到期后差`0.002295`；首epoch ratio误差`1.43e-5`、末epochKL=`8.48e-4`、clip fraction=`0.0272`。final checkpoint eval-only恢复exit 0，20条评估逐字段exact，新增runtime完整恢复。
+- P-M8正式配置只在P-M7 1M上增加`pid_update_interval=2`：seed1、50×B20×T1000=1M、25个Actor/PID事件、MC/raw/online、time weight .995、T1、target .15、Kp1/Ki.1/window50/leak.97/deadband.02、QR32、LSTM512、20 critic update、8 PPO epoch，其余LR和RNG协议不变。预计纯训练6.5–8分钟、140条评估约1分钟；通过screen后的fresh520约4分钟，总墙钟约12–14分钟，全部持久化后台。
+- screen仍为reward≥0.60、outage≤0.35、ratio/KL/loss有限；失败则不做520。正式门保持reward≥0.75、fresh520 outage≤0.22，并相对P-M7当前`132/520=.25385`至少下降约.03；Brier不得比`.20203`恶化10%，hard/mean error不得反弹。机制门要求25个PID事件与25个Actor事件严格对齐、每次40条，末200k outage std相对P-M7的`.1044`至少降低20%或末400k不再出现增长周期。
+- 1M过门才扩seed0/2。若只接近门（reward≥0.70、outage≤0.28）且最后400k风险/校准仍同向改善，才允许一次2M长度审计；否则停止当前同频参数，不跑3M。下一分歧路线分别保留为anti-windup/更小Kp-Ki、扩大num_envs、target-KL或critic更新后Actor风险验证，不能在P-M8首轮叠加。

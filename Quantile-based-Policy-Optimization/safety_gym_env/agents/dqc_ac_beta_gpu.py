@@ -502,6 +502,21 @@ class DQCACBetaGPU(VecAgentBase):
         self.dual_update_mode = str(getattr(args, 'dual_update_mode', 'critic_adam')).lower()
         if self.dual_update_mode not in {'critic_adam', 'empirical_pid'}:
             raise ValueError("dual_update_mode must be 'critic_adam' or 'empirical_pid'")
+        # P-M8默认关闭。正interval让经验PID累计多个同策略rollout后只更新一次，
+        # 避免Actor冻结期间controller先响应多次；critic_adam仍保留历史逐批时序。
+        self.pid_update_interval = max(
+            1, int(getattr(args, 'pid_update_interval', 1)))
+        if self.pid_update_interval > 1 and not self.freeze_policy_updates:
+            if self.dual_update_mode != 'empirical_pid':
+                raise ValueError(
+                    "pid_update_interval>1 requires dual_update_mode='empirical_pid'")
+            if self.pid_update_interval != self.actor_update_interval:
+                raise ValueError(
+                    "pid_update_interval>1 must equal actor_update_interval so controller "
+                    "and actor respond on the same rollout boundary")
+            if self.outer_interval != 1:
+                raise ValueError(
+                    "pid_update_interval>1 currently requires outer_interval=1")
         self.dual_pid_signal = str(getattr(args, 'dual_pid_signal', 'outage')).lower()
         if self.dual_pid_signal not in {'outage', 'cost_quantile'}:
             raise ValueError("dual_pid_signal must be 'outage' or 'cost_quantile'")
@@ -752,6 +767,11 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_pid_actual_delta = 0.0                       # 最终 I_state_new-I_state_old
         self.last_pid_proportional = 0.0                       # Kp * filtered_error
         self.last_pid_output = 0.0                             # clip(I_state + P)
+        self.pid_update_events = 0                             # 实际执行经验PID的cadence事件数
+        self.pid_rollouts_since_update = 0                     # 当前PID窗口已累计rollout数
+        self.last_pid_update_due = 0.0                         # 本轮是否执行了PID响应
+        self.last_pid_rollouts_accumulated = 0.0               # 本轮PID事件累计rollout数
+        self.last_pid_update_batch_episodes = 0.0              # 最近事件合并的完整轨迹数
 
     # ============================================================ 主训练循环 (与模板一致) ============================================================
     def train(self):
@@ -784,6 +804,7 @@ class DQCACBetaGPU(VecAgentBase):
               f"ppo_target_kl={self.ppo_target_kl:g}, "
               f"actor_cost_query={self.cost_actor_query_mode}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}"
+              f"/interval{self.pid_update_interval}"
               f"/target{self.pid_target_prob:g}, "
               f"sum_norm={self.sum_norm}, policy_frozen={self.freeze_policy_updates}, "
               f"obs_stats_frozen={self.freeze_observation_stats}, "
@@ -792,6 +813,9 @@ class DQCACBetaGPU(VecAgentBase):
         # interval=1 时该 cache 始终为空，历史路径不增加任何 tensor 拼接或 RNG 调用。
         # interval>1 时只暂存 actor 所需的 on-policy 字段；critic 仍当轮立即训练。
         actor_rollout_cache = []
+        # PID cache只保存每条完整轨迹的MC cost。interval=1继续走原update_dual(batch)
+        # 分支；interval>1不会缓存state/action，因此显存开销只有O(B*interval)标量。
+        pid_cost_cache = []
         for it in range(self.num_iterations):
             # ===== 1. 采样 + DQCAC 专属后处理 (cost budget / n-step / d,e) =====
             batch = self._rollout_vec()
@@ -821,12 +845,44 @@ class DQCACBetaGPU(VecAgentBase):
             self._maybe_save_rollout_checkpoint(it, batch)
 
             # 经验 PID 不依赖尚未校准的 critic，并在 actor epochs 前更新，逐位对齐 QCPO_refs 时序。
+            # P-M8把同一behavior actor的多批cost合并后只响应一次；第一批只累计，
+            # lambda保持不动，第二批B40更新后的lambda立即供同边界Actor PPO使用。
             dual_updated = False
+            self.last_pid_update_due = 0.0
+            self.last_pid_rollouts_accumulated = 0.0
+            self.last_pid_update_batch_episodes = 0.0
             if (not self.freeze_policy_updates and not in_warmup
                     and self.dual_update_mode == 'empirical_pid'
                     and it % self.outer_interval == 0):
-                self.update_dual(batch)
-                dual_updated = True
+                dual_batch = batch
+                pid_update_due = True
+                if self.pid_update_interval > 1:
+                    pid_cost_cache.append(batch['disc_cost'].detach())
+                    self.pid_rollouts_since_update = len(pid_cost_cache)
+                    pid_update_due = (
+                        len(pid_cost_cache) == self.pid_update_interval)
+                    if pid_update_due:
+                        # update_dual(empirical_pid)只读取disc_cost；沿episode维拼接得到
+                        # B*interval个真实MC标签，并让episode-scaled leak/I保持样本时间轴。
+                        dual_batch = {
+                            'disc_cost': torch.cat(pid_cost_cache, dim=0),
+                        }
+                else:
+                    self.pid_rollouts_since_update = 1
+
+                self.last_pid_rollouts_accumulated = float(
+                    self.pid_rollouts_since_update)
+
+                if pid_update_due:
+                    self.update_dual(dual_batch)
+                    dual_updated = True
+                    self.pid_update_events += 1
+                    self.last_pid_update_due = 1.0
+                    self.last_pid_update_batch_episodes = float(
+                        dual_batch['disc_cost'].numel())
+                    if self.pid_update_interval > 1:
+                        pid_cost_cache.clear()
+                    self.pid_rollouts_since_update = 0
 
             # interval>1 的每条 rollout 都预先抽取 K 组 risk-baseline action。抽样位置
             # 与历史 actor 首 epoch 使用相同全局 RNG 序列；即使本轮暂不更新 actor，
@@ -978,6 +1034,9 @@ class DQCACBetaGPU(VecAgentBase):
         if actor_rollout_cache:
             raise RuntimeError(
                 "training ended with unused actor rollouts; check interval divisibility")
+        if pid_cost_cache:
+            raise RuntimeError(
+                "training ended with unused PID costs; check interval divisibility")
 
     def _precompute_actor_baseline_actions(self, batch):
         """
@@ -3102,6 +3161,13 @@ class DQCACBetaGPU(VecAgentBase):
             'dual/pid_output': self.last_pid_output,
             'dual/pid_i': self.pid_i,
             'dual/window_size': float(len(self.empirical_cost_window)),
+            'dual/pid_update_interval': float(self.pid_update_interval),
+            'dual/pid_update_due': self.last_pid_update_due,
+            'dual/pid_rollouts_accumulated': (
+                self.last_pid_rollouts_accumulated),
+            'dual/pid_update_batch_episodes': (
+                self.last_pid_update_batch_episodes),
+            'dual/pid_update_events': float(self.pid_update_events),
             'dual/sum_norm_enabled': float(self.sum_norm),
             'debug/cost_history_actor_feature': float(
                 self.cost_history_mode == 'actor_feature'),
@@ -3411,6 +3477,13 @@ class DQCACBetaGPU(VecAgentBase):
             'pid_target_prob': self.pid_target_prob,
             'pid_safety_margin': self.q_alpha - self.pid_target_prob,
             'pid_i': self.pid_i,
+            'pid_update_interval': self.pid_update_interval,
+            'pid_update_events': self.pid_update_events,
+            'pid_rollouts_since_update': self.pid_rollouts_since_update,
+            'pid_rollouts_accumulated_last_iteration': (
+                self.last_pid_rollouts_accumulated),
+            'pid_update_batch_episodes_last_event': (
+                self.last_pid_update_batch_episodes),
             'dual_cost_quantile': self.last_dual_cost_quantile,
             'sum_norm': self.sum_norm,
             'beta': self.beta,
