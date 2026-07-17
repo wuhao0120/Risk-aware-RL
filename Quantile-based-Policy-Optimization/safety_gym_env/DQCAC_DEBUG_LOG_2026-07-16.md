@@ -1115,3 +1115,16 @@
 - 600k门：末5批prequential CDF absolute error或Brier相对QR至少改善20%，另一项不得恶化超过10%；独立140条的CDF error、Brier或mean-cost absolute error至少一项改善25%，其余关键项不得恶化超过10%；crossing绝对增加不得超过0.10。只有140过门才做fresh520，520仍过门才允许live 1M。
 - 长度续跑规则不变：若600k未过但相对QR的末5批和独立评估方向一致，且关键误差从此前5批到末5批仍改善超过10%，只允许一次从头1.2M；否则停止当前N64/local，不扫N96/N128、local fraction或half-width。两候选不能彼此组合后再解释单变量效果。
 - 既有N32 600k训练417.2秒，但当前同硬件direct run约245秒；N64 pairwise计算更大、local与N32近似。并行预计纯训练5--7分钟、含两组140评估总墙钟6--9分钟；均由`launch_background.sh`持久化，输出写`/vepfs`。
+
+
+### E83：C-Q3C/C-Q4C 600k结果——短跑会误判收敛值，但两种表示均不晋级（2026-07-17）
+
+- 两条正式持久化job均正常exit 0。N64-reference为W&B 'vcy6vawj'、纯训练'439.80s'；local-importance为W&B 'ndbi9jlj'、纯训练'434.27s'。并行共享GPU后，含两组140条独立评估的总墙钟约10分钟，略高于预估6--9分钟。没有NaN、OOM或标签异常。
+- 公平性检查通过：两候选与QR32基线的30批reward、reward quantile、outage、mean cost及逐步reward/cost全部逐值exact；final checkpoint中的actor 16个state tensor、observation normalizer 3个tensor和lambda均逐位相同。N64只改变64维reward/cost distributional heads，local只改变cost tau网格/权重；因此真实行为与评估truth完全一致。
+- 末5批prequential结果没有支持结构优势。QR32/N64/local的CDF absolute error分别为'0.10656/0.10797/0.10887'，N64和local相对基线恶化'1.32%/2.16%'；Brier分别为'0.23253/0.23191/0.23170'，只改善'0.27%/0.36%'，远低于20%门。N64从此前5批到末5批的CDF/Brier又恶化'9.16%/21.63%'；local恶化'13.79%/21.58%'，没有“仍以超过10%速度收敛”的延长证据。
+- 独立140条truth固定为outage '0.25714'、mean cost '11.75714'。QR32的CDF/Brier/mean-error/crossing为'0.26786/0.20282/0.77573/0.05737'。N64为'0.25859/0.20021/0.87055/0.15828'：CDF error从'0.01071'降到'0.00145'，相对改善86.46%，但Brier只改善1.28%，mean error恶化12.22%，crossing绝对增加'0.10090'。后两项分别越过“其他关键量不得恶化10%”和“crossing增加不超过0.10”的预注册边界。
+- local的独立CDF/Brier/mean-error/crossing为'0.27644/0.19930/0.80526/0.10023'。CDF error为'0.01929'，相对QR恶化80.07%；Brier只改善1.73%，mean error恶化3.81%，没有任一独立proper/mean指标达到25%改善门。
+- N64的86%相对CDF改善不能脱离绝对量和proper score解释：它只把总体预测移动约0.0093，而140条truth的二项标准误约0.0369；基线分母本来只有0.0107，所以相对百分比被放大。若它真实改善逐状态条件概率，Brier、mean和末段prequential应至少给出同方向证据；本次恰好相反，同时monotonicity明显变差。
+- 裁决：两条都不做fresh520、不进入live 1M，也不启动同seed原样1.2M。600k已经回答固定策略表示筛选，但不被写成“任何初始化下永久无效”。有分歧的备选消融保留为：未来在主线配置稳定后，用多个critic初始化各600k检验N64点估计是否复现；这比让同一初始化继续训练到1.2M更直接回答初始化偶然性。当前不扫N96/N128、local fraction/window，也不组合N64+local。
+- 本轮同时修正旧100k结论的证据等级：短跑确实可能误杀慢收敛表示，N64在600k才出现很准的总体CDF点；但完整门显示“训练更久后出现一个好数”不等于算法胜出。下一主线回到critic数据速度慢于policy移动速度的问题，优先实现默认关闭的actor更新间隔消融，而不是继续增加同一批critic更新次数。
+- 正式history/profile位于'_runs/wandb_export/dqc_frozen_qr32_n64_local_600k_lenaudit_2026-07-17/'和'_runs/profiles/dqc_frozen_qr32_n64_local_600k_lenaudit_2026-07-17/'；比较表为'quantile_length_audit_comparison.csv'，六面板图为'quantile_length_audit_comparison.png'（'3000×1500'，PIL解码通过）。

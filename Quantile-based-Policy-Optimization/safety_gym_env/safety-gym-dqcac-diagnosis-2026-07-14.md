@@ -1534,3 +1534,18 @@ N64候选使用64个uniform quantile，并以reference-mean把target数量造成
 两条都固定P-M3 seed1成熟策略、seed101行为和600k轨迹，baseline为已经完成的QR32 run 8ry7xn6g。策略恢复后重置随机数，因此网络大小不同也不能改变reward、cost或outage样本。末五批要求至少20% prequential收益，独立140要求至少25% CDF/Brier/mean-cost收益，crossing不能明显恶化；通过后才做520条和live 1M。
 
 这次600k是对“短跑可能误杀”的正面回答，但不是默认给所有失败方案无限预算。若末段与独立评估方向一致且仍以超过10%的速度改善，才延到1.2M；如果只在某个窗口偶然变好、proper score不支持或crossing恶化，就停止，不扫描N96/N128和局部窗口。两个候选并行运行以减少墙钟，但统计上仍是独立单变量消融。
+
+
+### 13.69 N64与局部quantile的600k结论：一个漂亮端点不足以推翻完整校准证据（2026-07-17）
+
+两条600k持久化实验均正常结束。N64-reference和local-importance的纯训练分别为439.8秒与434.3秒；它们与QR32的30批真实reward、outage、cost全部逐值相同，actor、observation normalizer和lambda checkpoint也逐位相同。独立140条的真实reward/outage/mean cost均严格一致为0.86576/0.25714/11.75714，因此没有策略初始化或环境随机流混杂。
+
+N64出现了一个值得记录但不能选择性放大的结果：独立hard-CDF从QR32的0.26786变为0.25859，对truth 0.25714的absolute error从0.01071降到0.00145，表面相对改善86.5%。然而逐状态Brier只从0.20282降到0.20021，改善1.28%；mean-cost error从0.77573升到0.87055，恶化12.22%；crossing从0.05737升到0.15828，增加0.10090。它同时失败于mean退化门和crossing门。140条truth自身的二项标准误约0.0369，而两模型总体CDF只差0.0093；以很小的baseline error作分母得到的86%不能视为稳定算法收益。
+
+时间曲线进一步否定“再等一会就会过门”。最后五批QR/N64的prequential CDF error为0.10656/0.10797，N64反而差1.32%；Brier为0.23253/0.23191，只好0.27%。N64自身从此前五批到末五批的CDF/Brier还恶化9.2%/21.6%。所以独立CDF端点与proper score、mean、crossing和末段趋势不一致，不满足原样延到1.2M的条件。
+
+局部加密也没有通过。它在tau约0.8附近使用19个点，但独立CDF error为0.01929，比QR恶化80.1%；Brier只改善1.73%，mean error恶化3.81%。末五批CDF误差也恶化2.16%，Brier只改善0.36%。这说明固定查询区加密提高局部分辨率，却没有解决initial-state泛化和有限tail轨迹问题。
+
+对“训练是否太短”的直白结论是：旧100k确实太短，不能宣布N64/local永久无效；本次600k足以完成固定成熟策略下的表示筛选，但不是论文最终算法预算。继续同一个初始化到1.2M的先验收益很低，因为没有同方向收敛趋势。若将来要专门检验初始化偶然性，应跑多个critic初始化的600k复验，而不是只延长同一seed；该路线保留为论文消融，不占当前主线。
+
+因此两条都不做fresh520或live 1M，也不扫描N96/N128和局部窗口。下一步优先把critic获取独立数据的速度与policy更新速度解耦：critic每批B20更新，但actor/PID每两批才改变一次，直接测试“每个policy版本只有20条轨迹”是否是闭环振荡来源。完整CSV和六面板图保存在'_runs/profiles/dqc_frozen_qr32_n64_local_600k_lenaudit_2026-07-17/'，图为3000×1500并已解码验证。
