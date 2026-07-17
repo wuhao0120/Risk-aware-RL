@@ -186,6 +186,9 @@ def base_args(algo, seed, device, env_key):
         # online逐式兼容；target查询Polyak网络；preupdate则先用最新online缓存
         # actor风险权重，再训练当前批critic，隔离同批标签而不引入长期target滞后。
         a.cost_actor_query_mode = 'online'
+        # trajectory-MC correction默认关闭，严格保留历史critic advantage。显式eta>0时
+        # 将其与真实整轨迹outage advantage凸组合，eta=1退化为无偏REINFORCE风险梯度。
+        a.cost_actor_mc_correction_coef = 0.0
         # n-step TD: T=1000 未折扣口径下 1-step 传播太慢 (600 updates 传不满 1000 步链,
         # 实测 cost-critic 在 s0 恒 0 → λ 不动)。n_step=100 → bootstrap 链长 10, 数百
         # updates 即可覆盖; on-policy 每迭代重采, n-step 和 + 截断 mask 均合法。
@@ -587,14 +590,18 @@ def main():
         print(f"[cost-critic calibration] P(Z<=q): critic={res['cost_cdf_initial']:.3f} "
               f"truth={emp:.3f} bias={res['cost_cdf_initial']-emp:+.3f}")
     if res.get('cost_cdf_brier_initial') is not None:
+        # recurrent评估返回完整hard/smooth discrimination；历史MLP评估只返回
+        # hard Brier。缺失诊断显示nan，不能因纯打印字段阻断checkpoint/JSON保存。
+        metric = lambda key: float(
+            res[key]) if res.get(key) is not None else float('nan')
         print(
             f"[cost-critic discrimination] hard Brier/AUC/BSS="
-            f"{res['cost_cdf_brier_initial']:.4f}/"
-            f"{res['cost_cdf_roc_auc_initial']:.4f}/"
-            f"{res['cost_cdf_brier_skill_initial']:.2%}  "
-            f"smooth={res['cost_cdf_smooth_brier_initial']:.4f}/"
-            f"{res['cost_cdf_smooth_roc_auc_initial']:.4f}/"
-            f"{res['cost_cdf_smooth_brier_skill_initial']:.2%}")
+            f"{metric('cost_cdf_brier_initial'):.4f}/"
+            f"{metric('cost_cdf_roc_auc_initial'):.4f}/"
+            f"{metric('cost_cdf_brier_skill_initial'):.2%}  "
+            f"smooth={metric('cost_cdf_smooth_brier_initial'):.4f}/"
+            f"{metric('cost_cdf_smooth_roc_auc_initial'):.4f}/"
+            f"{metric('cost_cdf_smooth_brier_skill_initial'):.2%}")
     if res.get('cost_cdf_qr_initial') is not None:
         # direct模式的主键是Bernoulli head；QR同样本对照单独打印，禁止混为一个CDF。
         print(
