@@ -1627,3 +1627,23 @@
 - adapter-only control相对C-H8 reward增加.04391但95%区间[-.01685,.10467]跨0，outage增加.02539且区间[-.02599,.07662]也跨0；Brier恶化12.49%、mean error恶化40%。因此额外PPO容量只有不确定的reward倾向，不能单独晋级。
 - 标准PCGrad不值得直接跑全量。25个W&B记录的rollout末事件cosine均值-.00817、绝对值中位数.0283；14个负事件平均cosine-.03865。按正交投影公式，负事件平均仍保留99.883%的aux norm，只移除0.117%，不可能解释20% reward损失。cosine>0才更新的强门控会删除约56%更新，属于另一个独立消融，不应与PCGrad混称。
 - 严格裁决：C-H11不扩seed、不启用PCGrad全量、adapter和cost共享监督均不进入默认配置。证据包位于_runs/wandb_export/dqc_ch11_adapter_pair_1m_s2_2026-07-17与_runs/profiles/dqc_ch11_adapter_pair_1m_s2_2026-07-17，含完整history、profile、三组fresh512统计CSV/JSON/PNG和privacy_audit。下一主路线转向QCPO_refs式低维Weibull tail辅助，检验降低cost分布监督方差是否比32点QR共享梯度更有效；强正余弦门控只作为分歧路线记录。
+
+
+### E136：QCPO_refs Weibull尾部头源码审计——它是共享表示正则，不是直接CDF替代（2026-07-17）
+
+- reference对cost distribution使用均匀tau，并定义`c_tau=-log(1-tau)`；cost quantile输出经过exp保证为正，另由共享history feature预测`alpha_W=4*sigmoid(linear(feature))`和`beta_W=exp(linear(feature))`。尾部比例为0.3，原设置N=25，并同时保留quantile与mean cost监督。
+- `weibull_tail_loss`先sort当前quantiles再detach，只在上30%尾部计算`0.5*(log(beta_W)+(1/alpha_W)*log(c_tau)-log(q_tail))^2`。因此它不直接拟合真实MC cost的Weibull极大似然，也不通过该项更新quantile输出层；它主要让低维alpha/beta头及其共享feature去解释当前QR尾部形状。
+- 这一区别决定首轮不能把Weibull CDF直接替换DQCAC actor使用的quantile CDF，也不能与PID、IQN、local grid、adapter或replay同时改。首轮只检验“低维尾部辅助是否改善cost critic跨rollout表示”，actor仍查询原32点QR。
+- DQCAC适配采用action-conditioned cost-critic hidden trunk，而不是reference的state-only head；这是因为当前actor风险优势必须比较同一state下不同action。QR/mean继续由真实MC cost监督，Weibull target只来自detach后的当前QR上尾，cost除以10后进入log域，并沿用risk-discount transition权重。
+- reference的正值quantile通过exp天然满足log定义域；当前主线linear quantile为保持历史可比性不改输出族，因此新增epsilon=1e-3和tail clamp fraction诊断。若成熟训练长期大量clamp，说明这项reference正则与linear输出不兼容，应停止而不是隐藏截断。
+
+### E137：C-H12 Weibull辅助实现、零影响回归与smoke验证（2026-07-17）
+
+- 新增默认关闭参数`cost_weibull_tail_coef=0, tail_prob=.3, cost_scale=10, epsilon=1e-3`。启用时新增`WeibullTailHead`，从cost critic最后隐藏层预测alpha/log-beta；辅助梯度进入Weibull头和cost hidden trunk，不进入actor/MLP+LSTM，也不通过该项进入quantile输出层。头只加入critic Adam和joint gradient clip。
+- 正式首轮配置被限制为C-H8兼容路径：recurrent actor-feature、MC、QR、uniform、linear、online quantile CDF、feature refresh关闭、full-batch critic、shared/adapter/replay/holdout/s0 auxiliary全关闭。这样Weibull是唯一新增机制，PID仍保持内部target=.15；最终裁决继续用fresh真实outage接近alpha=.20的双侧规则。
+- 纯张量验证中，`forward_features→final Linear`与原forward逐元素相同；N32/tail=.3得到index21和11个尾点；head为514参数。log-domain实现与reference等价式最大差`3.73e-9`；detach target无梯度、cost trunk和Weibull头梯度非零、quantile final layer不接收该辅助梯度。
+- 默认关闭持久化4k回归耗时12.7秒并exit0。与上一版金检查点比较，旧/新各60个tensor leaves，missing/extra/different均为0，最大浮点绝对差0；新增代码在coef0时没有改变既有模型、优化器或随机序列。
+- 启用B2×T32×3 rollout、C3/A2 smoke耗时7.6秒并exit0。最终tail loss=5.9474、head grad norm=11.782、alpha范围[2.240,2.472]、beta均值=.2887、tail clamp fraction=0；514个参数和全部48个checkpoint tensors均有限。PPO首epochratio最大误差`5.66e-6`，说明新增critic正则没有破坏behavior probability。
+- 启用检查点随后由独立持久化eval-only任务成功重建并加载`cost_weibull_head`，4回合验证exit0。短测的零cost/outage只反映T32任务过短，不能用于性能判断，也不作为“outage越低越好”的证据。
+- 下一步先做固定成熟policy、同seed、同600k监督预算的coef0/1配对机制验证；预计每条约4--6分钟，先于任何live 1M。门槛为全程有限、late clamp不高于10%、head梯度非零，并要求末5批prequential Brier至少改善10%或AUC增加至少.02，另一项不得恶化超过10%。未通过则停止Weibull live闭环；通过后才在C-H8 seed2上跑1M。
+- live候选的fresh512主规则已修正为：outage点估计在[.18,.22]才进入reward比较；低于.18判为过度保守，高于.22判为风险过大。进入工作带后要求mean reward至少不低于C-H8的.74496并争取明显提高，同时报告Wilson区间、BSS/AUC、CDF/mean误差和crossing。不会因Weibull把outage压得更低就宣布提升。

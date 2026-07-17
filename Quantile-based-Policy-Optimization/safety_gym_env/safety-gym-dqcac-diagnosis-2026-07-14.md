@@ -1961,3 +1961,14 @@ C-H11把额外网络容量和cost监督严格拆开后，结论比完整共享ba
 这也解释了为什么outage不能越低越好。若只用单侧约束，candidate会因0.184小于control的0.240而看似胜出；双侧目标揭示它只是花费过多reward换来更低风险。真正需要的是在outage约0.20时沿可行边界提高reward，而不是继续增强cost梯度把策略推向左下方。
 
 下一条主线应更换辅助监督的统计形式，而不是继续扩大或投影同一个QR梯度。QCPO_refs的Weibull头只拟合低维尾部参数，并与mean head共同约束history representation，可能比32个action-conditioned quantile的共享loss方差更低。首轮应把Weibull作为默认关闭的独立辅助项，保持B40/C20/A8、adapter关闭、PID固定；先做冻结表示和数值门，再决定是否进入live 1M。只在cosine为正时才启用cost的强门控保留为消融路线，但它会删除约56%更新，不能称为标准PCGrad，也不能与Weibull同时加入。
+
+
+### 13.117 QCPO_refs的Weibull项应先被视为低维尾部表示正则（2026-07-17）
+
+QCPO_refs并不是拿真实cost直接拟合一个Weibull CDF再供actor查询。它先用QR网络产生quantiles，把排序后的上30% quantile detach，再让共享history feature预测两个Weibull参数去解释这些尾点。于是这项loss的直接作用对象是Weibull头和共享表示，原quantile输出层不会从该辅助项收到梯度。它可能降低尾部表示的自由度和跨批方差，但也可能只是拟合critic自己的偏差；不能因为论文里使用它就默认有益。
+
+DQCAC首版因此保持actor使用原quantile CDF，只把Weibull作为action-conditioned cost trunk的辅助正则。真实MC cost仍监督QR和mean；尾部先按reference除以10，linear quantile进入log前显式clamp并记录比例。这样可以单独回答“低维尾部结构是否改善下一rollout校准”，而不会把分布族、actor风险公式和PID一起改掉。
+
+工程验证已经通过。默认关闭前后60个checkpoint tensor逐位相同；启用192步smoke中loss和head梯度非零、11个尾点无clamp、514个新增参数及全检查点有限，PPO ratio误差只有5.66e-6；独立eval-only也能重建加载头。192步的outage为0没有性能含义，因为T32几乎没有cost事件。
+
+下一步不直接花费完整闭环预算，而是冻结同一个成熟policy，用相同随机种子成对训练coef0/1 cost critic约600k监督步。只有prequential Brier至少改善10%或AUC提高0.02、且late clamp不超过10%时，才进入C-H8 seed2 live 1M。最终选择仍遵守双侧约束：fresh512 outage在[0.18,0.22]内后最大化mean reward；outage低于0.18属于未使用风险预算，不是自动胜出。内部PID target=.15暂时固定，待表示稳定后另做setpoint校准。
