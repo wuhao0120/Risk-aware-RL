@@ -1476,3 +1476,16 @@ B40也没有解决最关键的critic偏差。fresh520的hard-CDF预测只有0.08
 后续采用多保真但不草率的预算：smoke只检查全链路；300k只做机制门；冻结critic至少600k，若末五批相对前五批的关键误差仍改善超过10%则延到1.2M；live候选完整1M并做fresh520，仍接近门或末段继续改善者扩2M。最终DQCAC、QCPO和QCPO_refs必须在相同5M步、至少3 seeds、统一独立评估下比较。单seed差异不足约20%或区间跨0时不再下最终结论；使用配对随机数和多初始化区分算法效应与初始化偶然性。
 
 这不意味着把全部旧组合都重跑5M。优先验证直接query-point exceedance/CDF head（冻结600k，必要时1.2M）；若通过再进入live 1M。网络公平性方面，DQCAC最佳MLP与LSTM最终各需完整1M筛查。若QR仍承担actor的CDF查询，再补N32/N64或局部tau的600k严格配对；B40保留为可与有效CDF表示组合的减振组件，不立即扫描更多batch size。论文最终候选才消耗5M多seed预算。
+
+
+### 13.64 C-DCF1：直接学习查询量，而不是先把整条分布都学准（2026-07-17）
+
+当前actor真正需要的是给定剩余budget的超阈概率，而不是所有tau上的quantile。C-DCF1因此保留QR作为分布诊断，同时增加一个输入state、action和budget的Bernoulli critic，直接最小化MC remaining-cost事件的BCE。budget递推保证每个时刻的二元标签与整轨迹outage一致；不同时间的状态、动作和剩余budget仍不同，所以全部transition用于学习actor实际访问的条件概率函数。
+
+这个实现刻意没有把新head并入原joint critic optimizer。direct使用与QR相同的risk-discount样本权重和transition chunk，但拥有独立Adam与梯度裁剪；否则一个尺度完全不同的BCE梯度会改变reward/QR的joint clip，实验就无法归因。额外网络构造前后还恢复torch RNG，使policy动作不因多初始化一个MLP而变化。测试中34个共享module tensor leaves和构造后RNG逐位相同，full/chunk更新后最大参数差仅1.75e-10。
+
+评估不再只看总体CDF均值。selected direct和同run QR都在完全相同的独立s0、真实a0及outage标签上计算逐状态Brier；prequential训练前/后也同时报告两者。这样direct若只是输出一个接近总体outage的常数，会有不错的均值误差但无法在Brier上伪装成更好的条件风险估计。MLP、全尺寸LSTM、两epoch PPO risk cache、checkpoint恢复和两种终评路径均已通过持久化smoke。
+
+正式实验固定P-M3 seed1成熟actor、rollout seed101、B20、600k、20次critic update、MC、time weight .995、chunk2500。既有QR600k run可复用；direct run内部仍训练同一个QR，30批真实行为和QR本身必须与旧run一致。晋级要求末五批prequential至少20%改善，独立140至少25%改善，且另一校准量不明显恶化；随后还要fresh520复核。若600k仍在明显收敛则只允许一次1.2M长度审计，不允许顺手扫描网络宽度或学习率。
+
+即使冻结门通过，也不能直接宣布算法变好。direct进入live后会改变risk advantage、constraint RMS以及可能的critic-dual信号，仍可能发生policy--critic--PID闭环过冲。它必须先在压力seed完整跑1M，再按E77扩2M/多seed；最终候选与QCPO_refs仍按统一5M预算比较。

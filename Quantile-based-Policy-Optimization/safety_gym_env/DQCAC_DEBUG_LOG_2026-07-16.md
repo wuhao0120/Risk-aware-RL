@@ -1051,3 +1051,19 @@
 - 随机初始化处理：单seed中小差异不再定论。共享actor的critic消融继续使用common-random-number配对；差异小于约20%或置信区间跨0时至少补3个初始化/seed。只有效应巨大、方向在多个phase一致且直接机制指标也恶化，才允许单压力seed停止。
 - 复验优先级不是把所有旧组合全部5M重跑。先做直接query-point CDF head的冻结600k--1.2M门；通过后做live 1M。与此同时，最终网络公平性需要把DQCAC的MLP/LSTM最佳配置各跑完整1M；N64/局部tau只有在QR仍是主CDF表示时再做严格配对600k。B40保留为可与有效CDF head组合的减振组件，不因单独1M不过安全门永久删除，也不立即盲扫B30/B50/B60。
 - 本条记录时没有活动训练进程；下一条正式实验仍只通过`launch_background.sh`持久化启动，预计时长在启动前记录，输出继续写入`/vepfs-mlp2/c20250510/251204033/`。
+
+
+### E78：C-DCF1直接超阈概率critic实现、回归验证与600k预注册（2026-07-17）
+
+- C-DCF1已在提交`4b70914`实现，新增`cost_cdf_estimator=quantile|direct`，默认`quantile`。direct不是另一种quantile网络，而是额外的action-conditioned Bernoulli head，输入`(cost_input, action, remaining_budget/cost_limit)`，直接输出`P(C_remaining>=budget|s,a,budget)`；现有QR-N32继续完整训练并报告mean/std/quantile/crossing，作为同run内部对照。
+- 监督来自`label_t=1{mc_cost_to_go[t]>=budget[t]}`。由于`budget[t+1]=(budget[t]-cost[t])/gamma_c`，该事件与初始整轨迹超限严格等价；网络仍使用全部transition，因为条件`(s_t,a_t,b_t,t)`随时间改变，正是actor逐步查询的区域。新增`cost_direct_cdf_label_inconsistency_fraction`逐批检查同轨迹标签，必须恒为0。
+- head为与cost QR相同宽度的ReLU MLP，最终输出单logit；budget固定除以15，BCEWithLogits保证极端概率数值稳定。不使用正负类重加权，因为class-weighted BCE会改变概率校准目标。它复用QR的risk-discount transition weight和chunk边界，但使用独立Adam、独立grad clip、独立一次optimizer step，不进入reward/QR joint norm或clip。
+- direct首次只允许`QR + uniform grid + MC + raw cost history + online query + s0_aux=0`。这是归因约束，不是永久API限制：暂不与IQN、query-mixture、crossfit、target/preupdate或cost-LSTM叠加。MLP与`[512,512]+LSTM512` policy都已接通；direct会替换actor实际动作CDF、K动作baseline、constraint RMS和critic-dual查询，经验PID仍按真实轨迹工作。
+- 开启额外网络前后保存/恢复host与CUDA RNG。构造测试表明quantile/direct的actor、reward/cost online/target及normalizer共34个tensor leaves逐位相同，joint critic参数组数量相同，构造后torch RNG逐位相同；direct只有78,593个参数，不会因初始化消费改变首批动作。
+- 数学/工程验证：网络支持标量、`[B]`和`[B,1]` budget，BCE梯度全部有限；M=15、risk-weighted的full/chunk=4 loss为`0.6932367086/0.6932367027`，一次Adam后最大参数差`1.75e-10`，标签不一致率0。对旧提交`63b338d`做持久化配对训练，final checkpoint共34个module tensor leaves、lambda/runtime、全部旧eval键和47个共享summary键逐项exact；新增内容仅是direct配置/QR对照元数据与Brier。
+- 端到端持久化smoke均exit 0：MLP CPU训练9.1秒；全尺寸`[512,512]+LSTM512` CUDA训练9.9秒，覆盖GAE-PPO两epoch的固定risk cache、observation normalization、chunk critic、checkpoint与循环评估。direct checkpoint保存7个state tensor，eval-only恢复后的旧eval字段逐项exact。短T=32只有0-cost样本，direct仍约0.42只是4次更新后的未收敛先验，不作为算法结果。
+- 终评新增逐状态proper score：`cost_cdf_brier_initial`比较selected estimator与每条真实outage标签；direct时同时报告`cost_cdf_qr_initial/qr_brier_initial`。这避免“两个模型总体CDF均值相同，但逐状态排序完全错误”被均值误差掩盖。prequential pre/post也在相同真实a0上同时记录direct主键与`qr_*`内部对照。
+- 正式C-DCF1复用P-M3 seed1的1M成熟策略和rollout seed101。既有QR600k run `8ry7xn6g`、checkpoint `dqc_frozen_s1policy_seed101_ciqn_qr32_600k_lenaudit_20260717`作为外部基线；direct 600k仍在同一run同步训练完全相同的QR，所以可以额外验证30批behavior truth及QR权重/指标是否保持exact，不重复浪费一条QR训练。
+- 600k门：真实reward/cost/outage的30批history必须与既有QR逐值一致，所有标签不一致率为0且无非有限值；最后5批prequential direct的CDF absolute error或Brier相对同run QR至少改善20%，另一项不得恶化超过10%；独立140条的CDF absolute error或Brier至少改善25%，另一项不得恶化超过10%。140通过后才从同一final checkpoint做fresh520；520也通过才允许P-M3压力seed进入live 1M。
+- 若600k未过效果门但direct关键误差从前5批到末5批仍改善超过10%、且相对QR方向一致，则按E77训练长度规则从头预注册1.2M审计；若只近似持平或后段已平台，则停止当前direct，不扫学习率/隐藏层碰运气。通过live后再决定是否与B40减振组合，不能在第一条run同时打开两个变量。
+- 既有QR600k纯训练417.2秒。direct多一个仅78.6k参数的scalar head，结合smoke开销预计纯训练8--10分钟、含140终评总墙钟9--12分钟，显存增量远小于QR pairwise loss；正式实验只通过`launch_background.sh`，checkpoint/W&B/log全部写入`/vepfs`。
