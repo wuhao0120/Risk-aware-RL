@@ -1633,3 +1633,15 @@ P-M9完整1M的fresh520 outage从P-M8 seed0的0.32692降到0.19615，差-0.13077
 P-M9末次PPO的KL和clip明显偏高，且lambda在终点升到0.602。为判断reward损失是否集中在最后一次更新，预先固定一个轻量pre/post规则：同seed140回合评估更新前checkpoint；只有pre/post outage绝对变化至少0.08，或pre策略在140条同时满足reward≥0.75/outage≤0.22，才做额外520。无论诊断结果如何，P-M9 final的预注册失败不改写。下一主路线应是confidence-aware/adaptive PID或保守risk uncertainty，而不是继续固定target网格。
 
 评估时发现CLI disabled仍被W&B 0.18全局setup缓存成online；意外run只有1行且隐私审计无路径/源码/requirements。提交3c3379e已把mode显式传入Settings，完整1回合eval-only烟雾测试证明不再创建远端run，临时产物已清理。
+
+### 13.78 P-M9更新前后结论：需要连续可控的更新，不是二选一回滚（2026-07-17）
+
+140回合screen使pre-update checkpoint看起来同时满足reward与outage门，因此按预注册规则补做520回合。更大样本给出的结论更严格：pre-update reward/outage为`0.82559/0.23462`，post-update为`0.74188/0.19615`。reward差`-0.08370`的95%区间为`[-0.14172,-0.02568]`，下降明确；outage差`-0.03846`的Newcombe区间为`[-0.08826,+0.01155]`，安全改善点估计存在，但区间跨0。140条把pre的outage估成0.20，520条则估成0.2346，正好说明不能用小screen选择“看起来两项都过门”的checkpoint。
+
+这两个checkpoint分别位于同一reward--safety前沿的两侧。pre的reward过0.75门，但outage高于0.22；post的outage低于0.22，但reward低于0.75。简单post-update guard只能在两个失败端点中选择，无法创造中间解。更合理的目标是限制单次策略/critic/controller联合移动，使系统不跨过可接受区间，或使用能提前预测泛化误差的验证信号。
+
+critic退化比策略比例变化更强。pre的hard/smooth CDF error只有0.01058/0.00859，mean-cost error为0.14485，Brier Skill为-0.86%；post对应0.13912/0.14231、5.11495和-33.65%。一次更新让CDF误差增加约12--16倍、mean误差增加约35倍。crossing反而改善，说明单调quantile并不等价于概率正确。最后事件同时观察到logged rollout outage 0.45、lambda 0.4656→0.6023、PPO KL 0.00975和clip 0.405；最符合数据的解释是有限新trajectory上的强critic/PPO更新把策略推向更保守端，同时critic对fresh状态分布严重高估风险。
+
+这仍不是“把critic update从20直接降到10”的充分证据。早期固定策略C10→C20曾改善underfit，而本次暴露的是late live-policy的跨批泛化与联合更新幅度；全局减少update可能重新造成underfit。下一步先审计现有三seed的prequential`truth-CDF`偏差是否在多个事件上有持续符号。如果偏差可预测，就只加入一个默认关闭的自适应安全余量：用更新前CDF的校准偏差EMA，在critic低估时降低PID target、在高估时提高target，并做范围限制；如果偏差近似白噪声，就不反馈给PID，转向跨rollout validation或受控actor step。两条路线均先预注册、轻量机制验证，再决定是否完整1M。
+
+复现实验统计不再依赖一次性脚本。`compare_eval_snapshots.py`读取两份评估JSON，输出统一CSV、JSON和四面板图；P-M9结果保存在`_runs/profiles/dqc_pm9_pre_post_seed0_1m_2026-07-17/`。正式训练继续持久化后台并使用脱敏W&B online：只公开算法语义与数值指标，不公开绝对路径、机器元数据、凭据或源码；offline仅作断网恢复。

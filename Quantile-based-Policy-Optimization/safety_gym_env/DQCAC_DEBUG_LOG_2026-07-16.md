@@ -1217,3 +1217,14 @@
 - 校准门也明确失败：hard/smooth CDF误差0.07885/0.07630→0.13912/0.14231，恶化76%/87%；mean-cost误差1.5165→5.1150，恶化237%；Brier Skill从-3.44%降到-33.65%。P-M9安全并不是critic更准，而是更大lambda与保守风险高估换来的。故不扩seed、不扫其它固定target。
 - 终点P-M9的KL/clip=0.00975/0.405，P-M8为0.00457/0.241，且最后lambda升到0.602。为区分“整体target过保守”和“最后一次强PPO过冲”，只对rollout_step001000000.pt做同协议140回合pre/post诊断。只有abs(outage delta)≥0.08，或pre在140条同时reward≥0.75且outage≤0.22，才触发pre-checkpoint fresh520；否则停止。该诊断不能推翻P-M9 final的预注册失败，只决定post-update guard是否值得继续。
 - 正式历史、CSV、decision JSON和图位于_runs/wandb_export/dqc_pm8_vs_pm9_pid_target_seed0_1m_2026-07-17/及_runs/profiles/dqc_pm8_vs_pm9_pid_target_seed0_1m_2026-07-17/；overview、phase、fresh三张PNG均可解码并完成目视检查。
+
+### E92：P-M9终点fresh520更新前后——不是简单保留旧策略就能解决（2026-07-17）
+
+- 预注册的140回合诊断中，更新前checkpoint为`reward/outage=0.800/28÷140=0.200`，同时满足`reward≥0.75`和`outage≤0.22`，因此严格触发额外fresh520。该触发只决定是否值得精评，不改写E91对final P-M9的失败裁决。
+- 统一fresh520下，最后一次联合更新前后reward为`0.82559→0.74188`，差`-0.08370`，保守独立样本Welch 95%区间为`[-0.14172,-0.02568]`；reward下降不是520条抽样噪声。outage为`122÷520=0.23462→102÷520=0.19615`，差`-0.03846`，Newcombe 95%区间`[-0.08826,+0.01155]`，点估计变安全但差异区间仍跨0。
+- 两个端点没有一个同时过原门：pre-update的reward过门，但outage `0.23462>0.22`；post-update的outage过门，但reward `0.74188<0.75`。因此“若更新后风险变差就回滚”的二元guard在本例无解：保留pre仍不安全，接受post仍丢失过多reward。需要控制更新幅度或改变闭环信号，而不是只在两个端点中选一个。
+- critic泛化在一次更新后发生数量级退化。hard/smooth CDF error从`0.01058/0.00859`变成`0.13912/0.14231`，相对增加`1215%/1557%`；predicted/true mean cost从`10.183/10.038`变成`13.282/8.167`，absolute error由`0.14485`增至`5.11495`，增加`3431%`。raw Brier `0.18112→0.21074`，恶化16.35%；Brier Skill从`-0.86%`降至`-33.65%`，下降32.79个百分点。crossing虽从`0.14076`降到`0.08772`，说明“不交叉”不能保证概率校准。
+- 时序证据与“最近批次过强”一致但尚不能写成单一因果证明：更新前lambda为`0.46557`，24次PID/Actor事件；最后logged rollout outage为`0.45`，第25个B40 PID/Actor事件后lambda升到`0.60228`，PPO末epoch KL/clip为`0.00975/0.40495`。策略真实outage下降，但刚更新的critic在fresh分布上从轻微低估变成严重高估，符合对最近有限trajectory重复优化后跨策略/跨批泛化失配。
+- 下一步优先级据此调整：不实现单纯checkpoint accept/reject guard，也不继续扫固定PID target。先用既有三seed history做零训练开销的prequential校准审计，判断`truth-CDF`的符号和持续时间；若符号具有可预测性，预注册默认关闭的“校准偏差EMA→自适应PID安全余量”单变量路线。若符号不可预测，则转向限制单次联合更新幅度或critic跨rollout验证，而不把噪声直接反馈进PID。
+- 新增可复用工具`compare_eval_snapshots.py`，统一生成单组reward/Wilson区间、Welch/Newcombe差值区间、CDF/Brier/BSS/mean-cost统计及四面板图。正式结果位于`_runs/profiles/dqc_pm9_pre_post_seed0_1m_2026-07-17/`：`comparison.csv`、`statistics.json`与`comparison.png`（`2775×1895`，PIL解码与目视检查通过）。工具和本地文件不向W&B上传路径。
+- 用户再次明确：正式训练允许并应使用W&B在线监控。后续run默认online；run name/group/tags/config只含环境、算法、seed和公开超参数，继续过滤绝对路径、用户名、机器信息、凭据和源码。offline只用于真实断网兜底，不再因一般隐私顾虑默认启用。
