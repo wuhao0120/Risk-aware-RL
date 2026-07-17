@@ -82,6 +82,42 @@ class DistributionalCritic(nn.Module):
         x = torch.cat([state, action], dim=-1)              # 在最后一维拼接 → [B, sd+ad]
         return self.net(x)                                  # → [B, N]
 
+    def forward_features(self, state, action):
+        """
+        返回最后一个quantile Linear之前的共享action-conditioned表示。
+
+        默认forward不调用本函数，所以新增接口不会改变历史QR前向、state_dict或
+        浮点运算。Weibull消融显式二次前向同一组Linear+ReLU；无Dropout/BatchNorm，
+        因此feature数值与quantile head实际接收的表示逐元素相同。
+        """
+        x = torch.cat([state, action], dim=-1)              # [B,state_dim+action_dim]
+        # 最后一层是N维quantile输出；这里只执行共享hidden trunk并保留其计算图。
+        for layer in list(self.net.children())[:-1]:
+            x = layer(x)
+        return x                                             # [B,hidden[-1]]
+
+
+class WeibullTailHead(nn.Module):
+    """
+    QCPO_refs式两参数Weibull尾部头，只读取cost critic共享(s,a) feature。
+
+    原实现使用alpha=4*sigmoid(linear)与beta=exp(linear)。训练loss只需要
+    log(beta)，因此直接返回未指数化的log_beta，避免exp后再log的溢出/下溢；
+    在有限值区域两者数学和梯度完全等价。Linear保留PyTorch默认初始化，与ref一致。
+    """
+
+    def __init__(self, feature_dim):
+        """构造独立shape与log-scale标量头；不拥有或复制critic trunk参数。"""
+        super().__init__()
+        self.alpha = nn.Linear(int(feature_dim), 1)          # sigmoid后限制shape∈(0,4)
+        self.log_beta = nn.Linear(int(feature_dim), 1)       # beta的自然对数，无需显式exp
+
+    def forward(self, feature):
+        """输入[B,H]，返回alpha/log_beta两个[B]张量。"""
+        alpha = 4.0 * torch.sigmoid(self.alpha(feature).squeeze(-1))
+        log_beta = self.log_beta(feature).squeeze(-1)
+        return alpha, log_beta
+
 
 class ImplicitQuantileCritic(nn.Module):
     """

@@ -215,6 +215,12 @@ def base_args(algo, seed, device, env_key):
         # 尺度自动换算相对权重，不需要随N手动重调。
         a.cost_mean_anchor_coef = 0.0
         a.cost_mean_anchor_cost_scale = 10.0              # QCPO_refs cost /= 10
+        # QCPO_refs Weibull头拟合detach后的上30% cost quantiles。默认关闭；
+        # scale=10恢复reference训练单位，epsilon只保护linear quantile的log定义域。
+        a.cost_weibull_tail_coef = 0.0
+        a.cost_weibull_tail_prob = 0.3
+        a.cost_weibull_cost_scale = 10.0
+        a.cost_weibull_epsilon = 1e-3
         # QCPO_refs 在 cost/10 单位上用 exp(logit) 保证分布输出非负；DQCAC
         # 默认 linear 完全兼容历史，exp/softplus 显式乘回10恢复 raw-cost 单位。
         a.cost_quantile_output = 'linear'

@@ -41,8 +41,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from utils import RecurrentActorValue, RecurrentCostEncoder, RunningMeanStd
 from .vec_base import VecAgentBase
 from .common import (DistributionalCritic, ExceedanceProbabilityCritic,
-                     ImplicitQuantileCritic, ScalarValueCritic, lr_lambda,
-                     indicator_ge)
+                     ImplicitQuantileCritic, ScalarValueCritic, WeibullTailHead,
+                     lr_lambda, indicator_ge)
 
 
 def _build_cost_quantile_grid(num_quantiles, mode, query_tau, half_width,
@@ -335,6 +335,17 @@ class DQCACBetaGPU(VecAgentBase):
         # 这个单位差，否则二次MSE相对线性QR会被额外放大一个cost_scale。
         self.cost_mean_anchor_cost_scale = float(
             getattr(args, 'cost_mean_anchor_cost_scale', 10.0))
+        # C-H12默认关闭：QCPO_refs的Weibull头拟合detach后的cost quantile上尾。
+        # 首轮只把该辅助梯度写入action-conditioned cost critic trunk与两参数头，
+        # 不写actor MLP+LSTM，也不让Weibull预测替代DQCAC的quantile CDF查询。
+        self.cost_weibull_tail_coef = float(
+            getattr(args, "cost_weibull_tail_coef", 0.0))
+        self.cost_weibull_tail_prob = float(
+            getattr(args, "cost_weibull_tail_prob", 0.3))
+        self.cost_weibull_cost_scale = float(
+            getattr(args, "cost_weibull_cost_scale", 10.0))
+        self.cost_weibull_epsilon = float(
+            getattr(args, "cost_weibull_epsilon", 1e-3))
         # QCPO_refs 的 constraint head 输出 exp(logit)，但其监督和budget都先除以10。
         # 本实现继续使用raw cost，所以正值映射必须乘回scale；linear默认不增加
         # 任何tensor操作，保证历史checkpoint和逐张量回归完全兼容。
@@ -386,6 +397,14 @@ class DQCACBetaGPU(VecAgentBase):
         if self.cost_quantile_output not in {'linear', 'exp', 'softplus'}:
             raise ValueError(
                 "cost_quantile_output must be 'linear', 'exp', or 'softplus'")
+        if self.cost_weibull_tail_coef < 0.0:
+            raise ValueError("cost_weibull_tail_coef must be non-negative")
+        if not 0.0 < self.cost_weibull_tail_prob < 1.0:
+            raise ValueError("cost_weibull_tail_prob must lie in (0,1)")
+        if self.cost_weibull_cost_scale <= 0.0:
+            raise ValueError("cost_weibull_cost_scale must be positive")
+        if self.cost_weibull_epsilon <= 0.0:
+            raise ValueError("cost_weibull_epsilon must be positive")
         if self.cost_quantile_output_scale <= 0.0:
             raise ValueError("cost_quantile_output_scale must be positive")
         if self.cost_shared_backbone_coef < 0.0:
@@ -465,6 +484,13 @@ class DQCACBetaGPU(VecAgentBase):
         self.cost_gradient_diagnostic_events = 0
         self.cost_gradient_conflict_events = 0
         self.cost_gradient_cosine_sum = 0.0
+        # 最近一次Weibull update诊断会进入checkpoint summary；默认全零不构造张量。
+        self.last_cost_weibull_info = {
+            "loss": 0.0, "scaled_loss": 0.0, "tail_clamp_fraction": 0.0,
+            "alpha_mean": 0.0, "alpha_min": 0.0, "alpha_max": 0.0,
+            "beta_mean": 0.0, "log_beta_abs_max": 0.0,
+            "head_grad_norm": 0.0,
+        }
         self.advantage_norm = getattr(args, 'advantage_norm', 'qcpo')
         self.entropy_coef = getattr(args, 'entropy_coef', 0.0)
         self.lambda_max = getattr(args, 'lambda_max', 50.0)
@@ -744,6 +770,31 @@ class DQCACBetaGPU(VecAgentBase):
                 raise ValueError("cost adapter currently requires actor_update_interval=1")
             if self.freeze_policy_updates or self.actor_updates_per_episode <= 0:
                 raise ValueError("cost adapter requires live actor updates")
+        # C-H12首轮只在C-H8 action-conditioned actor-feature/MC/QR主线上增加
+        # cost-critic内部尾部正则。严格排除共享actor梯度、replay/guard和chunk，
+        # 使结果只能归因于Weibull头对同一个cost trunk的附加约束。
+        if self.cost_weibull_tail_coef > 0.0:
+            if not self.recurrent_policy or self.cost_history_mode != "actor_feature":
+                raise ValueError("cost Weibull tail requires recurrent actor_feature history")
+            if self.cost_target_mode != "mc":
+                raise ValueError("cost Weibull tail currently requires MC cost targets")
+            if self.cost_distribution_model != "qr":
+                raise ValueError("cost Weibull tail currently requires QR cost distribution")
+            if self.cost_quantile_grid_mode != "uniform":
+                raise ValueError("cost Weibull tail currently requires uniform quantiles")
+            if self.cost_quantile_output != "linear":
+                raise ValueError("cost Weibull tail first ablation requires linear output")
+            if self.cost_cdf_estimator != "quantile" or self.cost_actor_query_mode != "online":
+                raise ValueError("cost Weibull tail requires quantile CDF and online query")
+            if self.cost_actor_feature_refresh or self.cost_s0_aux_coef > 0.0:
+                raise ValueError("cost Weibull tail requires refresh disabled and s0_aux=0")
+            if self.cost_transition_replay_batches > 0 or self.cost_holdout_guard:
+                raise ValueError("cost Weibull tail cannot combine with replay or holdout guard")
+            if self.cost_shared_backbone_coef > 0.0 or self.cost_adapter_width > 0:
+                raise ValueError("cost Weibull tail first ablation cannot share actor gradients")
+            if self.critic_minibatch_size != 0:
+                raise ValueError("cost Weibull tail first ablation requires full-batch critic")
+
         # 主cost critic继续使用已验证的huber_kappa=0.1；共享辅助项单独使用
         # cost_shared_backbone_huber_kappa=1，精确对应QCPO_refs而不暗改head优化目标。
 
@@ -925,6 +976,17 @@ class DQCACBetaGPU(VecAgentBase):
         local_high = self.cost_quantile_query_tau + self.cost_quantile_local_half_width
         self.cost_quantile_local_count = int(
             ((self.cost_taus >= local_low) & (self.cost_taus <= local_high)).sum().item())
+        # 逐式复现QCPO_refs: floor(N*(1-tail_prob)-0.5)。midpoint grid下
+        # 首个tail quantile可能略低于1-tail_prob，但索引/包含端点与源实现一致。
+        self.cost_weibull_tail_index = int(np.floor(
+            self.num_quantiles * (1.0 - self.cost_weibull_tail_prob) - 0.5))
+        self.cost_weibull_tail_index = min(
+            max(self.cost_weibull_tail_index, 0), self.num_quantiles - 1)
+        self.cost_weibull_tail_count = (
+            self.num_quantiles - self.cost_weibull_tail_index)
+        # Weibull quantile Q(tau)=beta*(-log(1-tau))^(1/alpha)；loss在log域比较。
+        self.cost_weibull_log_c_tau = torch.log(
+            -torch.log1p(-self.cost_taus)).detach()
         if self.cost_distribution_model == 'iqn':
             # IQN 的 CDF 实际用 dense default query grid；局部计数也必须报告该网格，
             # 不能继续显示训练用的旧 N=32 固定 head 数。
@@ -1017,6 +1079,18 @@ class DQCACBetaGPU(VecAgentBase):
             self.cost_target_history_encoder.load_state_dict(
                 self.cost_history_encoder.state_dict())
 
+        # Weibull头只在显式启用时构造，并放在全部既有网络之后。保存/恢复CPU
+        # RNG保证新增头不会改变随后policy action的全局随机序列；默认None既不增加
+        # state_dict键，也不改变旧checkpoint或optimizer参数顺序。
+        self.cost_weibull_head = None
+        if self.cost_weibull_tail_coef > 0.0:
+            rng_state = torch.get_rng_state()
+            try:
+                self.cost_weibull_head = WeibullTailHead(
+                    feature_dim=int(hidden[-1])).to(self.device)
+            finally:
+                torch.set_rng_state(rng_state)
+
         # 一个优化器统管双 critic 与可选 cost encoder；reward/cost loss 各自
         # backward 后累积梯度，最后统一 clip 和 optimizer.step。
         critic_parameters = (
@@ -1028,6 +1102,9 @@ class DQCACBetaGPU(VecAgentBase):
             critic_parameters += list(self.cost_crossfit_critic.parameters())
         if self.cost_history_encoder is not None:
             critic_parameters += list(self.cost_history_encoder.parameters())
+        if self.cost_weibull_head is not None:
+            # 头与cost trunk共享一次Adam/clip，逐式对应QCPO_refs joint objective。
+            critic_parameters += list(self.cost_weibull_head.parameters())
         self.critic_optimizer = Adam(
             critic_parameters, getattr(args, 'critic_lr', 1e-3), eps=1e-5)
 
@@ -1165,6 +1242,11 @@ class DQCACBetaGPU(VecAgentBase):
               f"/atol{self.cost_holdout_absolute_tolerance:g}, "
               f"cost_mean_anchor={self.cost_mean_anchor_coef:g}"
               f"/scale{self.cost_mean_anchor_cost_scale:g}, "
+              f"cost_weibull={self.cost_weibull_tail_coef:g}"
+              f"/tail{self.cost_weibull_tail_prob:g}"
+              f"/index{self.cost_weibull_tail_index}"
+              f"/scale{self.cost_weibull_cost_scale:g}"
+              f"/eps{self.cost_weibull_epsilon:g}, "
               f"cost_output={self.cost_quantile_output}"
               f"/scale{self.cost_quantile_output_scale:g}, "
               f"shared_cost={self.cost_shared_backbone_coef:g}"
@@ -1370,6 +1452,15 @@ class DQCACBetaGPU(VecAgentBase):
                     'cost_update_retained': float(
                         critic_info['critic/cost_update_retained']),
                 })
+                # 保留每个C-step的Weibull曲线，而不只记录第20次末值。
+                critic_update_diagnostics[-1].update({
+                    "cost_weibull_loss": float(
+                        critic_info["critic/cost_weibull_loss"]),
+                    "cost_weibull_tail_clamp_fraction": float(
+                        critic_info["critic/cost_weibull_tail_clamp_fraction"]),
+                    "cost_weibull_head_grad_norm": float(
+                        critic_info["critic/cost_weibull_head_grad_norm"]),
+                })
                 if actor_epoch_allowed and not actor_before_critic:
                     apply_actor_epoch()
                 if self.learning_steps % self.target_update_interval == 0:
@@ -1390,6 +1481,15 @@ class DQCACBetaGPU(VecAgentBase):
                                 'cost_qr_loss', 'cost_mean_anchor_loss',
                                 'cost_objective_loss', 'cost_update_retained')
                 }
+                weibull_loss_sequence = np.asarray([
+                    item["cost_weibull_loss"]
+                    for item in critic_update_diagnostics], dtype=np.float64)
+                weibull_clamp_sequence = np.asarray([
+                    item["cost_weibull_tail_clamp_fraction"]
+                    for item in critic_update_diagnostics], dtype=np.float64)
+                weibull_grad_sequence = np.asarray([
+                    item["cost_weibull_head_grad_norm"]
+                    for item in critic_update_diagnostics], dtype=np.float64)
                 cost_grad = diagnostic_sequences['cost_grad_norm']
                 cost_head_grad = diagnostic_sequences['cost_head_grad_norm']
                 cost_history_grad = diagnostic_sequences['cost_history_grad_norm']
@@ -1449,6 +1549,25 @@ class DQCACBetaGPU(VecAgentBase):
                         diagnostic_sequences['cost_update_retained'].sum()),
                     'critic/cost_update_retained_fraction': float(
                         diagnostic_sequences['cost_update_retained'].mean()),
+                })
+
+                critic_info.update({
+                    "critic/cost_weibull_loss_first": float(
+                        weibull_loss_sequence[0]),
+                    "critic/cost_weibull_loss_mean": float(
+                        weibull_loss_sequence.mean()),
+                    "critic/cost_weibull_loss_last": float(
+                        weibull_loss_sequence[-1]),
+                    "critic/cost_weibull_tail_clamp_fraction_mean": float(
+                        weibull_clamp_sequence.mean()),
+                    "critic/cost_weibull_tail_clamp_fraction_last": float(
+                        weibull_clamp_sequence[-1]),
+                    "critic/cost_weibull_head_grad_norm_mean": float(
+                        weibull_grad_sequence.mean()),
+                    "critic/cost_weibull_head_grad_norm_max": float(
+                        weibull_grad_sequence.max()),
+                    "critic/cost_weibull_head_grad_norm_last": float(
+                        weibull_grad_sequence[-1]),
                 })
 
             # 若最后几个step仍在容忍带内但不是真正best，这里恢复best后再做post
@@ -2643,6 +2762,76 @@ class DQCACBetaGPU(VecAgentBase):
         return (
             per_transition * sample_weights.reshape(-1)).mean()
 
+    def _cost_weibull_tail_loss(
+            self, inputs, actions, quantiles, sample_weights=None):
+        """
+        用QCPO_refs公式拟合detach quantile上尾，并只正则化cost critic trunk。
+
+        quantiles是raw-cost单位[M,N]；先除固定S=10再排序。reference因exp输出
+        天然严格为正，当前linear head可能给出非正tail，所以只在detach监督侧clamp
+        到epsilon并显式报告比例。clamp不向quantile head传播任何梯度。
+        """
+        zero_info = {
+            "critic/cost_weibull_loss": 0.0,
+            "critic/cost_weibull_scaled_loss": 0.0,
+            "critic/cost_weibull_tail_clamp_fraction": 0.0,
+            "critic/cost_weibull_alpha_mean": 0.0,
+            "critic/cost_weibull_alpha_min": 0.0,
+            "critic/cost_weibull_alpha_max": 0.0,
+            "critic/cost_weibull_beta_mean": 0.0,
+            "critic/cost_weibull_log_beta_abs_max": 0.0,
+        }
+        if self.cost_weibull_head is None:
+            return None, zero_info
+        if quantiles.ndim != 2 or quantiles.shape[1] != self.num_quantiles:
+            raise ValueError("Weibull tail requires fixed QR quantiles [M,N]")
+
+        # 二次执行确定性trunk只为取得共享feature计算图；默认forward仍完全不变。
+        cost_features = self.cost_critic.forward_features(inputs, actions)
+        alpha, log_beta = self.cost_weibull_head(cost_features)
+        safe_alpha = alpha.clamp_min(self.cost_weibull_epsilon)
+
+        # torch.sort(...).detach逐式对应源实现；tail索引也使用同一floor公式。
+        sorted_scaled = (
+            torch.sort(quantiles, dim=-1).values.detach()
+            / self.cost_weibull_cost_scale)
+        tail = sorted_scaled[:, self.cost_weibull_tail_index:]
+        safe_tail = tail.clamp_min(self.cost_weibull_epsilon)
+        target_log_quantile = torch.log(safe_tail)
+        tail_log_c_tau = self.cost_weibull_log_c_tau[
+            self.cost_weibull_tail_index:].to(dtype=quantiles.dtype)
+
+        # log Q(tau)=log(beta)+log(-log(1-tau))/alpha；在log域避免beta显式exp。
+        predicted_log_quantile = (
+            log_beta.unsqueeze(1)
+            + safe_alpha.reciprocal().unsqueeze(1)
+            * tail_log_c_tau.unsqueeze(0))
+        per_transition = 0.5 * (
+            predicted_log_quantile - target_log_quantile).pow(2).mean(dim=1)
+        if sample_weights is None:
+            loss = per_transition.mean()
+        else:
+            if sample_weights.numel() != quantiles.shape[0]:
+                raise ValueError("Weibull sample weights must match transition count")
+            loss = (per_transition * sample_weights.reshape(-1)).mean()
+
+        # beta_mean只作可读诊断；clamp log避免日志计算本身溢出，不参与loss。
+        beta_mean = torch.exp(log_beta.detach().clamp(-30.0, 30.0)).mean()
+        info = {
+            "critic/cost_weibull_loss": float(loss.detach().item()),
+            "critic/cost_weibull_scaled_loss": float(
+                self.cost_weibull_tail_coef * loss.detach().item()),
+            "critic/cost_weibull_tail_clamp_fraction": float(
+                (tail <= self.cost_weibull_epsilon).float().mean().item()),
+            "critic/cost_weibull_alpha_mean": float(alpha.detach().mean().item()),
+            "critic/cost_weibull_alpha_min": float(alpha.detach().min().item()),
+            "critic/cost_weibull_alpha_max": float(alpha.detach().max().item()),
+            "critic/cost_weibull_beta_mean": float(beta_mean.item()),
+            "critic/cost_weibull_log_beta_abs_max": float(
+                log_beta.detach().abs().max().item()),
+        }
+        return loss, info
+
     def _shared_backbone_reference_cost_loss(
             self, actor_features, batch):
         """
@@ -2983,6 +3172,17 @@ class DQCACBetaGPU(VecAgentBase):
         crossfit_fold0_fraction = 0.0
         crossfit_fold1_fraction = 0.0
         cost_mean_loss_value = 0.0
+        cost_weibull_loss = None
+        cost_weibull_info = {
+            "critic/cost_weibull_loss": 0.0,
+            "critic/cost_weibull_scaled_loss": 0.0,
+            "critic/cost_weibull_tail_clamp_fraction": 0.0,
+            "critic/cost_weibull_alpha_mean": 0.0,
+            "critic/cost_weibull_alpha_min": 0.0,
+            "critic/cost_weibull_alpha_max": 0.0,
+            "critic/cost_weibull_beta_mean": 0.0,
+            "critic/cost_weibull_log_beta_abs_max": 0.0,
+        }
         cost_mean_anchor_scale = self._cost_mean_anchor_scale(
             cost_target.shape[-1])
 
@@ -3094,7 +3294,25 @@ class DQCACBetaGPU(VecAgentBase):
                     self._cost_mean_anchor_loss(
                         cost_pred, cost_target, cost_sample_weights)
                     if self.cost_mean_anchor_coef > 0.0 else None)
-            if transition_replay_active:
+                # Weibull target来自同一次current cost quantiles的detach上尾；额外
+                # trunk forward只建立辅助梯度图，不改变QR prediction或target。
+                cost_weibull_loss, cost_weibull_info = (
+                    self._cost_weibull_tail_loss(
+                        cost_state_inputs, actions, cost_pred,
+                        cost_sample_weights))
+            if cost_weibull_loss is not None:
+                # 构造保护已排除replay/s0/crossfit/chunk；这里再次断言，避免未来
+                # 放宽参数时悄悄遗漏loss凸组合或重复监督的尺度定义。
+                if transition_replay_active or s0_aux_loss is not None:
+                    raise RuntimeError("Weibull tail cannot share replay or s0 update")
+                if cost_mean_loss is None:
+                    (reward_loss + cost_loss
+                     + self.cost_weibull_tail_coef * cost_weibull_loss).backward()
+                else:
+                    (reward_loss + cost_loss
+                     + cost_mean_anchor_scale * cost_mean_loss
+                     + self.cost_weibull_tail_coef * cost_weibull_loss).backward()
+            elif transition_replay_active:
                 # 构造期已拒绝s0_aux/crossfit组合；先释放current大图，再逐块构建旧批图。
                 if s0_aux_loss is not None:
                     raise RuntimeError(
@@ -3213,7 +3431,14 @@ class DQCACBetaGPU(VecAgentBase):
         cost_history_parameters = []
         if self.cost_history_encoder is not None:
             cost_history_parameters = list(self.cost_history_encoder.parameters())
-        cost_parameters = cost_head_parameters + cost_history_parameters
+        cost_weibull_parameters = []
+        if self.cost_weibull_head is not None:
+            cost_weibull_parameters = list(self.cost_weibull_head.parameters())
+        # cost_head保持历史上只指QR/IQN critic；Weibull head单独报告，但两者都属于
+        # cost optimizer侧并参与同一次joint clip/step。
+        cost_parameters = (
+            cost_head_parameters + cost_history_parameters
+            + cost_weibull_parameters)
 
         def gradient_norm(parameters):
             squared_norm = torch.zeros((), dtype=torch.float32, device=self.device)
@@ -3225,6 +3450,7 @@ class DQCACBetaGPU(VecAgentBase):
         reward_grad_norm = gradient_norm(reward_parameters)
         cost_head_grad_norm = gradient_norm(cost_head_parameters)
         cost_history_grad_norm = gradient_norm(cost_history_parameters)
+        cost_weibull_head_grad_norm = gradient_norm(cost_weibull_parameters)
         cost_grad_norm = gradient_norm(cost_parameters)
         joint_parameters = reward_parameters + cost_parameters
         joint_grad_norm = gradient_norm(joint_parameters)
@@ -3313,7 +3539,9 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/cost_head_grad_norm': float(cost_head_grad_norm.item()),
             'critic/cost_history_grad_norm': float(
                 cost_history_grad_norm.item()),
-            'critic/cost_grad_norm': float(cost_grad_norm.item()),
+            "critic/cost_weibull_head_grad_norm": float(
+                cost_weibull_head_grad_norm.item()),
+            "critic/cost_grad_norm": float(cost_grad_norm.item()),
             'critic/cost_update_applied': float(apply_cost_update),
             'critic/joint_grad_norm': float(joint_grad_norm.item()),
             'critic/grad_clip_fraction': float(
@@ -3346,8 +3574,26 @@ class DQCACBetaGPU(VecAgentBase):
                 'critic/cost_crossfit_fold0_fraction': crossfit_fold0_fraction,
                 'critic/cost_crossfit_fold1_fraction': crossfit_fold1_fraction,
             })
+        # Weibull与QR/mean使用同一current batch；默认scaled_loss=0只改变日志数值加0。
+        critic_info["critic/cost_objective_loss"] += cost_weibull_info[
+            "critic/cost_weibull_scaled_loss"]
         critic_info.update(s0_aux_info)
         critic_info.update(transition_replay_info)
+        critic_info.update(cost_weibull_info)
+        # head grad在backward后才能得到；其余统计已由loss helper冻结为Python数值。
+        self.last_cost_weibull_info = {
+            "loss": cost_weibull_info["critic/cost_weibull_loss"],
+            "scaled_loss": cost_weibull_info["critic/cost_weibull_scaled_loss"],
+            "tail_clamp_fraction": cost_weibull_info[
+                "critic/cost_weibull_tail_clamp_fraction"],
+            "alpha_mean": cost_weibull_info["critic/cost_weibull_alpha_mean"],
+            "alpha_min": cost_weibull_info["critic/cost_weibull_alpha_min"],
+            "alpha_max": cost_weibull_info["critic/cost_weibull_alpha_max"],
+            "beta_mean": cost_weibull_info["critic/cost_weibull_beta_mean"],
+            "log_beta_abs_max": cost_weibull_info[
+                "critic/cost_weibull_log_beta_abs_max"],
+            "head_grad_norm": float(cost_weibull_head_grad_norm.item()),
+        }
         self.last_cost_transition_replay_samples = float(
             transition_replay_info['critic/cost_transition_replay_samples'])
         self.last_cost_transition_replay_batches = float(
@@ -4786,6 +5032,14 @@ class DQCACBetaGPU(VecAgentBase):
             'debug/cost_quantile_output_is_softplus': float(
                 self.cost_quantile_output == 'softplus'),
             'debug/cost_quantile_output_scale': self.cost_quantile_output_scale,
+            "debug/cost_weibull_enabled": float(
+                self.cost_weibull_tail_coef > 0.0),
+            "debug/cost_weibull_tail_coef": self.cost_weibull_tail_coef,
+            "debug/cost_weibull_tail_prob": self.cost_weibull_tail_prob,
+            "debug/cost_weibull_tail_index": float(
+                self.cost_weibull_tail_index),
+            "debug/cost_weibull_cost_scale": self.cost_weibull_cost_scale,
+            "debug/cost_weibull_epsilon": self.cost_weibull_epsilon,
             'debug/cost_shared_backbone_enabled': float(
                 self.cost_shared_backbone_coef > 0.0),
             'debug/cost_shared_backbone_coef': self.cost_shared_backbone_coef,
@@ -5183,6 +5437,17 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_mean_anchor_cost_scale': self.cost_mean_anchor_cost_scale,
             'cost_mean_anchor_scale': self._cost_mean_anchor_scale(
                 self.num_quantiles),
+            "cost_weibull_tail_coef": self.cost_weibull_tail_coef,
+            "cost_weibull_tail_prob": self.cost_weibull_tail_prob,
+            "cost_weibull_tail_index": self.cost_weibull_tail_index,
+            "cost_weibull_tail_count": self.cost_weibull_tail_count,
+            "cost_weibull_cost_scale": self.cost_weibull_cost_scale,
+            "cost_weibull_epsilon": self.cost_weibull_epsilon,
+            "cost_weibull_parameter_count": (
+                0 if self.cost_weibull_head is None else
+                sum(parameter.numel()
+                    for parameter in self.cost_weibull_head.parameters())),
+            "cost_weibull_last": dict(self.last_cost_weibull_info),
             'cost_quantile_output': self.cost_quantile_output,
             'cost_quantile_output_scale': self.cost_quantile_output_scale,
             'cost_shared_backbone_coef': self.cost_shared_backbone_coef,
