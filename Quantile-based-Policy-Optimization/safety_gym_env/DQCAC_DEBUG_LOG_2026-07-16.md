@@ -1021,3 +1021,9 @@
 - 不用300k早停。P-M1/C-X1已证明慢变量可在100k～600k改变方向，P-M6除NaN/OOM/确定性错误外完整跑1M，并每5个iteration（200k）保存phase checkpoint。内置160条只作screen；通过才做统一`num_envs=20`的fresh520。
 - 压力seed1 fresh520门：相对P-M3的`reward/outage=0.8622/0.3058`，候选需outage `≤0.22`且至少下降`.08`，reward `≥0.75`；同时末200k不出现更大lambda/outage周期。通过才原配置扩seed0/2，否则停止B40，不扫B30/B50/B60。
 - A100 80GB对B20只占少量显存，B40+N32预计安全；单条独占训练预计`7～9min`，内置160约1min，若晋级fresh520约5min。全程由`launch_background.sh`持久化，输出写入`/vepfs`。
+
+### E75：P-M6 内置screen通过与fresh520协议校正（2026-07-17，评估启动前）
+
+- P-M6 seed1 1M训练和160条内置评估正常exit 0；内置reward/outage为`0.93045/34÷160=0.2125`，通过screen。critic CDF为`0.08320`，相对truth仍低估`0.12930`，所以必须做fresh520。
+- E74写成统一`num_envs=20`是启动前发现的记录错误。既有P-M3 seed1正式fresh520命令实际为`num_eval=512,num_envs=40`，得到严格520条；为复用完全相同的并行布局与动作RNG协议，P-M6也使用`512/40`。这是查阅既有run.sh后的协议校正，不改变checkpoint、门槛或训练结果。
+- fresh520仍只做eval-only，门保持outage`≤0.22`且相对P-M3降低至少`.08`、reward`≥0.75`；不根据内置160调阈值。
