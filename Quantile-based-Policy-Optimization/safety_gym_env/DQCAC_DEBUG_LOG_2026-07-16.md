@@ -1744,3 +1744,14 @@
 - 不直接运行eta=.5/.25。当前`Aeta=Acritic+eta*residual`随后除以同一`Aeta`的EMA标准差；当residual比critic大两个数量级时，把eta从1缩到.5或.25会让分子和归一化分母近似同比缩小，稳态有效梯度及方向几乎不变。即使eta=.25，MC项标准差仍约是critic的16倍。因此原预注册的“eta扫描”在当前归一化下不是有效强度消融，盲跑1M没有信息价值。
 - 下一候选应让混合参数具有可辨识语义：分别跟踪critic与MC residual的RMS，按`A=Acritic+rho*(sigma_critic/sigma_residual)*residual`配平后再做一次总归一化；rho才控制真实相对贡献。另一条独立路线是把B40提高到B80并保持每次Actor/PID更新的trajectory数增加，同时按总环境步重新标定更新事件数。两条不能同时改；先做默认关闭实现、符号/eta0逐位回归和B80显存smoke，再选择一条正式1M。最终裁决继续是fresh outage进入`[.18,.22]`后最大化mean reward，不以outage更低为优。
 - 完整证据位于`_runs/wandb_export/dqc_ch8b40_vs_ch13_mcfix_eta1_b40_1m_s1_2026-07-17/`和同名`_runs/profiles/`。profile新增trajectory-MC分解曲线，明确显示critic/MC尺度、residual、相关性和label基率；这些绘图改动只扩展离线分析，不影响训练。
+
+### E148：RMS配平的trajectory residual收缩实现与正式预注册（2026-07-17）
+
+- 新模式默认关闭，参数为`cost_actor_mc_correction_mode=raw|rms_balanced`。raw逐式保留`Acritic+eta*(I-p_hat)`；balanced定义`A=Acritic+rho*s*(I-p_hat)`，其中`s=clip(sigma_critic/sigma_residual, max=1)`、两个sigma的数值下限为`1e-4`。rho=1使实际修正项与critic advantage具有约相同RMS，而不是让二元MC项以约64倍尺度完全替换critic。该估计有意以偏差换方差，不能声称rho=1仍是完整无偏trajectory REINFORCE。
+- 两套component EMA只在behavior batch首次真正进入actor时更新一次。online模式下这与actor实际查询的critic版本一致；随后8个PPO epoch冻结scale、风险优势和old log-prob，只重算当前策略分子。constraint RMS用同一个最终blended advantage更新一次，负责整体尺度；它不再把rho的分量比例抵消。actor cadence合并时统计覆盖全部独立trajectory，MLP和MLP+LSTM共用同一helper。
+- 新增W&B诊断包括balance scale、critic/residual reference sigma、实际`correction_std/critic_std`、两套component EMA及模式/数值保护配置。离线profile同步绘制这些字段；因此正式实验能直接验证rho是否真的产生预期相对贡献，而不是只看最终outage猜测机制。
+- 解析测试使用两条轨迹、三时刻的time-major标签，raw eta0/1端点逐元素正确；balanced rho=1和rho=.25的实际修正/critic RMS比分别为`1.0/.25`，第二次PPO式查询不再推进EMA且输出完全相同。默认兼容用补丁前提交`00697e1`、seed404、B2×T32、3 rollout、C3/A2生成金样本；补丁后同配置复跑正常exit0。四个checkpoint共176个tensor/array leaves逐元素完全一致，最大差0；排除纯墙钟后178个共享JSON数值完全一致。
+- 首次enabled smoke在构造期发现校验早于`self.advantage_norm`初始化，尚未进入训练；校验改为读取同一`args.advantage_norm`后复用原job名重跑。recurrent rho1 smoke训练7.3秒、3个actor事件、44个checkpoint tensor全有限，首epoch ratio误差`4.05e-5`；MLP rho1 smoke训练7.4秒、41个tensor全有限、ratio误差0。两个短测都用`cost_limit=-1`强制非零标签，只证明链路，不提供性能证据。
+- 正式C-H14只改C-H8 seed1的risk estimator：B40×25×T1000=1M、C20/A8、LSTM512、QR32/MC、actor-feature、mean-anchor=.5/scale10、obs RMS、GAE-PPO、beta=.995、经验PID target=.15与所有LR保持不变；设置`correction_coef=1, mode=rms_balanced, floor=1e-4, ratio_max=1`。W&B使用脱敏name `DQCAC_DynamicButton_ch14_mcbalance_rho1_b40_1m_s1`和group `dqcac_trajectory_mc_balance_dynamicbutton`。
+- 预计纯训练7--9分钟、内置128评估1--2分钟。机制门要求全部有限、首epoch ratio小于`1e-3`、末段实际修正/critic RMS比在`[.5,2]`且balance scale不长期触及非有限值。内置宽screen为reward至少`.60`、outage位于`.05--.40`；通过才做约3--4分钟fresh512。
+- 最终首先要求fresh outage点估计进入双侧带`[.18,.22]`；reward最低参考是同seed 2M带内点`.79542`，目标是不低于1M基线`.81951`。低于.18且reward下降记为过度保守，高于.22记为风险不足；更低outage只有在reward同时更高时才构成支配。若rho1过度保守，下一单变量为rho=.5；若仍明显不安全但方向改善，可讨论允许rho>1或B80独立trajectory消融，不能同时改batch、PID和rho。

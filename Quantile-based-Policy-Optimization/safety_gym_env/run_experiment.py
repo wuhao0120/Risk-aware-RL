@@ -186,9 +186,13 @@ def base_args(algo, seed, device, env_key):
         # online逐式兼容；target查询Polyak网络；preupdate则先用最新online缓存
         # actor风险权重，再训练当前批critic，隔离同批标签而不引入长期target滞后。
         a.cost_actor_query_mode = 'online'
-        # trajectory-MC correction默认关闭，严格保留历史critic advantage。显式eta>0时
-        # 将其与真实整轨迹outage advantage凸组合，eta=1退化为无偏REINFORCE风险梯度。
+        # trajectory-MC correction默认关闭，严格保留历史critic advantage。raw模式
+        # 逐式保留Acritic+eta*(I-p_hat)；rms_balanced先把二元residual缩放到与
+        # critic advantage相同的EMA标准差，使rho在总RMS归一化后仍具有可辨识意义。
         a.cost_actor_mc_correction_coef = 0.0
+        a.cost_actor_mc_correction_mode = 'raw'
+        a.cost_actor_mc_balance_std_floor = 1e-4
+        a.cost_actor_mc_balance_ratio_max = 1.0
         # n-step TD: T=1000 未折扣口径下 1-step 传播太慢 (600 updates 传不满 1000 步链,
         # 实测 cost-critic 在 s0 恒 0 → λ 不动)。n_step=100 → bootstrap 链长 10, 数百
         # updates 即可覆盖; on-policy 每迭代重采, n-step 和 + 截断 mask 均合法。

@@ -291,12 +291,34 @@ class DQCACBetaGPU(VecAgentBase):
             raise ValueError(
                 "cost_actor_query_mode must be 'online', 'target', 'crossfit', "
                 "or 'preupdate'")
-        # eta=0严格使用critic风险优势；eta=1使用真实轨迹outage标签，二者之间是
-        # 低方差但可能有偏的critic信号与高方差无偏MC信号的显式凸组合。
+        # eta=0严格使用critic风险优势。raw模式保留原始residual修正；rms_balanced
+        # 先把二元MC residual缩放到critic优势的EMA尺度，再由rho控制相对贡献。
+        # 后者是显式的bias--variance收缩估计，不再声称rho<完整修正时无偏。
         self.cost_actor_mc_correction_coef = float(
             getattr(args, 'cost_actor_mc_correction_coef', 0.0))
         if not 0.0 <= self.cost_actor_mc_correction_coef <= 1.0:
             raise ValueError("cost_actor_mc_correction_coef must be in [0,1]")
+        self.cost_actor_mc_correction_mode = str(
+            getattr(args, 'cost_actor_mc_correction_mode', 'raw')).lower()
+        if self.cost_actor_mc_correction_mode not in {'raw', 'rms_balanced'}:
+            raise ValueError(
+                "cost_actor_mc_correction_mode must be 'raw' or 'rms_balanced'")
+        self.cost_actor_mc_balance_std_floor = float(
+            getattr(args, 'cost_actor_mc_balance_std_floor', 1e-4))
+        self.cost_actor_mc_balance_ratio_max = float(
+            getattr(args, 'cost_actor_mc_balance_ratio_max', 1.0))
+        if self.cost_actor_mc_balance_std_floor <= 0.0:
+            raise ValueError("cost_actor_mc_balance_std_floor must be positive")
+        if self.cost_actor_mc_balance_ratio_max <= 0.0:
+            raise ValueError("cost_actor_mc_balance_ratio_max must be positive")
+        if (self.cost_actor_mc_correction_mode == 'rms_balanced'
+                and self.cost_actor_mc_correction_coef <= 0.0):
+            raise ValueError(
+                "rms_balanced correction requires a positive correction coefficient")
+        if (self.cost_actor_mc_correction_mode == 'rms_balanced'
+                and str(getattr(args, 'advantage_norm', 'qcpo')) != 'qcpo'):
+            raise ValueError(
+                "rms_balanced correction requires advantage_norm='qcpo'")
         self.n_step = max(1, int(getattr(args, 'n_step', 1)))
         if self.n_step > self.n:
             raise ValueError(
@@ -1003,7 +1025,16 @@ class DQCACBetaGPU(VecAgentBase):
         _wi = getattr(args, 'warmup_iters', None)
         self.warmup_iters = int(_wi) if _wi is not None else (5 if self.advantage_norm == 'qcpo' else 0)
         self.return_rms = RunningMeanStd(decay=self.norm_ema_decay)       # σ_R (reward 回报)
-        self.constraint_rms = RunningMeanStd(decay=self.norm_ema_decay)   # σ_c (cost 约束优势)
+        self.constraint_rms = RunningMeanStd(decay=self.norm_ema_decay)   # σ_c (最终风险优势)
+        # rms_balanced只在显式启用时维护两个分量尺度。默认raw不创建额外统计更新，
+        # 因而eta=0的RNG、tensor运算与checkpoint权重路径保持逐位兼容。
+        self.cost_actor_critic_adv_rms = None
+        self.cost_actor_mc_residual_rms = None
+        if self.cost_actor_mc_correction_mode == 'rms_balanced':
+            self.cost_actor_critic_adv_rms = RunningMeanStd(
+                decay=self.norm_ema_decay)
+            self.cost_actor_mc_residual_rms = RunningMeanStd(
+                decay=self.norm_ema_decay)
 
         # reward critic 始终使用 τ_i=(i+0.5)/N；self.taus 名称保留给旧代码/测试。
         self.taus = torch.tensor(
@@ -1323,7 +1354,8 @@ class DQCACBetaGPU(VecAgentBase):
               f"/interval{self.actor_update_interval}, reward_actor={self.reward_actor_mode}, "
               f"ppo_target_kl={self.ppo_target_kl:g}, "
               f"actor_cost_query={self.cost_actor_query_mode}"
-              f"/mcfix{self.cost_actor_mc_correction_coef:g}, "
+              f"/mcfix{self.cost_actor_mc_correction_coef:g}"
+              f":{self.cost_actor_mc_correction_mode}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}"
               f"/interval{self.pid_update_interval}"
               f"/target{self.pid_target_prob:g}, "
@@ -4076,19 +4108,21 @@ class DQCACBetaGPU(VecAgentBase):
             'reward_value/target_mean': float(value_targets.mean().item()),
         }
 
-    def _cost_actor_advantage_components(self, batch, psi_cdf, baseline_cdf):
+    def _cost_actor_advantage_components(
+            self, batch, psi_cdf, baseline_cdf, update_balance_stats=False):
         """
-        构造critic/trajectory-MC风险优势及其凸组合，所有输出形状均为[T*B]。
+        构造critic/trajectory-MC风险优势及其收缩组合，输出形状均为[T*B]。
 
-        critic优势是 p_hat(s,a)-V_hat(s)。完整轨迹标签 I{C_episode>=d}
-        在budget增强状态下可广播到同一轨迹所有时刻，因为 C_episode>=d
-        等价于该时刻剩余cost超过递推budget。因此 I_outage-V_hat(s)
-        是轨迹级chance constraint的无偏score-function信号。
+        公共分量:
+            A_critic = p_hat(s,a) - V_hat(s)
+            residual = I_outage - p_hat(s,a)
+            A_MC = A_critic + residual = I_outage - V_hat(s)
 
-        eta位于[0,1]，A_eta=A_critic+eta*(I_outage-p_hat)。baseline只依赖
-        状态和behavior policy下独立采样动作，不依赖实际动作，故只改变方差，
-        不改变score-function期望。eta=0/1采用独立分支，分别直接返回原critic
-        张量/MC张量，避免无效乘加改变默认浮点图，并让端点消融语义精确。
+        raw模式逐式保留历史定义A=A_critic+eta*residual；eta=1是无偏但高方差
+        的trajectory score-function信号。rms_balanced模式改用
+        A=A_critic+rho*(sigma_critic/sigma_residual)*residual。两个sigma只在
+        behavior batch首次进入actor时做一次EMA更新；后续PPO epoch复用冻结结果。
+        该收缩以少量偏差换方差，rho控制相对RMS，而不是被最终constraint RMS抵消。
         """
         # 两个概率必须与rollout的time-major transition一一对应；静默broadcast
         # 会把不同环境或不同时间的风险配错，因此在任何算术前显式验证形状。
@@ -4123,25 +4157,63 @@ class DQCACBetaGPU(VecAgentBase):
             self.n, actor_envs).reshape(expected_transitions)
 
         # 三个分量使用同一个state-only Monte-Carlo action baseline。critic与MC
-        # 的差恰为真实Bernoulli残差，因此eta可解释为残差修正强度。
+        # 的差恰为真实Bernoulli residual；所有统计都在调用方no_grad作用域内。
         critic_advantage = psi_cdf - baseline_cdf
         mc_advantage = outage_label - baseline_cdf
         mc_residual = outage_label - psi_cdf
+        critic_batch_mean = float(critic_advantage.mean().item())
+        critic_batch_var = float(
+            critic_advantage.var(unbiased=False).item())
+        residual_batch_mean = float(mc_residual.mean().item())
+        residual_batch_var = float(
+            mc_residual.var(unbiased=False).item())
+
+        # raw模式的reference只用于日志，不维护新状态。balanced模式先把当前
+        # behavior批矩合入EMA，再用同一冻结scale构造本批全部PPO epoch的risk target。
+        std_floor = self.cost_actor_mc_balance_std_floor
+        critic_scale_reference = max(critic_batch_var, 0.0) ** 0.5
+        residual_scale_reference = max(residual_batch_var, 0.0) ** 0.5
+        balance_scale = 1.0
+        if self.cost_actor_mc_correction_mode == 'rms_balanced':
+            if update_balance_stats:
+                self._ema_update(
+                    self.cost_actor_critic_adv_rms,
+                    critic_batch_mean, critic_batch_var)
+                self._ema_update(
+                    self.cost_actor_mc_residual_rms,
+                    residual_batch_mean, residual_batch_var)
+            if (not self.cost_actor_critic_adv_rms._initialized
+                    or not self.cost_actor_mc_residual_rms._initialized):
+                raise RuntimeError(
+                    "rms_balanced component scales must be initialized by "
+                    "the first behavior-batch actor query")
+            critic_scale_reference = max(
+                self.cost_actor_critic_adv_rms.std, std_floor)
+            residual_scale_reference = max(
+                self.cost_actor_mc_residual_rms.std, std_floor)
+            balance_scale = min(
+                critic_scale_reference / residual_scale_reference,
+                self.cost_actor_mc_balance_ratio_max)
+
         eta = self.cost_actor_mc_correction_coef
         if eta == 0.0:
-            # 返回原表达式产生的同一个tensor，不执行critic_advantage+0。
+            # 默认raw eta0返回原表达式的同一个tensor，不执行乘加或scale查询。
             blended_advantage = critic_advantage
             applied_correction = torch.zeros_like(mc_residual)
-        elif eta == 1.0:
-            # 端点直接采用I-V，不先做两次相消，减少不必要的舍入误差。
+        elif self.cost_actor_mc_correction_mode == 'raw' and eta == 1.0:
+            # raw端点直接采用I-V，避免先加后减p_hat产生无效舍入误差。
             blended_advantage = mc_advantage
             applied_correction = mc_residual
-        else:
+        elif self.cost_actor_mc_correction_mode == 'raw':
             applied_correction = eta * mc_residual
+            blended_advantage = critic_advantage + applied_correction
+        else:
+            # balance_scale是从behavior batch冻结的Python标量，不参与autograd；
+            # rho=1令修正项RMS约等于critic，而不是用二元项完全替换critic。
+            applied_correction = eta * balance_scale * mc_residual
             blended_advantage = critic_advantage + applied_correction
 
         # 中心化cosine等于Pearson相关系数；常数向量时定义为0，防止W&B出现NaN。
-        # 该诊断和下列各分量都在调用方no_grad作用域中，不参与actor反向传播。
         critic_centered = critic_advantage - critic_advantage.mean()
         mc_centered = mc_advantage - mc_advantage.mean()
         correlation_denominator = torch.sqrt(
@@ -4153,6 +4225,11 @@ class DQCACBetaGPU(VecAgentBase):
             torch.zeros(
                 (), dtype=psi_cdf.dtype, device=psi_cdf.device))
 
+        # 直接报告实际修正/critic的batch RMS比，检验rho是否真正可辨识。
+        correction_std = applied_correction.std(unbiased=False)
+        critic_std_safe = critic_advantage.std(
+            unbiased=False).clamp_min(std_floor)
+        correction_to_critic_ratio = correction_std / critic_std_safe
         return {
             'blended': blended_advantage,
             'critic': critic_advantage,
@@ -4161,6 +4238,12 @@ class DQCACBetaGPU(VecAgentBase):
             'correction': applied_correction,
             'label': outage_label,
             'critic_mc_correlation': critic_mc_correlation,
+            'balance_scale': psi_cdf.new_tensor(balance_scale),
+            'critic_scale_reference': psi_cdf.new_tensor(
+                critic_scale_reference),
+            'residual_scale_reference': psi_cdf.new_tensor(
+                residual_scale_reference),
+            'correction_to_critic_std_ratio': correction_to_critic_ratio,
         }
 
     # ============================================================ 循环 Actor + reward-V 联合更新 ============================================================
@@ -4263,8 +4346,17 @@ class DQCACBetaGPU(VecAgentBase):
                             label_folds=query_folds))
                 baseline_cdf = torch.stack(baseline_cdfs, dim=0).mean(dim=0)
                 risk_components = self._cost_actor_advantage_components(
-                    batch, psi_cdf, baseline_cdf)
+                    batch, psi_cdf, baseline_cdf,
+                    update_balance_stats=(
+                        self.cost_actor_mc_correction_mode == 'rms_balanced'))
                 raw_adv_c = risk_components['blended']
+                if self.cost_actor_mc_correction_mode == 'rms_balanced':
+                    # 与组件EMA相同，每个behavior batch只在首个PPO epoch更新一次；
+                    # 当前raw_adv正是随后全部epoch复用的风险监督。
+                    self._ema_update(
+                        self.constraint_rms,
+                        float(raw_adv_c.mean().item()),
+                        float(raw_adv_c.var(unbiased=False).item()))
 
                 if self.advantage_norm == 'qcpo':
                     normalized_adv_c = raw_adv_c / self.constraint_rms.std
@@ -4288,6 +4380,15 @@ class DQCACBetaGPU(VecAgentBase):
                     risk_components['label'].detach())
                 batch['_risk_critic_mc_correlation'] = (
                     risk_components['critic_mc_correlation'].detach())
+                batch['_risk_mc_balance_scale'] = (
+                    risk_components['balance_scale'].detach())
+                batch['_risk_mc_critic_scale_reference'] = (
+                    risk_components['critic_scale_reference'].detach())
+                batch['_risk_mc_residual_scale_reference'] = (
+                    risk_components['residual_scale_reference'].detach())
+                batch['_risk_mc_correction_to_critic_std_ratio'] = (
+                    risk_components[
+                        'correction_to_critic_std_ratio'].detach())
             else:
                 risk_weight_flat = batch['_risk_weight']
                 raw_adv_c = batch['_risk_advantage_raw']
@@ -4467,6 +4568,14 @@ class DQCACBetaGPU(VecAgentBase):
                 batch['_risk_mc_outage_label'].mean().item()),
             'advantage/risk_mc_correction_coef': (
                 self.cost_actor_mc_correction_coef),
+            'advantage/risk_mc_balance_scale': float(
+                batch['_risk_mc_balance_scale'].item()),
+            'advantage/risk_mc_critic_scale_reference': float(
+                batch['_risk_mc_critic_scale_reference'].item()),
+            'advantage/risk_mc_residual_scale_reference': float(
+                batch['_risk_mc_residual_scale_reference'].item()),
+            'advantage/risk_mc_correction_to_critic_std_ratio': float(
+                batch['_risk_mc_correction_to_critic_std_ratio'].item()),
             'advantage/risk_query_target_online_abs_mean': float(
                 batch['_risk_query_target_online_abs_mean'].item()),
             'constraint/psi_c_mean': float(psi_cdf.mean().item()),
@@ -4513,8 +4622,17 @@ class DQCACBetaGPU(VecAgentBase):
                     need_reward=self.reward_actor_mode == 'distributional',
                     cost_query_folds=query_folds)
                 risk_components = self._cost_actor_advantage_components(
-                    batch, psi_cdf, v_c)
+                    batch, psi_cdf, v_c,
+                    update_balance_stats=(
+                        self.cost_actor_mc_correction_mode == 'rms_balanced'))
                 raw_adv_c = risk_components['blended']
+                if self.cost_actor_mc_correction_mode == 'rms_balanced':
+                    # MLP与recurrent共享同一behavior-batch尺度协议，不能让后续
+                    # PPO epoch或critic更新再次推进component/constraint EMA。
+                    self._ema_update(
+                        self.constraint_rms,
+                        float(raw_adv_c.mean().item()),
+                        float(raw_adv_c.var(unbiased=False).item()))
                 if self.advantage_norm == 'qcpo':
                     a_c = raw_adv_c / self.constraint_rms.std          # EMA σ_c 归一化
                 else:
@@ -4536,6 +4654,15 @@ class DQCACBetaGPU(VecAgentBase):
                     risk_components['label'].detach())
                 batch['_risk_critic_mc_correlation'] = (
                     risk_components['critic_mc_correlation'].detach())
+                batch['_risk_mc_balance_scale'] = (
+                    risk_components['balance_scale'].detach())
+                batch['_risk_mc_critic_scale_reference'] = (
+                    risk_components['critic_scale_reference'].detach())
+                batch['_risk_mc_residual_scale_reference'] = (
+                    risk_components['residual_scale_reference'].detach())
+                batch['_risk_mc_correction_to_critic_std_ratio'] = (
+                    risk_components[
+                        'correction_to_critic_std_ratio'].detach())
             else:
                 risk_weight = batch['_risk_weight']
                 raw_adv_c = batch['_risk_advantage_raw']
@@ -4636,6 +4763,14 @@ class DQCACBetaGPU(VecAgentBase):
                 batch['_risk_mc_outage_label'].mean().item()),
             'advantage/risk_mc_correction_coef': (
                 self.cost_actor_mc_correction_coef),
+            'advantage/risk_mc_balance_scale': float(
+                batch['_risk_mc_balance_scale'].item()),
+            'advantage/risk_mc_critic_scale_reference': float(
+                batch['_risk_mc_critic_scale_reference'].item()),
+            'advantage/risk_mc_residual_scale_reference': float(
+                batch['_risk_mc_residual_scale_reference'].item()),
+            'advantage/risk_mc_correction_to_critic_std_ratio': float(
+                batch['_risk_mc_correction_to_critic_std_ratio'].item()),
             'advantage/risk_query_target_online_abs_mean': float(
                 batch['_risk_query_target_online_abs_mean'].item()),
             'constraint/psi_c_mean': float(psi_cdf.mean().item()),
@@ -5066,6 +5201,10 @@ class DQCACBetaGPU(VecAgentBase):
         z = batch['disc_return'].detach()                     # [B] reward 回报
         self._ema_update(self.return_rms,
                          float(z.mean().item()), float(z.var(unbiased=False).item()))
+        # balanced模式必须用actor真正查询到的online/preupdate概率更新分量RMS。
+        # 因此这里只刷新reward；constraint及两个分量在首个actor epoch统一更新一次。
+        if self.cost_actor_mc_correction_mode == 'rms_balanced':
+            return
         with torch.no_grad():
             s, b = batch['states'], batch['budgets']
             a = batch['actions']
@@ -5237,6 +5376,12 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_actor_mc_correction_coef > 0.0),
             'debug/cost_actor_mc_correction_coef': (
                 self.cost_actor_mc_correction_coef),
+            'debug/cost_actor_mc_correction_rms_balanced': float(
+                self.cost_actor_mc_correction_mode == 'rms_balanced'),
+            'debug/cost_actor_mc_balance_std_floor': (
+                self.cost_actor_mc_balance_std_floor),
+            'debug/cost_actor_mc_balance_ratio_max': (
+                self.cost_actor_mc_balance_ratio_max),
             'debug/cost_cdf_is_sigmoid': float(
                 self.cost_cdf_mode == 'sigmoid'),
             'debug/cost_cdf_temperature': self.cost_cdf_temperature,
@@ -5344,6 +5489,12 @@ class DQCACBetaGPU(VecAgentBase):
         if self.advantage_norm == 'qcpo':
             extra['norm/return_sigma_ema'] = float(self.return_rms.std)
             extra['norm/constraint_sigma_ema'] = float(self.constraint_rms.std)
+            if self.cost_actor_mc_correction_mode == 'rms_balanced':
+                # component RMS只在实际actor事件推进；与constraint RMS的更新次数一致。
+                extra['norm/risk_critic_sigma_ema'] = float(
+                    self.cost_actor_critic_adv_rms.std)
+                extra['norm/risk_mc_residual_sigma_ema'] = float(
+                    self.cost_actor_mc_residual_rms.std)
         if self.normalize_observation:
             # recurrent actor 的 RMS 覆盖 [state, previous_cost]；MLP 使用共享 raw-state RMS。
             obs_rms = self.actor.obs_rms if self.recurrent_policy else self.obs_normalizer
@@ -5629,6 +5780,12 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_actor_query_mode': self.cost_actor_query_mode,
             'cost_actor_mc_correction_coef': (
                 self.cost_actor_mc_correction_coef),
+            'cost_actor_mc_correction_mode': (
+                self.cost_actor_mc_correction_mode),
+            'cost_actor_mc_balance_std_floor': (
+                self.cost_actor_mc_balance_std_floor),
+            'cost_actor_mc_balance_ratio_max': (
+                self.cost_actor_mc_balance_ratio_max),
             'risk_query_target_online_abs_mean': (
                 self.last_risk_query_target_online_abs_mean),
             'cost_s0_aux_coef': self.cost_s0_aux_coef,

@@ -2060,3 +2060,11 @@ eta1在工程上完全正常，但算法表现明确失败。1M训练末5批rewa
 当前eta公式还存在可辨识性问题。constraint RMS跟踪最终混合优势是防止数值爆炸所必需的，但当MC residual主导时，`eta*residual / sigma(eta*residual)`近似与eta无关。把eta改成0.5或0.25不能按比例减小有效风险梯度，也不能明显恢复critic方向；eta=.25时MC标准差仍约为critic的16倍。因此不把这两个值直接当作下一轮超参数扫描。
 
 更合理的收缩估计要先把两个分量配平。可用上一批或EMA统计量构造`Acritic + rho*(sigma_critic/sigma_residual)*(I-p_hat)`，随后总RMS只负责全局数值尺度；这样rho=0恢复critic，rho=1表示“残差与critic具有相当RMS”，而不是完全替换。它有意用少量偏差换取显著方差下降，应作为bias--variance消融诚实报告，不能再声称rho小于完整修正时无偏。并列路线是增加每次更新的独立trajectory数，但必须同时处理固定1M预算下更新事件减半的问题。两条路线应分别验证，最终仍以真实outage落在0.20附近后mean reward最大为唯一性能准则。
+
+### 13.128 配平后rho才是可辨识的偏差--方差旋钮（2026-07-17）
+
+新实现保留raw公式作为严格兼容模式，另加默认关闭的RMS-balanced收缩。它分别跟踪`p_hat-V_hat`和`I-p_hat`的behavior-batch EMA标准差，并构造`Acritic+rho*(sigma_critic/sigma_residual)*(I-p_hat)`。ratio上限1保证二元残差不会因早期分母很小被额外放大，`1e-4`下限处理critic几乎常数的首批。最终blended advantage仍做一次constraint RMS归一化，但由于两个分量已经先配平，rho改变的是方向和相对贡献，不再与总尺度一起被约掉。
+
+统计时序与PPO因果性同样重要。两个component EMA只在某个behavior batch的首个actor epoch推进一次，online模式使用actor实际看到的当前critic；随后的epoch固定risk target和old log-probability。若在每个epoch更新scale，当前策略和更新后critic就会偷偷改变同一批监督，rho的解释再次失效。actor cadence大于1时应在合并后的独立trajectory集合上更新，而不是分别标准化后拼接。
+
+解析测试证明rho=1与.25得到的实际修正/critic RMS比就是1与.25，默认raw eta0的176个checkpoint tensor leaves补丁前后最大差为0。循环与MLP短测也都完成训练、评估和checkpoint保存，ratio误差远低于1e-3。下一条正式实验只在C-H8 seed1打开rho1 balanced；评价仍是outage接近0.20后最大化reward，而不是因为新增机制降低了outage就判成功。
