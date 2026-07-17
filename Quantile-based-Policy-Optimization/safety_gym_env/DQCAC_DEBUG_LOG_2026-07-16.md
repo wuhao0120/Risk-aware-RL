@@ -1400,3 +1400,13 @@
 - 因此不为当前主线实现或运行“独立reward/cost optimizer”1M实验。它对旧distributional模式可能有意义，但没有解释当前recurrent GAE/PPO性能的作用链。保留这一分歧路线作为旧模式消融，不把审计前的假设升级成算法结论。
 - 重新审计QCPO_refs后，最直接而尚未移植的稳定组件是：共享policy/reward/cost history backbone、非负c_dist=exp(linear)、cost quantile loss之外的mean-cost MSE锚定（系数0.5），以及Weibull tail loss。下一项先单变量加入默认关闭的mean anchor；它直接针对cost-LSTM“有少量AUC信号但均值/概率尺度失准”，比拆optimizer或事后温度校准更有作用链证据。
 - 用现有140条充分统计计算的同样本乐观单调仿射校准上界显示，B20/C20 cost-LSTM即使事后最优缩放，Brier Skill也只有约+0.62%；raw约+0.15%。所以当前问题不只是一个全局temperature/bias，不能靠Platt式校准替代表示与训练目标改进。
+
+### E113：QCPO_refs mean-cost anchor实现与冻结600k预注册（2026-07-17）
+
+- QCPO_refs源码的cost目标已逐式核对：`loss += 0.5 × [0.5(mean(c_dist)-c_return)^2] + quantile_huber_mean + weibull_tail`。当前DQCAC的QR对`N_target`求和而reference对pairwise全部取mean，因此不能直接把0.5加到现有loss；新`cost_mean_anchor_coef=.5`使用有效scale `coef×N_target×quantile_target_scale`，在QR32/legacy_sum下为16，在N64/reference_mean/ref32下仍为16，保持mean/QR相对权重而不让N成为隐含学习率。
+- 新参数默认0，接入recurrent TBPTT、整批、transition chunk与crossfit四条cost路径；mean目标使用与QR相同的risk-discount sample weight，query-mixture时使用相同CDF quadrature，IQN uniform tau仍用样本平均。日志新增enabled/configured/effective scale、原始/缩放mean loss及rollout内first/mean/min/last，同时把mean项纳入`cost_objective_loss`。没有混入exp非负输出、Weibull或共享backbone。
+- 工程回归用同一P-M3 seed1 policy、rollout seed305、B2×2批×3次critic update。改动前后两个持久化job均exit 0；60个checkpoint tensor leaves逐位完全相同，tensor差异0，全部eval字段与共享summary字段差异0，新增summary只有coef/scale。enabled smoke同配置设0.5后scale严格为16，40个cost/history tensor发生非零变化，所有checkpoint tensor与eval数值有限。解析full/chunk检查loss差`5.12e-9`、gradient最大差0。
+- 正式C-H4M复用C-H1W的成熟冻结policy、rollout seed101、B20×30×T1000=600k、C20、MC、risk-discount=.995、QR32、cost-LSTM、chunk2500及140条独立评估；唯一算法变量是`cost_mean_anchor_coef=0.5`。30批behavior/truth必须与raw和C-H1W的16个控制字段逐值exact，独立reward/outage也必须exact。
+- 主门不移动：末5批prequential CDF error或Brier相对raw至少改善20%/10%之一，另一项不得恶化10%，聚合mean bias绝对值≤1；独立hard或smooth Brier相对raw至少改善10%且对应AUC提高≥.03，或Brier改善20%且AUC下降≤.02，同时mean-cost error≤.90、crossing≤.10。机制门相对C-H1W要求Brier改善≥20%、保留至少一半AUC增益即hard AUC≥.55495、mean error≤.90且pre/独立方向一致。
+- 只有主门通过才做fresh520并考虑live；若只改善mean却丢失AUC，说明anchor把critic收缩为总体均值，不能驱动action选择；若AUC保留但Brier/mean仍不过门，说明QCPO_refs的稳定性还依赖非负输出、Weibull或共享多任务表示。失败后不立即扫描anchor系数，下一候选分别是softplus/exp非负输出、Weibull tail或小型共享多任务backbone，保持单变量。
+- 既有同配置无anchor纯训练281.4秒；新项只做quantile mean和标量MSE，预计纯训练4.5--5.5分钟、140评估约1分钟，总墙钟6--7分钟。正式任务只用`launch_background.sh`持久化，W&B online名称/group/tags只含公开算法语义，路径与敏感配置继续过滤。

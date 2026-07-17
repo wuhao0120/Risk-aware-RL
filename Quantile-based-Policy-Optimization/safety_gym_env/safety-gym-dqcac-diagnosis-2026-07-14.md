@@ -1779,3 +1779,11 @@ B40暴露了一个工程口径错误：请求140条时，向量评估器实际�
 QCPO_refs真正多出的cost稳定项更值得验证。它在共享history feature上同时优化policy、reward-V、cost quantile、cost mean MSE和Weibull tail，并用exp保证cost输出非负。DQCAC cost-LSTM当前只有独立大encoder与QR-MC监督；它能得到约0.59 AUC，却伴随严重Brier、mean与crossing错误。现有充分统计还表明，即使在同一140条上做乐观单调仿射校准，Brier Skill上界也仅约0.6%，所以全局概率缩放不是解。
 
 下一实验先只借用QCPO_refs的mean-cost MSE锚定，默认关闭并保持旧checkpoint/默认训练逐tensor等价。它不会一次混入exp、Weibull或共享backbone；若能保留AUC并改善mean/Brier，才说明复合cost objective值得继续。若失败，再分别考虑非负输出、tail loss或小型受多任务约束的共享表示。
+
+### 13.97 mean-cost anchor按QCPO_refs相对尺度实现并预注册（2026-07-17）
+
+QCPO_refs不是只做quantile regression。它额外用`0.5 × 0.5(mean(c_dist)-c_return)^2`锚定cost分布均值，再叠加quantile与Weibull目标。DQCAC当前QR在target quantile维求和，数值尺度是reference平均loss的N倍；所以直接添加系数0.5会弱N倍。新实现把配置系数乘`N_target×target_scale`，QR32默认得到16，N64配reference-mean也维持16。这是在保持相对目标权重，不是任意把MSE放大。
+
+新参数默认关闭。默认0的改动前后持久化回归中，60个checkpoint tensor、所有评估字段和共享summary逐项完全一致；enabled smoke得到预期scale16，cost head/history encoder发生有限非零更新。mean loss在recurrent、full、chunk和crossfit路径都使用与QR相同的transition权重；解析full/chunk梯度最大差为0。因而后续差异可以归因于mean anchor，而不是RNG、网络初始化、chunk边界或日志副作用。
+
+正式冻结实验只在C-H1W的B20/C20、600k、seed101配置上打开`cost_mean_anchor_coef=.5`。它必须同时保留history的AUC排序信号并修复Brier/mean/crossing；只把总体mean拉准、却让AUC回到0.5附近不算成功。通过后才做520条和live闭环；失败则不扫系数，而将非负cost输出、Weibull tail和共享多任务history作为彼此独立的下一条消融。

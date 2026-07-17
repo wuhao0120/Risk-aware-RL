@@ -327,10 +327,16 @@ class DQCACBetaGPU(VecAgentBase):
         # objective 总尺度，避免把“重视 s0”混淆成“提高 critic learning rate”。
         self.cost_s0_aux_coef = float(
             getattr(args, 'cost_s0_aux_coef', 0.0))
+        # QCPO_refs 同时拟合 cost distribution 的均值与 quantiles。这里的系数
+        # 与 reference 的 cost_value_loss_coeff 同义；默认0保证历史路径逐式不变。
+        self.cost_mean_anchor_coef = float(
+            getattr(args, 'cost_mean_anchor_coef', 0.0))
         self.cost_s0_replay_batches = int(
             getattr(args, 'cost_s0_replay_batches', 4))
         if self.cost_s0_aux_coef < 0.0:
             raise ValueError("cost_s0_aux_coef must be non-negative")
+        if self.cost_mean_anchor_coef < 0.0:
+            raise ValueError("cost_mean_anchor_coef must be non-negative")
         if self.cost_s0_replay_batches <= 0:
             raise ValueError("cost_s0_replay_batches must be positive")
         # step feature 默认跟随 episodic: 有限期界下剩余 cost 分布依赖剩余步数 (已验证配方)
@@ -859,6 +865,7 @@ class DQCACBetaGPU(VecAgentBase):
               f"/floor{self.cost_critic_weight_floor:g}, "
               f"s0_aux={self.cost_s0_aux_coef:g}"
               f"/replay{self.cost_s0_replay_batches}, "
+              f"cost_mean_anchor={self.cost_mean_anchor_coef:g}, "
               f"cost_cdf={self.cost_cdf_estimator}/{self.cost_cdf_mode}"
               f"/T{self.cost_cdf_temperature:g}"
               f"/lr{self.cost_direct_cdf_lr:g}"
@@ -1029,6 +1036,10 @@ class DQCACBetaGPU(VecAgentBase):
                     'reward_grad_norm': float(critic_info['critic/reward_grad_norm']),
                     'grad_clipped': float(critic_info['critic/grad_clip_fraction']),
                     'cost_qr_loss': float(critic_info['critic/cost_qr_loss']),
+                    'cost_mean_anchor_loss': float(
+                        critic_info['critic/cost_mean_anchor_loss']),
+                    'cost_objective_loss': float(
+                        critic_info['critic/cost_objective_loss']),
                 })
                 if actor_epoch_allowed and not actor_before_critic:
                     apply_actor_epoch()
@@ -1047,7 +1058,8 @@ class DQCACBetaGPU(VecAgentBase):
                     for key in ('cost_grad_norm', 'joint_grad_norm',
                                 'reward_grad_norm', 'cost_head_grad_norm',
                                 'cost_history_grad_norm', 'grad_clipped',
-                                'cost_qr_loss')
+                                'cost_qr_loss', 'cost_mean_anchor_loss',
+                                'cost_objective_loss')
                 }
                 cost_grad = diagnostic_sequences['cost_grad_norm']
                 cost_head_grad = diagnostic_sequences['cost_head_grad_norm']
@@ -1055,6 +1067,8 @@ class DQCACBetaGPU(VecAgentBase):
                 joint_grad = diagnostic_sequences['joint_grad_norm']
                 reward_grad = diagnostic_sequences['reward_grad_norm']
                 cost_loss = diagnostic_sequences['cost_qr_loss']
+                cost_mean_loss = diagnostic_sequences['cost_mean_anchor_loss']
+                cost_objective_loss = diagnostic_sequences['cost_objective_loss']
                 critic_info.update({
                     'critic/update_count': float(len(critic_update_diagnostics)),
                     'critic/update_grad_clip_fraction': float(
@@ -1086,6 +1100,22 @@ class DQCACBetaGPU(VecAgentBase):
                     'critic/cost_qr_loss_mean': float(cost_loss.mean()),
                     'critic/cost_qr_loss_min': float(cost_loss.min()),
                     'critic/cost_qr_loss_last': float(cost_loss[-1]),
+                    'critic/cost_mean_anchor_loss_first': float(
+                        cost_mean_loss[0]),
+                    'critic/cost_mean_anchor_loss_mean': float(
+                        cost_mean_loss.mean()),
+                    'critic/cost_mean_anchor_loss_min': float(
+                        cost_mean_loss.min()),
+                    'critic/cost_mean_anchor_loss_last': float(
+                        cost_mean_loss[-1]),
+                    'critic/cost_objective_loss_first': float(
+                        cost_objective_loss[0]),
+                    'critic/cost_objective_loss_mean': float(
+                        cost_objective_loss.mean()),
+                    'critic/cost_objective_loss_min': float(
+                        cost_objective_loss.min()),
+                    'critic/cost_objective_loss_last': float(
+                        cost_objective_loss[-1]),
                 })
 
             if self.cost_actor_query_mode == 'preupdate':
@@ -1730,6 +1760,39 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/cost_s0_target_mean': float(scalar_targets.mean().item()),
         }
 
+    def _cost_mean_anchor_scale(self, num_target_samples):
+        '''
+        把 QCPO_refs 的 mean-cost 系数换算到本实现 QR 的 target-sum 尺度。
+
+        reference 对 pairwise QR 的全部维度取 mean；本实现默认在 N_target 维
+        求和。故有效系数是 configured_coef*N_target*target_scale。N=32、
+        legacy_sum、coef=.5 时得到16，使 mean/QR 的相对权重与 reference 相同。
+        '''
+        return (
+            self.cost_mean_anchor_coef
+            * float(num_target_samples)
+            * self._quantile_target_scale(num_target_samples))
+
+    def _cost_mean_anchor_loss(
+            self, prediction, targets, sample_weights=None):
+        '''
+        返回 QCPO_refs 式 0.5*(predicted_mean-target_mean)^2。
+
+        QR uniform grid 逐行普通平均；query-mixture 使用相同 quadrature 权重，
+        IQN 的训练 taus 来自 uniform sampling，因此普通样本平均仍是无偏积分。
+        可选 transition 权重与 QR 的 risk-discount 测度完全相同。
+        '''
+        predicted_mean = self._cost_quantile_moments(prediction)[0]
+        target_mean = self._cost_quantile_moments(targets)[0]
+        per_transition = 0.5 * (predicted_mean - target_mean).pow(2)
+        if sample_weights is None:
+            return per_transition.mean()
+        if sample_weights.numel() != prediction.shape[0]:
+            raise ValueError(
+                "sample_weights length must match mean-anchor batch size")
+        return (
+            per_transition * sample_weights.reshape(-1)).mean()
+
     # ============================================================ Critic 更新 (双 QR-TD) ============================================================
     def _backward_recurrent_cost_loss(
             self, batch, cost_target, cost_sample_weights=None):
@@ -1760,6 +1823,9 @@ class DQCACBetaGPU(VecAgentBase):
             self.num_envs, self.device)
         total_size = float(self.n * self.num_envs)
         loss_value = 0.0
+        mean_loss_value = 0.0
+        mean_anchor_scale = self._cost_mean_anchor_scale(
+            cost_target.shape[-1])
 
         for begin in range(0, self.n, self.recurrent_seq_len):
             finish = min(begin + self.recurrent_seq_len, self.n)
@@ -1788,14 +1854,24 @@ class DQCACBetaGPU(VecAgentBase):
             chunk_loss = self._cost_quantile_huber_loss(
                 prediction, chunk_targets, chunk_sample_weights)
             chunk_weight = float((finish - begin) * self.num_envs) / total_size
-            (chunk_weight * chunk_loss).backward()
+            if self.cost_mean_anchor_coef <= 0.0:
+                # 默认关闭分支保留历史 backward 表达式和浮点运算顺序。
+                (chunk_weight * chunk_loss).backward()
+            else:
+                chunk_mean_loss = self._cost_mean_anchor_loss(
+                    prediction, chunk_targets, chunk_sample_weights)
+                (chunk_weight * (
+                    chunk_loss
+                    + mean_anchor_scale * chunk_mean_loss)).backward()
+                mean_loss_value += (
+                    chunk_weight * float(chunk_mean_loss.item()))
             loss_value += chunk_weight * float(chunk_loss.item())
 
             # 先保存数值再释放当前 chunk 图；下个 chunk 继承历史但不跨边界反传。
             hidden = next_hidden.detach()
             cell = next_cell.detach()
 
-        return loss_value
+        return loss_value, mean_loss_value
 
     def update_critic(self, batch):
         """
@@ -1858,6 +1934,9 @@ class DQCACBetaGPU(VecAgentBase):
         crossfit_fold1_loss_value = 0.0
         crossfit_fold0_fraction = 0.0
         crossfit_fold1_fraction = 0.0
+        cost_mean_loss_value = 0.0
+        cost_mean_anchor_scale = self._cost_mean_anchor_scale(
+            cost_target.shape[-1])
 
         # 辅助目标只改变 cost 监督在 transition 与 recent-s0 间的质量分配。
         # coef=0 时 s0_aux_loss=None，下面保留历史 backward 表达式逐位不变。
@@ -1890,8 +1969,9 @@ class DQCACBetaGPU(VecAgentBase):
                     (weight * reward_loss_chunk).backward()
                     reward_loss_value += (
                         weight * float(reward_loss_chunk.item()))
-            cost_loss_value = self._backward_recurrent_cost_loss(
-                batch, cost_target, cost_sample_weights)
+            cost_loss_value, cost_mean_loss_value = (
+                self._backward_recurrent_cost_loss(
+                    batch, cost_target, cost_sample_weights))
         elif not use_chunks:
             # 默认历史路径：构造完整 [T*B,N,N] pairwise error，一次 backward。
             reward_pred = self.reward_critic(reward_state_inputs, actions)
@@ -1924,6 +2004,19 @@ class DQCACBetaGPU(VecAgentBase):
                 cost_loss = (
                     crossfit_fold0_fraction * fold0_loss
                     + crossfit_fold1_fraction * fold1_loss)
+                cost_mean_loss = None
+                if self.cost_mean_anchor_coef > 0.0:
+                    fold0_mean_loss = self._cost_mean_anchor_loss(
+                        fold0_pred, cost_target[fold0_mask],
+                        None if cost_sample_weights is None
+                        else cost_sample_weights[fold0_mask])
+                    fold1_mean_loss = self._cost_mean_anchor_loss(
+                        fold1_pred, cost_target[fold1_mask],
+                        None if cost_sample_weights is None
+                        else cost_sample_weights[fold1_mask])
+                    cost_mean_loss = (
+                        crossfit_fold0_fraction * fold0_mean_loss
+                        + crossfit_fold1_fraction * fold1_mean_loss)
                 crossfit_fold0_loss_value = float(fold0_loss.item())
                 crossfit_fold1_loss_value = float(fold1_loss.item())
             else:
@@ -1933,14 +2026,28 @@ class DQCACBetaGPU(VecAgentBase):
                 cost_loss = self._cost_quantile_huber_loss(
                     cost_pred, cost_target, cost_sample_weights,
                     prediction_taus=cost_prediction_taus)
-            if s0_aux_loss is None:
-                # 默认关闭路径保持历史 autograd 图和浮点运算顺序。
+                cost_mean_loss = (
+                    self._cost_mean_anchor_loss(
+                        cost_pred, cost_target, cost_sample_weights)
+                    if self.cost_mean_anchor_coef > 0.0 else None)
+            if s0_aux_loss is None and cost_mean_loss is None:
+                # 两个可选目标都关闭时保持历史图和浮点运算顺序。
                 (reward_loss + cost_loss).backward()
-            else:
+            elif s0_aux_loss is None:
+                (reward_loss + cost_loss
+                 + cost_mean_anchor_scale * cost_mean_loss).backward()
+            elif cost_mean_loss is None:
                 (reward_loss + cost_base_scale * cost_loss).backward()
+                (cost_aux_scale * s0_aux_loss).backward()
+            else:
+                (reward_loss + cost_base_scale * (
+                    cost_loss
+                    + cost_mean_anchor_scale * cost_mean_loss)).backward()
                 (cost_aux_scale * s0_aux_loss).backward()
             reward_loss_value = float(reward_loss.item())
             cost_loss_value = float(cost_loss.item())
+            cost_mean_loss_value = float(
+                0.0 if cost_mean_loss is None else cost_mean_loss.item())
         else:
             # 顺序分块避免额外 permutation 张量并保持可复现；每块图在 backward 后释放。
             reward_loss_value, cost_loss_value = 0.0, 0.0
@@ -1962,15 +2069,36 @@ class DQCACBetaGPU(VecAgentBase):
                     None if cost_sample_weights is None
                     else cost_sample_weights[begin:finish],
                     prediction_taus=chunk_prediction_taus)
-                if s0_aux_loss is None:
-                    # 默认关闭路径保持原来的 chunk 聚合与 backward 顺序。
+                cost_mean_loss_chunk = (
+                    self._cost_mean_anchor_loss(
+                        cost_pred, cost_target[begin:finish],
+                        None if cost_sample_weights is None
+                        else cost_sample_weights[begin:finish])
+                    if self.cost_mean_anchor_coef > 0.0 else None)
+                if s0_aux_loss is None and cost_mean_loss_chunk is None:
+                    # 两个可选目标都关闭时保持原 chunk backward 顺序。
                     (weight * (reward_loss_chunk + cost_loss_chunk)).backward()
-                else:
+                elif s0_aux_loss is None:
+                    (weight * (
+                        reward_loss_chunk + cost_loss_chunk
+                        + cost_mean_anchor_scale
+                        * cost_mean_loss_chunk)).backward()
+                elif cost_mean_loss_chunk is None:
                     (weight * (
                         reward_loss_chunk
                         + cost_base_scale * cost_loss_chunk)).backward()
+                else:
+                    (weight * (
+                        reward_loss_chunk
+                        + cost_base_scale * (
+                            cost_loss_chunk
+                            + cost_mean_anchor_scale
+                            * cost_mean_loss_chunk))).backward()
                 reward_loss_value += weight * float(reward_loss_chunk.item())
                 cost_loss_value += weight * float(cost_loss_chunk.item())
+                if cost_mean_loss_chunk is not None:
+                    cost_mean_loss_value += (
+                        weight * float(cost_mean_loss_chunk.item()))
             if s0_aux_loss is not None:
                 # recent-s0 图很小，只在全部 transition chunk 释放后反传一次。
                 (cost_aux_scale * s0_aux_loss).backward()
@@ -2016,6 +2144,13 @@ class DQCACBetaGPU(VecAgentBase):
         critic_info = {
             'critic/reward_qr_loss': reward_loss_value,
             'critic/cost_qr_loss': cost_loss_value,
+            'critic/cost_mean_anchor_enabled': float(
+                self.cost_mean_anchor_coef > 0.0),
+            'critic/cost_mean_anchor_coef': self.cost_mean_anchor_coef,
+            'critic/cost_mean_anchor_scale': float(cost_mean_anchor_scale),
+            'critic/cost_mean_anchor_loss': cost_mean_loss_value,
+            'critic/cost_mean_anchor_scaled_loss': float(
+                cost_mean_anchor_scale * cost_mean_loss_value),
             'critic/chunked_update': float(use_chunks),
             'critic/cost_recurrent_tbptt': float(recurrent_cost),
             'critic/cost_time_weighted': float(
@@ -2065,7 +2200,9 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/cost_s0_base_scale': float(cost_base_scale),
             'critic/cost_s0_aux_scale': float(cost_aux_scale),
             'critic/cost_objective_loss': float(
-                cost_base_scale * cost_loss_value
+                cost_base_scale * (
+                    cost_loss_value
+                    + cost_mean_anchor_scale * cost_mean_loss_value)
                 + s0_aux_info['critic/cost_s0_aux_scaled_loss']),
         }
         if self.cost_actor_query_mode == 'crossfit':
@@ -3675,6 +3812,9 @@ class DQCACBetaGPU(VecAgentBase):
                 self.last_risk_query_target_online_abs_mean),
             'cost_s0_aux_coef': self.cost_s0_aux_coef,
             'cost_s0_replay_batches': self.cost_s0_replay_batches,
+            'cost_mean_anchor_coef': self.cost_mean_anchor_coef,
+            'cost_mean_anchor_scale': self._cost_mean_anchor_scale(
+                self.num_quantiles),
             's0_holdout_pre': dict(self.last_s0_holdout_pre),
             's0_holdout_post': dict(self.last_s0_holdout_post),
             'cost_cdf_mode': self.cost_cdf_mode,
