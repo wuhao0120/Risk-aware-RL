@@ -1103,3 +1103,15 @@
 - 裁决：EMA005保留为“成功减少更新方差、但未改善到足以替代QR”的正机制/负性能消融；不做fresh520、不进live 1M、不扫tau。replay或减少direct update仍作为有分歧的可选路线记录，但两版direct均未在独立proper score上接近25%收益，优先级降到QR主路线和actor更新频率之后。
 - 这再次回答训练长度问题：300k时EMA仍约0.41，确实太短；完整600k后才能看到它稳定到0.33附近。但“更长才看清”不等于“更长会成功”。当独立评估、proper score和末段趋势不一致时，继续延长会放大选择性报告风险。
 - 正式history/profile在`_runs/wandb_export/dqc_frozen_direct_cdf_ema005_600k_2026-07-17/`与`_runs/profiles/dqc_frozen_direct_cdf_ema005_600k_2026-07-17/`；`overview.png`为`2880×3440`、约1.2MB且PIL解码通过，checkpoint约12MB，均在`/vepfs`。
+
+
+### E82：C-Q3C/C-Q4C N64与局部quantile的600k长度审计预注册（2026-07-17）
+
+- 重新开放原因不是移动旧100k门，而是E77明确把N64/local旧结论降级为“无早期收益”；direct两条600k未能替代QR后，QR仍是actor主CDF表示。现在用同一成熟固定策略补足600k，只回答“更多独立轨迹后表示是否出现稳定泛化收益”，不直接进入policy/PID。
+- 共同基线为QR-N32 run `8ry7xn6g`：P-M3 seed1的1M actor、rollout seed101、B20、T1000、30批=600k、MC/raw、risk-discount .995、20次critic update、chunk2500、独立140条评估。既有truth为reward/outage/mean cost=`0.86576/0.25714/11.75714`，QR hard-CDF=`0.26786`，absolute error=`0.01071`，Brier=`0.20282`。
+- C-Q3C只把`num_quantiles=32→64`，并启用`quantile_target_reduction=reference_mean,reference_samples=32`，消除旧N64目标数翻倍导致的梯度尺度混杂；uniform τ和其他配置不变。当前实现会同时把reward/cost distributional head改为64，但固定策略下reward critic不影响行为；joint clip效应属于该真实N64算法配置的一部分，后续若有收益再考虑cost-only N64解耦。
+- C-Q4C保持N32，只把cost τ网格改为uniform+local mixture：中心`τ*=0.8`、半宽`0.1`、local fraction`0.5`，prediction使用importance weighting保持全局uniform-W1目标，CDF/mean使用对应quadrature权重。使用importance而非旧query-focused，是因为100k已证明后者放大cost gradient并长期clip，无法把收益归因于局部分辨率。
+- 两候选在policy-only恢复后统一重置host/CUDA RNG；网络大小不同也必须得到30批完全相同的reward/cost/outage。标签、非有限值、target scale、joint/cost grad和crossing全部记录。N64与local同时后台运行，但各自独立进程/optimizer/W&B，不共享状态；A100 80GB和128 CPU可承载B20×2。
+- 600k门：末5批prequential CDF absolute error或Brier相对QR至少改善20%，另一项不得恶化超过10%；独立140条的CDF error、Brier或mean-cost absolute error至少一项改善25%，其余关键项不得恶化超过10%；crossing绝对增加不得超过0.10。只有140过门才做fresh520，520仍过门才允许live 1M。
+- 长度续跑规则不变：若600k未过但相对QR的末5批和独立评估方向一致，且关键误差从此前5批到末5批仍改善超过10%，只允许一次从头1.2M；否则停止当前N64/local，不扫N96/N128、local fraction或half-width。两候选不能彼此组合后再解释单变量效果。
+- 既有N32 600k训练417.2秒，但当前同硬件direct run约245秒；N64 pairwise计算更大、local与N32近似。并行预计纯训练5--7分钟、含两组140评估总墙钟6--9分钟；均由`launch_background.sh`持久化，输出写`/vepfs`。
