@@ -1614,3 +1614,16 @@
 - 正式尺寸H=512、W=64的持久化smoke训练11.7秒并exit0，adapter参数为66112；3个rollout产生3次actor事件、6次梯度诊断。首epoch PPO ratio最大误差2.861e-6，cost head在actor backward中的梯度存在标志为0，主任务与cost辅助在adapter上的梯度都非零且有限。
 - smoke中6次诊断有3次负内积，冲突率0.5；running cosine均值0.00897，最后一次cosine 0.04032。它说明两个目标在小adapter上大体近乎正交、但局部冲突真实存在；样本只有192 env steps，不能推断最终性能，也不能据此提前启用PCGrad。
 - 正式比较必须成对运行：C-H11A为adapter64、shared coef0的容量控制，C-H11B为同一adapter64、shared coef1的cost监督候选。两条初始输出/RNG、B40/T1000/C20/A8、1M预算、seed2、actor-feature、mean-anchor及PID全部相同，唯一有效差异是cost辅助梯度。两条都必须做fresh512；outage在[.18,.22]内后再比较reward。若只有control提升，归因为额外PPO容量；若candidate提升且control不提升，才归因为隔离后的cost supervision。
+
+
+### E135：C-H11成对1M结果——adapter cost梯度进入目标带，但reward显著下降（2026-07-17）
+
+- 实现与预注册绑定提交7d70cb6。C-H11A/C-H11B都使用B40、T1000、C20/A8、1M、seed2、actor-feature、mean-anchor、GAE-PPO、LSTM512、adapter64；唯一有效变量为shared cost coef 0/1。两条由launch_background持久化并发运行，均exit0，纯训练832.1/835.3秒；W&B dsze6uux/yys4r1ip均finished、各25行到1M、只同步3个标准文件。每条132个config键，无敏感键或绝对路径值，公开算法tag隐私审计通过。
+- 工程门全部通过。两条都有66112个adapter参数和25次Actor事件；首epoch ratio最大误差为1.335e-5/1.615e-5。candidate共记录200次独立梯度诊断，112次负点积，冲突率.56、running cosine=-.002009；最后primary/aux norm=.00494/.01407，cost-head actor-gradient标志恒0。cost监督确实只进入adapter，既不是空操作，也没有破坏behavior probability。
+- 训练曲线继续发生多次闭环反转。matched-budget末20%训练reward为control/candidate=.6845/.5871，outage=.140/.155，lambda=.0695/.1553；最后单批又变为reward=.833/.505、outage=.250/.150。400k、600k、800k和终点的排序不同，再次证明中途单窗口不能裁决。
+- fresh512给出control reward/outage=.78887/.24023，candidate=.62898/.18359。按修订后的双侧规则，control高于[.18,.22]、风险过大；candidate点估计进入工作带，但reward下降.15989即20.27%，Welch95=[-.21495,-.10483]，差异明确。outage下降.05664，Newcombe95=[-.10643,-.00655]。candidate不能因进入目标带就判成功，因为原C-H8已在带内且reward=.74496。
+- 相对C-H8，candidate reward下降.11598即15.57%，Welch95=[-.17907,-.05289]；outage下降.03125但Newcombe95=[-.08009,.01774]跨0。candidate的Wilson95 outage区间为[.15246,.21944]，点估计刚进带并不表示显著优于C-H8。
+- critic仍未修复。control→candidate的true/pred outage为.240/.177→.184/.096，candidate低估.08765；hard AUC .5492→.5408，Brier .19162→.16051虽随更低基率下降，但Brier Skill -.04983→-.07088反而更差。hard CDF error恶化37.55%，crossing .14163→.19090，mean-cost error只从2.003小幅降到1.840。它把策略推向低reward端，却没有获得更有区分力的条件风险估计。
+- adapter-only control相对C-H8 reward增加.04391但95%区间[-.01685,.10467]跨0，outage增加.02539且区间[-.02599,.07662]也跨0；Brier恶化12.49%、mean error恶化40%。因此额外PPO容量只有不确定的reward倾向，不能单独晋级。
+- 标准PCGrad不值得直接跑全量。25个W&B记录的rollout末事件cosine均值-.00817、绝对值中位数.0283；14个负事件平均cosine-.03865。按正交投影公式，负事件平均仍保留99.883%的aux norm，只移除0.117%，不可能解释20% reward损失。cosine>0才更新的强门控会删除约56%更新，属于另一个独立消融，不应与PCGrad混称。
+- 严格裁决：C-H11不扩seed、不启用PCGrad全量、adapter和cost共享监督均不进入默认配置。证据包位于_runs/wandb_export/dqc_ch11_adapter_pair_1m_s2_2026-07-17与_runs/profiles/dqc_ch11_adapter_pair_1m_s2_2026-07-17，含完整history、profile、三组fresh512统计CSV/JSON/PNG和privacy_audit。下一主路线转向QCPO_refs式低维Weibull tail辅助，检验降低cost分布监督方差是否比32点QR共享梯度更有效；强正余弦门控只作为分歧路线记录。

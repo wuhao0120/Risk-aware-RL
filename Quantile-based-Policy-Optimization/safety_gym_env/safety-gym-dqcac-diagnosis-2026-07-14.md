@@ -1948,3 +1948,16 @@ adapter末层零初始化，开启时初始policy/value输出与无adapter网络
 新增梯度诊断不通过backward累积，也不改optimizer状态。它分别求PPO+value与cost辅助目标对adapter的梯度，并记录余弦。192步smoke的平均cosine约0.009，6次中3次为负，提示局部冲突存在但没有稳定同向或反向趋势。这个统计不足以证明PCGrad有益；PCGrad只应在1M候选显示持续冲突且性能退化时作为下一独立消融。
 
 严格因果对照需要同样带adapter的coef0控制组。若直接拿adapter+cost与原C-H8比较，任何reward变化都可能来自多出的两层PPO容量。C-H11A和C-H11B因此都用adapter64，只有共享cost系数为0或1；两条都按outage在[.18,.22]内后最大化reward的新规则裁决。这个对照比单纯继续扫描共享coef更能回答算法问题。
+
+
+### 13.116 adapter隔离减少了破坏范围，但没有改善风险信息质量（2026-07-17）
+
+C-H11把额外网络容量和cost监督严格拆开后，结论比完整共享backbone更清楚。adapter-only control的fresh512 reward/outage为0.789/0.240；加入cost辅助后变成0.629/0.184。cost梯度确实把策略从风险过大的区域推回[0.18,0.22]工作带，但reward损失0.160，95%区间[-0.215,-0.105]完全小于0。相对原C-H8的0.745/0.215，candidate仍少0.116 reward，差异同样明确。
+
+这不是cost梯度泄漏到主干。200次诊断确认cost head不接收actor梯度，adapter上的primary和aux都非零，PPO首epoch ratio误差约1.6e-5。cost辅助有56%的局部负点积，但平均cosine只有-0.002；已记录负事件的标准PCGrad投影平均只移除0.117%辅助梯度范数。因此结果不能简单归因于少数反向梯度，也没有理由为几乎不改变方向的PCGrad再跑一条1M。
+
+更根本的问题仍是监督信息质量。candidate的真实outage为0.184，critic只预测0.096；AUC只有0.541，低于control的0.549，Brier Skill也从-0.050降到-0.071。Brier绝对值下降主要因为策略本身的outage基率下降，不是条件排序更准。CDF error增加37.5%、crossing增加0.049，说明把高方差32点QR限制在小子空间只减少了受损参数数量，没有把QR目标变成更低方差或更可泛化的风险信号。
+
+这也解释了为什么outage不能越低越好。若只用单侧约束，candidate会因0.184小于control的0.240而看似胜出；双侧目标揭示它只是花费过多reward换来更低风险。真正需要的是在outage约0.20时沿可行边界提高reward，而不是继续增强cost梯度把策略推向左下方。
+
+下一条主线应更换辅助监督的统计形式，而不是继续扩大或投影同一个QR梯度。QCPO_refs的Weibull头只拟合低维尾部参数，并与mean head共同约束history representation，可能比32个action-conditioned quantile的共享loss方差更低。首轮应把Weibull作为默认关闭的独立辅助项，保持B40/C20/A8、adapter关闭、PID固定；先做冻结表示和数值门，再决定是否进入live 1M。只在cosine为正时才启用cost的强门控保留为消融路线，但它会删除约56%更新，不能称为标准PCGrad，也不能与Weibull同时加入。
