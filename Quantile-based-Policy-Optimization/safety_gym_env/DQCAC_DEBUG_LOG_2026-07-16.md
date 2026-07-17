@@ -1244,3 +1244,19 @@
 - 三seed成熟期mean underestimation仍均为正：`0.03594/0.04014/0.02085`。这说明存在总体低估倾向，但事件级误差快速换符号且常呈反相关；“平均需要安全余量”不能推出“用上一事件偏差动态调下一target”。P-M9已经证明固定更大余量会显著损失reward，自适应反馈又没有可预测输入，故两条都不继续。
 - 预注册四项只通过seed方向一致性，overall严格失败。停止“校准偏差EMA→PID target”，不扫描tau/gain/clip，不把负相关事后改造成反向controller。下一路线必须不依赖上一批偏差预测，优先比较受控单次联合更新与跨rollout critic validation；需先核对既有target-KL、preupdate/target/crossfit消融，避免重复。
 - 新增可复用`audit_prequential_calibration.py`，支持列映射、event cadence、严格因果last/EMA、去seed均值lag相关、符号二项检验、机械gate与逐seed图。正式文件在`_runs/profiles/dqc_pm8_prequential_calibration_audit_2026-07-17/`：`event_series.csv`、`audit_summary.json`和`calibration_audit.png`（`3105×2269`，PIL与目视检查通过）。
+
+### E95：P-M8 PID窗口离线重放——window100是最小低噪声候选（2026-07-17）
+
+- 发现的尺度问题是：P-M8每个同频事件一次加入B40，而`window=50`只保留1.25个事件、每次替换80%窗口；P-M3的B20+window50保留2.5个事件。当前Kp=1因此几乎直接响应最近B40的二项噪声。该事实不表示窗口越长越好，必须同时量化滞后。
+- 新工具用每个B20的整数outage计数精确重建window100/200，并逐式重放`target=.15,Kp=1,Ki=.1,leak=.97,deadband=.02,delta_max=.05,reference=10`。用正式logged window50重放三seed lambda，最大绝对误差仅`1.44e-8`，验证控制公式与事件边界完全一致。
+- 400k--1M的seed0/1/2中，window100相对logged window50使控制概率mean absolute jump下降`37.72%/43.33%/36.25%`，lambda jump下降`36.84%/35.64%/38.20%`；用当前窗口预测下一B40 raw outage的MAE变化为`+5.13%/+4.76%/-5.77%`，每个seed都低于探索性10%滞后上限。
+- window200的概率/lambda jump下降更大，但压力seed0的next-B40 MAE恶化`15.75%`，超过上限；它在高风险下降后仍保持更大lambda，额外迟滞清晰可见。因此不扫更长窗口，选择所有seed都通过且最小的window100。
+- 这是固定已观察轨迹上的信号重放，不是换窗口后的policy反事实，不能据此宣称reward/outage会改善。新增可复用`audit_pid_window_replay.py`，正式CSV/JSON/图在`_runs/profiles/dqc_pm8_pid_window_replay_2026-07-17/`；`pid_window_replay.png`为`3105×2269`，PIL与目视检查通过。探索性选择规则和局限均写入JSON，没有伪装成性能预注册。
+
+### E96：P-M10 window100完整1M预注册（2026-07-17）
+
+- P-M10回到P-M8 seed0，只把`pid_window_episodes=50→100`。保持名义alpha=.20、PID target=.15、Kp1/Ki.1/leak.97/deadband.02、Actor/PID interval2、B20、QR32/C20/MC/time-weight.995、T1 sigmoid、LSTM512、8 PPO epoch、LR、seed与1M总预算完全不变；P-M9的target=.10不参与。
+- 不用300k早停；窗口改变controller相位，P-M7/P-M8已证明中后段可反转。只有NaN/OOM/确定性错误提前终止。内置140 screen为reward≥.60、outage≤.40；通过才做统一fresh520。
+- fresh520强门：reward≥.75、outage≤.22，且相对P-M8 seed0的`170/520=.32692`至少下降.08；hard/smooth CDF、mean-cost error和Brier Skill不得出现类似P-M9的数量级发散。机制门为400k--1M的window probability或lambda mean absolute jump相对P-M8 seed0至少下降20%，并报告新增滞后。
+- seed0通过才原样扩seed1/2；失败则window100保留为“信号减振但无性能收益”消融，不扫描75/125/150/200。若只通过机制门且fresh接近安全门，仍不移动门槛，先检查是否为窗口滞后造成reward或风险代价。
+- 独占A100预计纯训练6.5--8分钟、140评估约1分钟、条件fresh520约4--5分钟，总墙钟12--14分钟。正式job只用`launch_background.sh`持久化，W&B使用脱敏online；run name/tags/config只含公开算法语义，checkpoint与绝对路径不上传。

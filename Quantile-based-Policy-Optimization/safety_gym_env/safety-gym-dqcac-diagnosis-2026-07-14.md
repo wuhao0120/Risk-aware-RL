@@ -1659,3 +1659,15 @@ critic退化比策略比例变化更强。pre的hard/smooth CDF error只有0.010
 值得区分两个结论。第一，三个seed成熟期的平均`truth-CDF`都为正，约0.021--0.040，distributional critic确有总体低估倾向；这解释了为什么某种静态安全余量有必要。第二，单个B40事件的偏差常在下一事件换符号，last-value甚至比永远预测零更差35.8%。因此不能把上一事件的低估量当成下一事件的margin。总体bias存在，不代表bias time series可预测。
 
 按预注册规则，不实现自适应PID target，不扫描EMA tau、gain或上下限，也不因观察到负相关就事后设计“反向补偿”。P-M9固定大余量已经展示reward损失；动态余量又缺少可靠输入。下一步回到同一次联合更新内部：限制policy/critic移动幅度，或用跨rollout validation决定critic更新何时停止。选择前先核对已经失败的target-KL、target critic、crossfit和preupdate query，确保新实验改变的是尚未回答的机制。
+
+### 13.81 同频B40后，window50变成了高替换率控制器（2026-07-17）
+
+P-M8修正了PID与Actor频率，却保留50条episode窗口。每次PID事件现在加入40条新轨迹，所以旧窗口80%被一次替换，只覆盖约1.25个控制事件；原B20配置覆盖2.5个事件。episode scaling保证积分增益按样本数等价，却不会自动保持P项输入的事件级平滑度。Kp=1直接乘window error，因此高替换率是lambda跳变的独立来源。
+
+用正式三seed B20 outage计数重放时，logged window50能以最大1.44e-8误差复现lambda。window100把三seed成熟期概率跳变降低36%--43%、lambda跳变降低36%--38%，而预测下一B40 raw outage的MAE最坏只恶化5.13%。window200更平滑，但压力seed滞后恶化15.75%，因此没有“越长越好”。选择window100是最小满足低噪声/有限滞后的探索性工程决策，不是看过policy回报后的调参。
+
+### 13.82 P-M10只检验window100的真实闭环效果（2026-07-17）
+
+离线重放不能预测策略反事实，所以P-M10必须完整跑1M。它以P-M8 seed0为基线，仅将window50改为100；target仍为0.15，不混入P-M9失败的0.10，不加target-KL、critic early stop或新网络。目标是检验平滑P项输入能否让高风险seed减少闭环跳变，同时避免固定更大margin造成的reward损失。
+
+正式520门保持reward至少0.75、outage不高于0.22，并要求比P-M8 seed0至少改善0.08；critic校准不能数量级发散。机制上要求成熟期window probability或lambda jump至少下降20%。通过才扩其他seed，失败不扫描中间窗口。预计独占训练6.5--8分钟，含评估12--14分钟，使用持久化后台与脱敏W&B online。
