@@ -1179,3 +1179,16 @@
 - P-M8正式配置只在P-M7 1M上增加`pid_update_interval=2`：seed1、50×B20×T1000=1M、25个Actor/PID事件、MC/raw/online、time weight .995、T1、target .15、Kp1/Ki.1/window50/leak.97/deadband.02、QR32、LSTM512、20 critic update、8 PPO epoch，其余LR和RNG协议不变。预计纯训练6.5–8分钟、140条评估约1分钟；通过screen后的fresh520约4分钟，总墙钟约12–14分钟，全部持久化后台。
 - screen仍为reward≥0.60、outage≤0.35、ratio/KL/loss有限；失败则不做520。正式门保持reward≥0.75、fresh520 outage≤0.22，并相对P-M7当前`132/520=.25385`至少下降约.03；Brier不得比`.20203`恶化10%，hard/mean error不得反弹。机制门要求25个PID事件与25个Actor事件严格对齐、每次40条，末200k outage std相对P-M7的`.1044`至少降低20%或末400k不再出现增长周期。
 - 1M过门才扩seed0/2。若只接近门（reward≥0.70、outage≤0.28）且最后400k风险/校准仍同向改善，才允许一次2M长度审计；否则停止当前同频参数，不跑3M。下一分歧路线分别保留为anti-windup/更小Kp-Ki、扩大num_envs、target-KL或critic更新后Actor风险验证，不能在P-M8首轮叠加。
+
+### E88：P-M8 seed1 1M结果——同频PID通过强门，但存在可量化reward代价（2026-07-17）
+
+- 正式job正常exit 0，绑定提交`d99b928`，W&B run `yxarpian`；1M纯训练`391.7s`，与P-M7的395.6s等价。PID/Actor各25个事件且每次都为40条轨迹，首epoch ratio误差最终`1.23e-5`，没有NaN/OOM或cadence错位。
+- 五个200k阶段P-M7→P-M8的reward为`0.0034→0.0034, 0.3402→0.3428, 0.6631→0.5932, 0.7898→0.7112, 0.8120→0.8005`；outage为`0.015→0.015, 0.160→0.150, 0.205→0.225, 0.185→0.230, 0.210→0.195`。P-M8中段更慢且更不安全，末段才恢复，不能表述为全程支配。
+- 预注册减振门通过：末200k outage std从`0.11005`降到`0.07619`，下降30.76%；lambda std从`0.06267`降到`0.04759`，下降24.07%；CDF calibration error均值从`0.07047`降到`0.05094`，改善27.71%。末段reward只下降1.41%。同频把高频追批变成较低幅B40锯齿，但并未令每个训练batch都稳定在0.20。
+- 内置140条P-M8为reward/outage=`0.905/33÷140=0.2357`，critic/truth=`0.196/0.236`、Brier=`0.1975`，通过screen；P-M7同协议为`0.9575/0.3071`和Brier`0.2387`。随后按原门执行统一fresh520，而不是用140条宣布成功。
+- fresh520的P-M3/P-M7/P-M8分别为reward=`0.83419/0.96141/0.87025`，outage=`158/132/103÷520=0.30385/0.25385/0.19808`。P-M8自身Wilson 95%区间为`[0.16609,0.23449]`；点估计低于alpha=0.20且明确通过0.22工程门，但区间仍跨0.20，不能写成统计上证明真实outage严格小于alpha。
+- 相对P-M7，P-M8 reward下降`0.09116`（-9.48%），保守独立95%区间`[-0.14882,-0.03350]`；outage下降`0.05577`（-21.97%），Newcombe 95%区间`[-0.10630,-0.00491]`，两者都不跨0。这是显著的安全–reward交换，不是免费改进。相对P-M3，reward增加`0.03605`但区间`[-0.02988,0.10198]`跨0；outage下降`0.10577`，区间`[-0.15765,-0.05316]`。
+- critic总体校准同步改善。P-M7→P-M8 hard/smooth CDF error=`0.06569→0.01436`/`0.06142→0.01124`，改善78.13%/81.69%；mean-cost error=`1.80671→1.55780`，改善13.78%；crossing从`0.10230`升到`0.12004`，绝对恶化0.01774。raw Brier=`0.20203→0.15848`表面改善21.55%，但两个策略的真实outage基率不同，不能把这个百分比单独解释为条件critic提升。按各自520条基率构造常数预测，P-M7/P-M8的climatology Brier约为`0.18941/0.15884`，对应Brier Skill Score约为`-6.66%/+0.23%`：P-M8从劣于常数基线变为接近基线，但尚未证明有强逐状态分辨率。后续同时报告BSS、reliability/resolution与总体CDF误差；原预注册raw-Brier门不事后修改。
+- E87的九项预注册门全部通过，所以不在seed1继续扫Kp/Ki或跑2M，直接扩seed0/2各1M并对所有成功训练的final checkpoint做fresh520，避免只评估好seed。两条可并行：每条纯训练约6.5–8分钟，并行墙钟预计8–10分钟；两组520并行预计再4–6分钟，A100 80GB和128 CPU可承载40个训练env或80个评估env。
+- 多seed晋级标准预先固定：至少2/3 seed的fresh520 outage≤0.22，三seed平均outage≤0.22且平均reward≥0.75；报告seed作为统计单位的mean±SD以及pooled episode比例，但不以pooled 1560条代替seed方差。若通过，P-M8成为当前DQCAC主候选，随后进入与校准QCPO/QCPO_refs相同5M预算；若失败，先按seed轨迹判断是Kp过强、critic反弹还是初始化敏感，再选择单变量路线。
+- 完整history/profile在`_runs/wandb_export/dqc_pm7_vs_pm8_pid_cadence_seed1_1m_2026-07-17/`与`_runs/profiles/dqc_pm7_vs_pm8_pid_cadence_seed1_1m_2026-07-17/`；后者含`phase_comparison.csv`、`fresh520_comparison.csv`、置信区间/门控JSON及比较图。P-M8 fresh520原始JSON为`_runs/DQCAC_DynamicButton_pm8_actorint2_pidint2_1m_s1_final_eval520_s1.json`。
