@@ -1897,3 +1897,13 @@ C-H8B40在固定100万环境步下把每次更新的独立轨迹从20增到40、
 第一版没有重算旧rollout在current actor下的feature。这样做不是忽略非平稳性，而是根据四格证据控制变量：固定critic换actor只改变预测约0.03，固定actor换critic改变约9.88。若直接同时加入raw recurrent replay和current-feature重算，就无法判断收益来自跨批标签还是坐标刷新。正式C-H9R先检验一批stale feature是否已经足以抑制C20当前批记忆；若成功，再单独比较refresh；若失败且出现明显feature方向冲突，才升级缓存协议。
 
 正式实验在B40/seed2/1M上只打开一批等权replay。它必须同时改善下一rollout的prequential Brier和fresh reward/outage，而不是只降低混合训练loss。通过门为reward≥0.75、outage≤0.22、hard Brier≤0.15898、mean error≤1且AUC无明显下降；否则下一路线是held-out critic-step selection，而不是继续把同一旧批权重调成0.25/2或无限加深buffer。
+
+### 13.111 等权跨rollout训练replay改善quantile形状，却把概率和均值推向错误的保守偏置（2026-07-17）
+
+C-H9R的工程实现完全按设计运行：首轮无旧批，此后每个cost step把当前40条和上一批40条按0.5/0.5组合，1M内共发生480次replay更新；PPO只使用当前behavior batch，固定old log-prob的ratio误差最大`2.47e-5`。所以失败不能归因于replay没有激活、比例权重放大或actor off-policy接线错误。
+
+它确实学到了一些更规整的分布结构。fresh512 crossing从无replay的0.157降到0.097；内置128上AUC一度达到0.641。这说明旧批监督降低了单批QR更新对分位数顺序的破坏。但512条评估把真正问题暴露得很清楚：AUC只有0.559，hard Brier从0.170升到0.274，预测/真实mean cost为17.803/14.025，outage从0.215升到0.316。相对C-H8，outage差的95%区间为`[0.0475,0.1548]`，完全大于0，而reward差区间覆盖0；这是明确的安全退化，不是需要再跑两颗seed才能判断的边界结果。
+
+训练时序解释了为什么。replay不是无偏地增加独立样本，而是把“上一policy、上一hidden坐标、上一批cost基率”的监督持续注入当前head。mean anchor又强迫同一head同时追随混合均值。末5批pre-Brier恶化85%、pre-CDF error恶化81%，lambda均值从0.087升到0.562；最后一批pre预测mean 18.577，真实只有10.550。它把上一批的高cost记忆变成了跨policy持续偏置，quantile更少crossing不代表查询点概率更准。
+
+因此不应继续扫描replay系数或堆更多旧批。下一项要把旧rollout从training target改成validation set：当前rollout仍负责梯度，上一rollout只判断cost head在哪个更新step开始对未见批次变坏，并在此后停止cost梯度或恢复最佳cost参数及相应Adam状态；reward critic仍完成原定C20，Actor/PID/环境步不变。这个实验区分“跨批信息本身有用”与“把跨批标签直接混进目标会产生分布滞后”。若held-out选择仍失败，再分别测试小cost adapter/PCGrad或QCPO_refs式Weibull低方差辅助，不能同时混合。

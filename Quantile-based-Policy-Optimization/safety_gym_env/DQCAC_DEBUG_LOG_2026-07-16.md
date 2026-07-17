@@ -1564,3 +1564,14 @@
 - 工程门：first active step=20、update events=480、active时samples=40,000/batches=1/current scale=.5/replay scale=.5；ratio≤`1e-3`、无NaN/Inf/OOM。机制门：末5批pre-Brier相对C-H8的约`.15842`改善至少10%，pre-CDF error不得恶化10%；最后一批current/replay target mean及两个loss透明报告，防止只把旧批平均值机械写入head。
 - 性能门保持fresh512 reward≥`.75`且outage≤`.22`；hard Brier必须≤E121 seed2的1.10倍即约`.15898`、AUC不得比C-H8 `.59387`下降超过`.03`、mean-cost error≤1。全部通过才扩seed0/1；失败不扫replay coef或B60/B80，优先实现上一rollout held-out选择critic epoch，区分“混合旧标签有用”与“需要显式泛化选择”。
 - B40无replay纯训练403.94秒。完整replay额外做一次等规模cost-head前向/反向，预计纯训练9--13分钟、内置128评估约1--2分钟、fresh512约4--5分钟；正式训练只用持久化后台和脱敏W&B online。
+
+### E130：C-H9R完整结果——排序形状局部改善，但概率校准与安全闭环显著恶化（2026-07-17）
+
+- 正式后台job正常`exit 0`，训练run为`7ob6dayd`，25行history完整到1M且远端finished。实际纯训练416.7秒，只比无replay B40的403.94秒慢3.2%，远低于保守估计；W&B运行口径为487.44秒。工程门全部通过：first-active-step=20、后24轮共480次replay update、每次40,000条旧transition、current/replay scale均为0.5；PPO首epochratio最大误差`2.47e-5`，无NaN/Inf/OOM。
+- 内置128评估曾给出reward/outage=`.80256/.27344`、hard AUC `.64071`、crossing `.09551`；但fresh512为`.78413/.31641`、AUC `.55918`、crossing `.09684`。小评估集上的排序提升没有在更可靠的512条口径上保持到预注册AUC门，不能据此扩seed。
+- 相对C-H8无replay fresh512，reward `.74496→.78413`，差`.03917`，Welch 95%区间`[-.02502,.10336]`覆盖0；outage `.21484→.31641`，增加`.10156`，Newcombe 95%区间`[.04752,.15484]`完全大于0。reward增益没有统计把握，风险恶化却清晰且幅度很大。
+- critic不是完全退化：crossing `.15732→.09684`，说明分位数形状更有序；但hard Brier `.17034→.27366`恶化60.66%，Brier Skill `-.00979→-.26525`，hard CDF error `.05212→.11957`增加129.39%。predicted/true mean从`7.823/9.254`变成`17.803/14.025`，绝对误差`1.431→3.778`。replay把旧批高cost监督长期保留后形成保守偏置，不等于校准改善。
+- 训练末5批同样提前暴露失败：pre-Brier `.15842→.29304`恶化84.98%，而预注册要求至少改善10%；pre-CDF abs error `.09125→.16547`恶化81.34%，允许上限只有`.10038`。末5批outage `.18→.355`、lambda `.0870→.5616`；最后一批pre predicted/true mean=`18.577/10.550`，post-Brier仍为`.22954`。这不是只在final fresh评估偶然翻车。
+- 严格裁决为`strict_fail_no_seed_expansion`：不跑seed0/1，不扫replay coef、buffer深度、B60/B80。简单等权训练replay被否决为主路线；它证明跨批标签能改善quantile crossing，却也证明“降低混合训练loss”不能保证下一policy/新trajectory上的概率校准。
+- 下一路线改为上一rollout只做held-out validation，用其选择或早停当前rollout的cost-critic step，而不把旧标签直接写入目标。首版需要保持reward critic继续C20、只冻结cost branch后续梯度，并明确保存/恢复cost参数与Adam状态；否则所谓early stop会暗中改变reward critic或留下optimizer动量污染。小adapter/PCGrad和Weibull仍保留为后续独立消融，不与held-out首轮混合。
+- 完整导出在`_runs/wandb_export/dqc_ch9r_transitionreplay1_actorfeature_meananchor_b40_1m_s2_2026-07-17/`，C-H8/C-H9R共同history与曲线在`_runs/wandb_export/dqc_ch8b40_vs_ch9r_replay1_seed2_1m_2026-07-17/`和同名`_runs/profiles/`。fresh表、门槛JSON、末段表、隐私审计及`2775×1895`比较图位于C-H9R profile的`e121_ch8_comparison/`；全部PNG可由PIL解码。125个公开config键无敏感键或绝对路径，远端只同步标准config/output/summary文件。
