@@ -209,6 +209,11 @@ def base_args(algo, seed, device, env_key):
         # 默认 linear 完全兼容历史，exp/softplus 显式乘回10恢复 raw-cost 单位。
         a.cost_quantile_output = 'linear'
         a.cost_quantile_output_scale = 10.0
+        # QCPO_refs式共享多任务表示默认关闭。开启后cost QR/mean监督只回传到
+        # recurrent actor的MLP+LSTM骨干，action-conditioned cost head仍由critic Adam更新。
+        a.cost_shared_backbone_coef = 0.0
+        a.cost_shared_backbone_cost_scale = 10.0
+        a.cost_shared_backbone_huber_kappa = 1.0             # QCPO_refs固定阈值
         # cost history 消融：raw=历史 Markov critic；actor_feature=C-H0.5 共享并
         # detach policy feature；cost_lstm=C-H1 独立同输入 MLP+LSTM（当前要求 MC）。
         a.cost_history_mode = 'raw'

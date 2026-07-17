@@ -1823,3 +1823,11 @@ softplus路线定义为10×softplus(logit)/log(2)，因此与exp在零logit处�
 优化诊断给出更直接的原因。exp相对linear把末段cost总梯度从88.7提高到144.4，quantile head梯度从63.2提高到126.8，而history梯度只从59.5提高到65.2。指数导数主要放大了输出head，所有update仍被clip；它没有提供新的跨轨迹监督。mean-anchor与QR的相对比值仍接近linear，因此mean退化不是MSE权重突然过大，而是共享clip下的方向与非线性参数化改变。
 
 所以不继续跑softplus全量。softplus只在exp发生非有限值或指数尾部明显失控时才有区分价值；本次exp稳定但统计门失败，换平滑激活不会增加新监督信息。下一项应回到QCPO_refs最本质的结构差异：policy、reward value、cost quantiles、mean与tail heads共享同一个规范化MLP+LSTM，cost辅助损失会约束产生policy action的history representation。当前DQCAC的cost-LSTM是独立大网络，actor-feature消融又把共享feature完全detach，两者都没有复现这种多任务梯度耦合。Weibull可保留为较小消融，但其源实现对quantiles detach，主要价值同样可能来自对共享backbone的辅助梯度，而不是单独给现有quantile head加一个尾部分布公式。
+
+### 13.102 共享backbone不是复用detach feature（2026-07-17）
+
+QCPO_refs稳定性的关键候选不是“用了LSTM”这一表面结构，而是policy、reward-V、cost quantiles和Weibull辅助头共同训练同一个MLP+LSTM表示。此前DQCAC的`actor_feature`只复用detach feature，cost loss无法改变policy representation；独立`cost_lstm`虽能从history中提取AUC约0.59的信号，却在B20/C20下同批过拟合，且新增约2.39M自由参数。两者都不等价于reference的共享监督。
+
+当前新增默认关闭的共享cost辅助目标：DQCAC仍保留理论所需的action-conditioned cost head，但在actor PPO/value epoch中固定该head，只让QCPO_refs单位和归约下的QR+可选mean loss回传actor body/LSTM。两个optimizer继续拥有互斥参数，behavior log-prob在全部PPO epoch固定，feature在actor step后才标记并刷新；这既借用共享多任务表示，又不把DQCAC偷换为state-only QCPO。
+
+默认关闭的60个checkpoint张量逐位回归通过；手算loss逐位一致，feature梯度非零而cost-head梯度为None；全尺寸4k smoke无非有限值，ratio/KL/clip健康。下一裁决是paired seed1 1M：同一个actor-feature+mean-anchor head下只切换共享系数0/1，并用prequential指标和fresh520 reward/outage决定是否扩多seed。详细参数、门槛和耗时估计见调试账本E118–E119。

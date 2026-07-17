@@ -342,6 +342,14 @@ class DQCACBetaGPU(VecAgentBase):
             getattr(args, 'cost_quantile_output', 'linear')).lower()
         self.cost_quantile_output_scale = float(
             getattr(args, 'cost_quantile_output_scale', 10.0))
+        # C-H6默认关闭：用QCPO_refs单位/归约的cost辅助目标训练policy/reward共享
+        # MLP+LSTM。cost head本身仍只属于critic optimizer，避免两个Adam拥有同一参数。
+        self.cost_shared_backbone_coef = float(
+            getattr(args, 'cost_shared_backbone_coef', 0.0))
+        self.cost_shared_backbone_cost_scale = float(
+            getattr(args, 'cost_shared_backbone_cost_scale', 10.0))
+        self.cost_shared_backbone_huber_kappa = float(
+            getattr(args, 'cost_shared_backbone_huber_kappa', 1.0))
         self.cost_s0_replay_batches = int(
             getattr(args, 'cost_s0_replay_batches', 4))
         if self.cost_s0_aux_coef < 0.0:
@@ -355,6 +363,12 @@ class DQCACBetaGPU(VecAgentBase):
                 "cost_quantile_output must be 'linear', 'exp', or 'softplus'")
         if self.cost_quantile_output_scale <= 0.0:
             raise ValueError("cost_quantile_output_scale must be positive")
+        if self.cost_shared_backbone_coef < 0.0:
+            raise ValueError("cost_shared_backbone_coef must be non-negative")
+        if self.cost_shared_backbone_cost_scale <= 0.0:
+            raise ValueError("cost_shared_backbone_cost_scale must be positive")
+        if self.cost_shared_backbone_huber_kappa <= 0.0:
+            raise ValueError("cost_shared_backbone_huber_kappa must be positive")
         if self.cost_s0_replay_batches <= 0:
             raise ValueError("cost_s0_replay_batches must be positive")
         # step feature 默认跟随 episodic: 有限期界下剩余 cost 分布依赖剩余步数 (已验证配方)
@@ -386,6 +400,15 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_actor_updates_completed = 0.0
         self.last_actor_approx_kl = 0.0
         self.last_actor_clip_fraction = 0.0
+        self.last_shared_cost_qr_loss = 0.0
+        self.last_shared_cost_mean_loss = 0.0
+        self.last_shared_cost_weighted_loss = 0.0
+        self.last_shared_cost_feature_refresh_abs_mean = 0.0
+        self.last_shared_cost_body_grad_norm = 0.0
+        self.last_shared_cost_lstm_grad_norm = 0.0
+        self.last_shared_cost_policy_head_grad_norm = 0.0
+        self.last_shared_cost_value_head_grad_norm = 0.0
+        self.last_shared_cost_head_grad_present = 0.0
         self.advantage_norm = getattr(args, 'advantage_norm', 'qcpo')
         self.entropy_coef = getattr(args, 'entropy_coef', 0.0)
         self.lambda_max = getattr(args, 'lambda_max', 50.0)
@@ -493,6 +516,46 @@ class DQCACBetaGPU(VecAgentBase):
                 raise ValueError("cost_s0_aux_coef>0 currently requires cost_target_mode='mc'")
             if self.cost_history_mode != 'raw':
                 raise ValueError("cost_s0_aux_coef>0 currently requires cost_history_mode='raw'")
+
+        # C-H6首轮只改变QCPO_refs式共享表示梯度，不同时混入IQN、局部网格、
+        # target/crossfit查询、独立cost-LSTM或actor cadence。严格限制组合使中长跑
+        # 的差异可以归因于“cost监督是否进入policy/reward MLP+LSTM”这一项。
+        if self.cost_shared_backbone_coef > 0.0:
+            if not self.recurrent_policy or self.reward_actor_mode != 'gae_ppo':
+                raise ValueError(
+                    "cost_shared_backbone_coef>0 requires recurrent gae_ppo")
+            if self.cost_history_mode != 'actor_feature':
+                raise ValueError(
+                    "cost_shared_backbone_coef>0 requires cost_history_mode='actor_feature'")
+            if self.cost_target_mode != 'mc':
+                raise ValueError(
+                    "cost_shared_backbone_coef>0 currently requires cost_target_mode='mc'")
+            if self.cost_distribution_model != 'qr':
+                raise ValueError(
+                    "cost_shared_backbone_coef>0 currently requires QR cost distribution")
+            if self.cost_quantile_grid_mode != 'uniform':
+                raise ValueError(
+                    "cost_shared_backbone_coef>0 currently requires uniform quantiles")
+            if self.cost_cdf_estimator != 'quantile':
+                raise ValueError(
+                    "cost_shared_backbone_coef>0 currently requires quantile CDF")
+            if self.cost_actor_query_mode != 'online':
+                raise ValueError(
+                    "cost_shared_backbone_coef>0 currently requires online cost query")
+            if self.cost_quantile_output != 'linear':
+                raise ValueError(
+                    "cost_shared_backbone_coef>0 first ablation requires linear cost output")
+            if self.cost_s0_aux_coef > 0.0:
+                raise ValueError(
+                    "cost_shared_backbone_coef>0 currently requires cost_s0_aux_coef=0")
+            if self.actor_update_interval != 1:
+                raise ValueError(
+                    "cost_shared_backbone_coef>0 currently requires actor_update_interval=1")
+            if self.freeze_policy_updates or self.actor_updates_per_episode <= 0:
+                raise ValueError(
+                    "cost_shared_backbone_coef>0 requires live actor updates")
+        # 主cost critic继续使用已验证的huber_kappa=0.1；共享辅助项单独使用
+        # cost_shared_backbone_huber_kappa=1，精确对应QCPO_refs而不暗改head优化目标。
 
         # C-DCF1 首轮只在P-M3已经验证的QR/raw/MC/online链路隔离比较查询表示。
         # 这些限制不是永久API边界；它们防止首次实验同时混入IQN、history encoder、
@@ -887,6 +950,9 @@ class DQCACBetaGPU(VecAgentBase):
               f"/scale{self.cost_mean_anchor_cost_scale:g}, "
               f"cost_output={self.cost_quantile_output}"
               f"/scale{self.cost_quantile_output_scale:g}, "
+              f"shared_cost={self.cost_shared_backbone_coef:g}"
+              f"/scale{self.cost_shared_backbone_cost_scale:g}"
+              f"/k{self.cost_shared_backbone_huber_kappa:g}, "
               f"cost_cdf={self.cost_cdf_estimator}/{self.cost_cdf_mode}"
               f"/T{self.cost_cdf_temperature:g}"
               f"/lr{self.cost_direct_cdf_lr:g}"
@@ -1178,6 +1244,26 @@ class DQCACBetaGPU(VecAgentBase):
                     actor_info.get('ppo/approx_kl', 0.0))
                 self.last_actor_clip_fraction = float(
                     actor_info.get('ppo/clip_fraction', 0.0))
+                self.last_shared_cost_qr_loss = float(
+                    actor_info.get('shared_cost/qr_loss', 0.0))
+                self.last_shared_cost_mean_loss = float(
+                    actor_info.get('shared_cost/mean_loss', 0.0))
+                self.last_shared_cost_weighted_loss = float(
+                    actor_info.get('shared_cost/weighted_loss', 0.0))
+                self.last_shared_cost_feature_refresh_abs_mean = float(
+                    actor_info.get('shared_cost/feature_refresh_abs_mean', 0.0))
+                self.last_shared_cost_body_grad_norm = float(
+                    actor_info.get('shared_cost/joint_body_grad_norm', 0.0))
+                self.last_shared_cost_lstm_grad_norm = float(
+                    actor_info.get('shared_cost/joint_lstm_grad_norm', 0.0))
+                self.last_shared_cost_policy_head_grad_norm = float(
+                    actor_info.get(
+                        'shared_cost/joint_policy_head_grad_norm', 0.0))
+                self.last_shared_cost_value_head_grad_norm = float(
+                    actor_info.get(
+                        'shared_cost/joint_value_head_grad_norm', 0.0))
+                self.last_shared_cost_head_grad_present = float(
+                    actor_info.get('shared_cost/cost_head_grad_present', 0.0))
 
             # 旧 critic_adam 路径保留 actor 后更新时序，保证历史实验可复现。
             if (not self.freeze_policy_updates and not in_warmup
@@ -1185,6 +1271,11 @@ class DQCACBetaGPU(VecAgentBase):
                     and it % self.outer_interval == 0):
                 self.update_dual(batch)
                 dual_updated = True                            # warmup 时不推进 λ 的学习率时间轴
+
+            # 最后一个actor epoch发生在最后一次critic刷新之后；post holdout必须查询
+            # 当前共享表示，而不是最后一次head update前的陈旧feature。RMS此时仍冻结。
+            if self.cost_shared_backbone_coef > 0.0:
+                self._refresh_shared_actor_cost_features(batch)
 
             # 与 pre 指标使用完全相同的 s0/a0/真实回报；这里只改变 critic 版本。
             # 放在 actor.obs_rms 合并前，避免把输入统计变化混入 pre/post 差值。
@@ -1306,6 +1397,88 @@ class DQCACBetaGPU(VecAgentBase):
         new_B = T * B // self.recurrent_seq_len
         return (tensor.transpose(0, 1).reshape(
             new_B, self.recurrent_seq_len, *rest).transpose(0, 1).contiguous())
+
+    def _inverse_transform_recurrent(self, tensor, batch_size):
+        """
+        把chunk主序 [seq_len,new_B,*] 精确还原为时间主序 [T,B,*]。
+
+        _transform_recurrent先把每条episode切成连续chunk，再把chunk放到batch维；
+        这里必须先恢复[B,T,*]再转置。直接reshape成[T,B,*]会把不同环境和
+        时间块交错，cost标签虽不报shape错误，却会监督到错误的history feature。
+        """
+        sequence_length, chunk_batch = tensor.shape[:2]
+        rest = tuple(tensor.shape[2:])
+        total_steps = int(sequence_length * chunk_batch)
+        B = int(batch_size)
+        if B <= 0 or total_steps % B != 0:
+            raise ValueError(
+                "recurrent inverse transform requires total elements divisible by batch_size")
+        horizon = total_steps // B
+        return (tensor.transpose(0, 1).reshape(
+            B, horizon, *rest).transpose(0, 1).contiguous())
+
+    def _recompute_recurrent_actor_features(self, batch):
+        """
+        用当前actor参数和behavior chunk初始状态重算整条rollout的共享表示。
+
+        返回值按原始time-major顺序展平为[T*B,H]。h0/c0仍取采样时保存的
+        chunk入口状态，与PPO当前策略前向完全相同；这避免把每个chunk错误地当作
+        零历史episode，也让critic head始终看到和当前policy backbone一致的特征。
+        """
+        B = int(batch.get('_actor_num_envs', self.num_envs))
+        observations = self._transform_recurrent(batch['actor_obs'])
+        prev_actions = self._transform_recurrent(batch['prev_action'])
+        prev_rewards = self._transform_recurrent(batch['prev_reward'])
+        hidden0 = self._transform_recurrent(
+            batch['h0'])[0].unsqueeze(0).contiguous()
+        cell0 = self._transform_recurrent(
+            batch['c0'])[0].unsqueeze(0).contiguous()
+        _means, _log_stds, _values, _final_state, features = self.actor(
+            observations, prev_actions, prev_rewards, (hidden0, cell0),
+            return_features=True)
+        time_major = self._inverse_transform_recurrent(features, B)
+        expected_shape = (self.n, B, self.actor.lstm_size)
+        if tuple(time_major.shape) != expected_shape:
+            raise RuntimeError(
+                f"recomputed actor feature shape {tuple(time_major.shape)} "
+                f"does not match {expected_shape}")
+        return time_major.reshape(self.n * B, self.actor.lstm_size)
+
+    @torch.no_grad()
+    def _refresh_shared_actor_cost_features(self, batch):
+        """
+        刷新共享cost head使用的detach actor feature，并记录表示漂移。
+
+        critic optimizer只训练action-conditioned head；因此每次head更新前必须用
+        当前actor重算输入。若继续使用rollout时缓存的旧feature，actor更新后head会
+        在陈旧表示上训练，下一轮共享backbone更新又在新表示上查询，制造额外off-policy
+        feature drift。detach边界确保本函数本身不把critic梯度写入actor。
+        """
+        if self.cost_shared_backbone_coef <= 0.0:
+            return
+        if self.cost_history_mode != 'actor_feature':
+            raise RuntimeError(
+                "shared actor feature refresh requires cost_history_mode='actor_feature'")
+        # critic-only steps不会改变actor；dirty=False时复用刚按当前actor刷新的feature，
+        # 避免在剩余critic epochs中重复做整条LSTM前向。默认缺失视为dirty，保证
+        # 每个新rollout第一次head更新前仍执行一次数值对齐刷新。
+        if not bool(batch.get('_shared_cost_feature_dirty', True)):
+            batch['_shared_cost_feature_refresh_abs_mean'] = 0.0
+            batch['_shared_cost_feature_refresh_applied'] = 0.0
+            return
+        previous = batch.get('cost_feature')
+        current = self._recompute_recurrent_actor_features(batch).detach()
+        refresh_gap = 0.0
+        if previous is not None:
+            if tuple(previous.shape) != tuple(current.shape):
+                raise RuntimeError("shared actor feature refresh shape mismatch")
+            refresh_gap = float((current - previous).abs().mean().item())
+        batch['cost_feature'] = current
+        batch['_shared_cost_feature_refresh_abs_mean'] = refresh_gap
+        batch['_shared_cost_feature_refresh_applied'] = 1.0
+        batch['_shared_cost_feature_refresh_count'] = int(
+            batch.get('_shared_cost_feature_refresh_count', 0)) + 1
+        batch['_shared_cost_feature_dirty'] = False
 
     def _normalize_cost_history_observation(self, actor_observation):
         """
@@ -1818,6 +1991,97 @@ class DQCACBetaGPU(VecAgentBase):
         return (
             per_transition * sample_weights.reshape(-1)).mean()
 
+    def _shared_backbone_reference_cost_loss(
+            self, actor_features, batch):
+        """
+        返回只训练共享actor MLP+LSTM的QCPO_refs尺度cost辅助目标。
+
+        参考实现先把cost和quantiles都除以10，再对batch、prediction quantile和
+        target quantile三维全部取mean。当前MC标签每个transition只有一个realization；
+        把它重复N次后再取mean与只保留一列严格等价，因此这里直接计算[M,N]，
+        避免无信息的[M,N,N]张量。可选risk-discount权重与主cost critic一致。
+
+        前向期间临时关闭cost head参数的requires_grad。这样固定head仍对输入feature
+        提供Jacobian，但autograd不会为head创建参数梯度；actor Adam只拥有共享骨干，
+        critic Adam只拥有head，彻底避免同一参数被两个优化器交替写入。
+        """
+        if self.cost_shared_backbone_coef <= 0.0:
+            zero = actor_features.new_zeros(())
+            return zero, {
+                'shared_cost/qr_loss': 0.0,
+                'shared_cost/mean_loss': 0.0,
+                'shared_cost/objective_loss': 0.0,
+                'shared_cost/weighted_loss': 0.0,
+            }
+        expected_rows = int(batch['actions'].shape[0])
+        if actor_features.ndim != 2 or actor_features.shape[0] != expected_rows:
+            raise ValueError(
+                "shared actor features must have shape [T*B, hidden_size]")
+        if 'mc_cost' not in batch:
+            raise RuntimeError("shared backbone cost loss requires MC cost targets")
+
+        # actor_feature模式通常还拼接t/T；这里不能调用_cost_inputs，因为该函数
+        # 对actor_feature有意detach。共享辅助路径必须保留feature到actor的计算图。
+        cost_inputs = actor_features
+        if self.critic_step_feature:
+            step_feature = (
+                batch['steps'].float() / self.n).reshape(-1, 1)
+            cost_inputs = torch.cat([actor_features, step_feature], dim=1)
+
+        # 清掉上一个critic step遗留的.grad后再冻结head。requires_grad状态在forward
+        # 建图时决定；forward完成后恢复原状态不会让随后backward重新创建head梯度。
+        cost_head_parameters = list(self.cost_critic.parameters())
+        original_requires_grad = [
+            parameter.requires_grad for parameter in cost_head_parameters]
+        for parameter in cost_head_parameters:
+            parameter.grad = None
+            parameter.requires_grad_(False)
+        try:
+            prediction = self._cost_quantiles(
+                self.cost_critic, cost_inputs, batch['actions'])
+        finally:
+            for parameter, requires_grad in zip(
+                    cost_head_parameters, original_requires_grad):
+                parameter.requires_grad_(requires_grad)
+
+        scale = self.cost_shared_backbone_cost_scale
+        scaled_prediction = prediction / scale
+        scaled_target = batch['mc_cost'].detach() / scale
+        pairwise_delta = scaled_target.unsqueeze(1) - scaled_prediction
+        absolute_delta = pairwise_delta.abs()
+        kappa = self.cost_shared_backbone_huber_kappa
+        huber = torch.where(
+            absolute_delta > kappa,
+            kappa * (absolute_delta - 0.5 * kappa),
+            0.5 * pairwise_delta.pow(2))
+        tau = self.cost_taus.to(
+            device=prediction.device, dtype=prediction.dtype).view(1, -1)
+        quantile_weight = (
+            tau - (pairwise_delta.detach() < 0).to(prediction.dtype)).abs()
+        qr_per_transition = (
+            quantile_weight * huber / kappa).mean(dim=1)
+
+        # QCPO_refs中c_value_se本身含0.5，再乘cost_value_loss_coeff（正式值0.5）。
+        mean_error = scaled_prediction.mean(dim=1) - scaled_target
+        mean_per_transition = 0.5 * mean_error.pow(2)
+        sample_weights = self._cost_critic_sample_weights(batch['steps'])
+        if sample_weights is None:
+            qr_loss = qr_per_transition.mean()
+            mean_loss = mean_per_transition.mean()
+        else:
+            weights = sample_weights.reshape(-1)
+            qr_loss = (qr_per_transition * weights).mean()
+            mean_loss = (mean_per_transition * weights).mean()
+
+        objective = qr_loss + self.cost_mean_anchor_coef * mean_loss
+        weighted_loss = self.cost_shared_backbone_coef * objective
+        return weighted_loss, {
+            'shared_cost/qr_loss': float(qr_loss.detach().item()),
+            'shared_cost/mean_loss': float(mean_loss.detach().item()),
+            'shared_cost/objective_loss': float(objective.detach().item()),
+            'shared_cost/weighted_loss': float(weighted_loss.detach().item()),
+        }
+
     # ============================================================ Critic 更新 (双 QR-TD) ============================================================
     def _backward_recurrent_cost_loss(
             self, batch, cost_target, cost_sample_weights=None):
@@ -1907,6 +2171,10 @@ class DQCACBetaGPU(VecAgentBase):
         共享一次 zero_grad/clip/optimizer.step。因此它与整批 mean loss 的梯度定义
         相同，不会因为块数增加而偷偷放大学习率。
         """
+        # 共享backbone每个actor epoch后都会变化；head更新前必须在no_grad下刷新
+        # 当前表示。默认coef=0时函数立即返回，不增加一次actor forward。
+        if self.cost_shared_backbone_coef > 0.0:
+            self._refresh_shared_actor_cost_features(batch)
         states, actions = batch['states'], batch['actions']
         boot_states, boot_mask = batch['boot_states'], batch['boot_mask']
         steps, boot_steps = batch['steps'], batch['boot_steps']
@@ -2184,6 +2452,12 @@ class DQCACBetaGPU(VecAgentBase):
                 cost_mean_anchor_scale * cost_mean_loss_value),
             'critic/chunked_update': float(use_chunks),
             'critic/cost_recurrent_tbptt': float(recurrent_cost),
+            'critic/shared_actor_feature_refresh_abs_mean': float(
+                batch.get('_shared_cost_feature_refresh_abs_mean', 0.0)),
+            'critic/shared_actor_feature_refresh_applied': float(
+                batch.get('_shared_cost_feature_refresh_applied', 0.0)),
+            'critic/shared_actor_feature_refresh_count': float(
+                batch.get('_shared_cost_feature_refresh_count', 0)),
             'critic/cost_time_weighted': float(
                 cost_sample_weights is not None),
             'critic/cost_time_weight_min': float(
@@ -2675,8 +2949,29 @@ class DQCACBetaGPU(VecAgentBase):
         hidden0 = transform(batch['h0'])[0].unsqueeze(0).contiguous()
         cell0 = transform(batch['c0'])[0].unsqueeze(0).contiguous()
 
-        means, log_stds, value_pred, _final_state = self.actor(
-            observations, prev_actions, prev_rewards, (hidden0, cell0))
+        shared_cost_enabled = self.cost_shared_backbone_coef > 0.0
+        if shared_cost_enabled:
+            # 同一次actor forward同时产生policy/value和可微history feature；这样cost
+            # 辅助梯度与PPO/value看到完全相同的当前MLP+LSTM表示，不重复构建recurrent图。
+            means, log_stds, value_pred, _final_state, actor_features = self.actor(
+                observations, prev_actions, prev_rewards, (hidden0, cell0),
+                return_features=True)
+            actor_features = self._inverse_transform_recurrent(
+                actor_features, B).reshape(n * B, self.actor.lstm_size)
+            shared_cost_loss, shared_cost_info = (
+                self._shared_backbone_reference_cost_loss(
+                    actor_features, batch))
+        else:
+            # 默认关闭分支保留历史四元actor forward，保证旧checkpoint数值路径不变。
+            means, log_stds, value_pred, _final_state = self.actor(
+                observations, prev_actions, prev_rewards, (hidden0, cell0))
+            shared_cost_loss = observations.new_zeros(())
+            shared_cost_info = {
+                'shared_cost/qr_loss': 0.0,
+                'shared_cost/mean_loss': 0.0,
+                'shared_cost/objective_loss': 0.0,
+                'shared_cost/weighted_loss': 0.0,
+            }
 
         # cost advantage 固定在 behavior policy：实际动作和 K 个 baseline 动作均具有
         # rollout 的完整历史条件。不能对中间 state 调 _sample_initial_actions。
@@ -2763,7 +3058,14 @@ class DQCACBetaGPU(VecAgentBase):
             - self.entropy_coef * entropy)
         value_error = value_pred - value_targets
         value_loss = 0.5 * value_error.pow(2).mean()
-        total_loss = policy_loss + self.recurrent_value_loss_coef * value_loss
+        if shared_cost_enabled:
+            total_loss = (
+                policy_loss
+                + self.recurrent_value_loss_coef * value_loss
+                + shared_cost_loss)
+        else:
+            # coef=0保持原表达式与加法顺序，避免默认回归因无效+0改变浮点图。
+            total_loss = policy_loss + self.recurrent_value_loss_coef * value_loss
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         approx_kl = ((ratio.detach() - 1.0) - log_ratio.detach()).mean()
@@ -2771,18 +3073,52 @@ class DQCACBetaGPU(VecAgentBase):
         if self.ppo_target_kl > 0.0:
             target_kl_hit = float(approx_kl.item()) > self.ppo_target_kl
 
+        # 分组件范数只在共享消融中计算；它们是policy+value+cost的联合梯度，
+        # 用于判断辅助目标是否淹没mu/value，而不额外执行autograd.grad或第二次backward。
+        body_grad_norm = torch.zeros((), device=self.device)
+        lstm_grad_norm = torch.zeros((), device=self.device)
+        policy_head_grad_norm = torch.zeros((), device=self.device)
+        value_head_grad_norm = torch.zeros((), device=self.device)
+        cost_head_grad_present = 0.0
+
+        def component_grad_norm(parameters):
+            squared_norm = torch.zeros(
+                (), dtype=torch.float32, device=self.device)
+            for parameter in parameters:
+                if parameter.grad is not None:
+                    squared_norm += parameter.grad.detach().float().pow(2).sum()
+            return squared_norm.sqrt()
+
         if target_kl_hit:
             # 当前forward已经测得behavior→current KL越界；本epoch不能再反传一步。
             # zero_grad已清除上个epoch残留梯度，后续critic optimizer与actor独立。
             grad_norm = torch.zeros((), device=self.device)
         else:
             total_loss.backward()
+            if shared_cost_enabled:
+                body_grad_norm = component_grad_norm(
+                    self.actor.body.parameters())
+                lstm_grad_norm = component_grad_norm(
+                    self.actor.lstm.parameters())
+                policy_head_grad_norm = component_grad_norm(
+                    self.actor.mu.parameters())
+                value_head_grad_norm = component_grad_norm(
+                    self.actor.value.parameters())
+                cost_head_grad_present = float(any(
+                    parameter.grad is not None
+                    for parameter in self.cost_critic.parameters()))
+                if cost_head_grad_present:
+                    raise RuntimeError(
+                        "shared cost actor backward unexpectedly wrote cost-head gradients")
             if self.actor_grad_clip and self.actor_grad_clip > 0:
                 grad_norm = nn.utils.clip_grad_norm_(
                     self.actor.parameters(), self.actor_grad_clip)
             else:
                 grad_norm = torch.zeros((), device=self.device)
             self.actor_optimizer.step()
+            if shared_cost_enabled:
+                # 下一次critic head update必须先重算actor step后的共享表示。
+                batch['_shared_cost_feature_dirty'] = True
             with torch.no_grad():
                 self.actor.log_std.clamp_(self.log_std_min, self.log_std_max)
 
@@ -2803,6 +3139,20 @@ class DQCACBetaGPU(VecAgentBase):
             'actor/w_mean': float(combined_weight.mean().item()),
             'actor/w_std': float(combined_weight.std(unbiased=False).item()),
             'actor/log_std_mean': float(self.actor.log_std.detach().mean().item()),
+            'shared_cost/enabled': float(shared_cost_enabled),
+            'shared_cost/coefficient': self.cost_shared_backbone_coef,
+            'shared_cost/cost_scale': self.cost_shared_backbone_cost_scale,
+            'shared_cost/huber_kappa': self.cost_shared_backbone_huber_kappa,
+            'shared_cost/feature_refresh_abs_mean': float(
+                batch.get('_shared_cost_feature_refresh_abs_mean', 0.0)),
+            'shared_cost/joint_body_grad_norm': float(body_grad_norm.item()),
+            'shared_cost/joint_lstm_grad_norm': float(lstm_grad_norm.item()),
+            'shared_cost/joint_policy_head_grad_norm': float(
+                policy_head_grad_norm.item()),
+            'shared_cost/joint_value_head_grad_norm': float(
+                value_head_grad_norm.item()),
+            'shared_cost/cost_head_grad_present': cost_head_grad_present,
+            **shared_cost_info,
             'advantage/mean_adv_std': float(
                 batch['_reward_advantage_raw'].std(unbiased=False).item()),
             'advantage/risk_adv_std': float(raw_adv_c.std(unbiased=False).item()),
@@ -3548,6 +3898,13 @@ class DQCACBetaGPU(VecAgentBase):
             'debug/cost_quantile_output_is_softplus': float(
                 self.cost_quantile_output == 'softplus'),
             'debug/cost_quantile_output_scale': self.cost_quantile_output_scale,
+            'debug/cost_shared_backbone_enabled': float(
+                self.cost_shared_backbone_coef > 0.0),
+            'debug/cost_shared_backbone_coef': self.cost_shared_backbone_coef,
+            'debug/cost_shared_backbone_cost_scale': (
+                self.cost_shared_backbone_cost_scale),
+            'debug/cost_shared_backbone_huber_kappa': (
+                self.cost_shared_backbone_huber_kappa),
             'debug/cost_iqn_train_quantiles': float(
                 self.cost_iqn_train_quantiles),
             'debug/cost_iqn_query_quantiles': float(
@@ -3899,6 +4256,11 @@ class DQCACBetaGPU(VecAgentBase):
                 self.num_quantiles),
             'cost_quantile_output': self.cost_quantile_output,
             'cost_quantile_output_scale': self.cost_quantile_output_scale,
+            'cost_shared_backbone_coef': self.cost_shared_backbone_coef,
+            'cost_shared_backbone_cost_scale': (
+                self.cost_shared_backbone_cost_scale),
+            'cost_shared_backbone_huber_kappa': (
+                self.cost_shared_backbone_huber_kappa),
             's0_holdout_pre': dict(self.last_s0_holdout_pre),
             's0_holdout_post': dict(self.last_s0_holdout_post),
             'cost_cdf_mode': self.cost_cdf_mode,
@@ -3937,6 +4299,22 @@ class DQCACBetaGPU(VecAgentBase):
                 self.last_actor_updates_completed),
             'actor_last_approx_kl': self.last_actor_approx_kl,
             'actor_last_clip_fraction': self.last_actor_clip_fraction,
+            'shared_cost_last_qr_loss': self.last_shared_cost_qr_loss,
+            'shared_cost_last_mean_loss': self.last_shared_cost_mean_loss,
+            'shared_cost_last_weighted_loss': (
+                self.last_shared_cost_weighted_loss),
+            'shared_cost_last_feature_refresh_abs_mean': (
+                self.last_shared_cost_feature_refresh_abs_mean),
+            'shared_cost_last_body_grad_norm': (
+                self.last_shared_cost_body_grad_norm),
+            'shared_cost_last_lstm_grad_norm': (
+                self.last_shared_cost_lstm_grad_norm),
+            'shared_cost_last_policy_head_grad_norm': (
+                self.last_shared_cost_policy_head_grad_norm),
+            'shared_cost_last_value_head_grad_norm': (
+                self.last_shared_cost_value_head_grad_norm),
+            'shared_cost_last_head_grad_present': (
+                self.last_shared_cost_head_grad_present),
             'ppo_target_kl': self.ppo_target_kl,
             'freeze_policy_updates': self.freeze_policy_updates,
             'freeze_observation_stats': self.freeze_observation_stats,

@@ -1451,3 +1451,25 @@
 - 预注册门中只有AUC≥0.55通过；末段pre、独立Brier、mean与crossing门全部失败。因此不做fresh520、不进入live、不扫描output scale；10是QCPO_refs单位，不是自由超参。exp本身数值稳定，所以也不触发“指数溢出才运行softplus”的分支，避免用一个4条smoke更差的近似机制继续消耗600k。
 - 结论：非负cost输出不是QCPO_refs稳定性的充分来源。它保留甚至略增强history排序，但无法把排序变成校准概率，还通过指数几何加重head梯度和quantile crossing。下一路线应改变representation/多任务约束，而不是继续改输出激活：优先审计QCPO_refs共享policy/reward/cost MLP+LSTM的真实梯度耦合；Weibull tail作为独立辅助路线保留，但必须明确其quantile detach后主要通过共享backbone间接起作用。
 - 统一证据位于_runs/profiles/dqc_frozen_ch5e_meananchor_exp10_600k_2026-07-17/：四候选独立与末段CSV、linear/exp完整history、decision、W&B隐私审计和2755×1557对比图。PNG已由PIL完整解码；环境view_image因系统bwrap故障不可用，不影响数值与文件完整性。
+
+### E118：C-H6 QCPO_refs式共享多任务backbone实现与工程验证（2026-07-17）
+
+- 源码审计确认QCPO_refs不是“policy LSTM旁边再放一个cost-LSTM”：其policy、reward-V、cost quantiles和Weibull头共用同一个`[observation,previous_cost]→MLP[512,512]→concat(previous_action,previous_reward)→LSTM512`表示，并在同一个PPO loss中联合反传。当前DQCAC的`actor_feature`只把rollout feature detach后交给cost head，`cost_lstm`则额外训练约2.39M参数的独立encoder；两条都没有让cost监督训练policy/reward共享表示。
+- 新增默认关闭的`cost_shared_backbone_coef`、`cost_shared_backbone_cost_scale=10`和`cost_shared_backbone_huber_kappa=1`。首轮只允许recurrent GAE-PPO、MC、uniform QR、linear output、online query、`cost_history_mode=actor_feature`和`actor_update_interval=1`，显式拒绝IQN、local grid、direct CDF、target/crossfit、独立cost-LSTM、recent-s0及冻结policy组合，保证正式差异只来自cost监督是否进入共享表示。
+- DQCAC不能照搬QCPO_refs的state-only cost head，否则`P(C≥b|history,a)`对action失去条件，risk advantage会退化。当前实现保留action-conditioned cost head；actor epoch用同一次recurrent forward取得policy、reward value和可微feature，固定cost head参数，只把QCPO_refs尺度的QR/mean辅助梯度回传到actor body/LSTM。cost head仍只属于critic Adam，actor Adam仍只拥有actor参数。
+- 共享辅助QR先把prediction和MC cost都除以10，Huber阈值独立使用QCPO_refs的1，再对transition和quantile取mean；mean项为`cost_mean_anchor_coef×0.5(mean(Q)/10-C/10)^2`。主cost critic继续使用已验证的raw-cost、`huber_kappa=.1`目标，没有因共享消融暗改head loss。可选risk-discount transition权重与主cost critic相同。
+- 每次critic head更新前用当前actor和behavior chunk入口h0/c0重算detach feature；actor step后标记dirty。actor不再变化的剩余critic epochs直接复用当前feature，因此C20/A8每rollout约做9次而不是20次额外LSTM刷新。post holdout位于observation RMS合并前，并保证查询最后一次actor step后的当前feature。
+- 默认关闭回归通过：复跑`dqc_cost_output_linear_reg_4k_20260717`同一seed305金样本，补丁前后60个checkpoint tensor leaves逐位相同，差异数0、最大绝对误差0；评估语义字段一致，只有新增summary配置、路径和墙钟字段不同。纯手算测试中共享loss与QCPO_refs式公式逐位相同，feature梯度范数`0.0026525`非零，所有cost-head参数梯度均为None。
+- 第一次共享smoke在构造期因“全局huber_kappa必须为1”的过严校验主动退出1，没有开始训练。审计发现主DQCAC正式κ为0.1，而共享辅助函数本来已经固定按参考κ=1计算；随后把共享κ改为独立显式参数并移除会暗改主critic的要求。该失败job只属工程校验，不作为算法结果。
+- B2、T32、C2/A2 tiny共享smoke正常exit0、训练8.8秒。coef0配对首epoch ratio最大误差为`5.9128e-5`，coef1为`6.0558e-5`，差仅`1.43e-6`；这是逐步LSTM采样与chunk批量重算的既有浮点基线，不是共享机制导致的off-policy概率错误。候选cost-head梯度存在标志严格为0，body/LSTM梯度非零。
+- 全尺寸`[512,512]+LSTM512`、B2×T1000×2=4k、C4/A2持久化smoke正常exit0，纯训练12.5秒；43个module tensor leaves全部有限。首epoch ratio误差`9.06e-6`、末epoch KL`3.58e-4`、clip fraction`.003`；最后共享QR/mean/weighted loss为`7.33e-6/3.50e-7/7.51e-6`，body/LSTM联合梯度范数`.1152/.02747`，cost-head梯度标志仍为0。短随机policy几乎无cost，loss数值只作链路证据，不作性能判断。
+
+### E119：C-H6L 共享backbone成对1M live预注册（2026-07-17）
+
+- 首轮直接使用压力seed1跑完整1M，不用100k/300k reward早停。共享representation、cost critic和PID都有慢变量，已有IQN与B40实验证明300k可能误杀，P-M1/C-X3也证明600k可能误判为成功；除NaN/Inf、梯度所有权断言、显存错误或明确发散外，两条都跑满1M并保留每100k checkpoint。
+- baseline与candidate共同使用P-M3的B20、T1000、C20/A8、N32、MC、risk-discount=.995、GAE-PPO、observation RMS、LSTM512、sigmoid CDF T1、经验outage PI、PID target=.15、sum normalization和beta=.995。两条都改为`cost_history_mode=actor_feature,cost_mean_anchor_coef=.5,cost_mean_anchor_cost_scale=10`；唯一变量是`cost_shared_backbone_coef=0→1`。因此它回答“在同一个action-conditioned history head上，cost监督进入共享表示是否有益”，既有P-M3 raw三seed作为外部性能语境，不充当唯一因果对照。
+- 工程门：初始rollout的reward/cost/outage与动作统计必须配对一致；候选所有checkpoint有限、cost-head actor-gradient标志恒0、共享body/LSTM梯度非零、首epoch ratio误差不高于coef0基线加`1e-3`；C20/A8正常阶段每rollout共享feature实际刷新应约为9次，而不是20次。
+- 机制门：候选最后5个rollout的prequential Brier或CDF absolute error相对baseline至少改善10%，另一项不得恶化超过10%；mean-cost error和crossing同时报告，不能用同批post loss代替跨批泛化。共享weighted loss、policy/value loss、body/LSTM/head梯度、KL与clip分phase报告，用于判断coef1是有效监督、过弱还是淹没PPO。
+- 性能门不依赖内置140条单点。两条final checkpoint都做相同动作RNG/并行布局的fresh520：候选若outage降到`≤.22`且reward`≥.75`即通过；或相对paired baseline把outage降低至少`.05`且reward下降不超过10%；若baseline本身已安全，则候选需保持`≤.22`并把reward提高至少10%。同时与P-M3 seed1的`reward/outage=.8622/.3058`透明比较。
+- 若seed1通过，原参数扩seed0/2各1M+fresh520，不回调coef；至少2/3 seed通过且聚合outage≤.2后才进入2M/5M与QCPO_refs公平终局。若coef1出现明确辅助梯度过强且KL/clip/body norm同步放大，下一条只降coef；若梯度相对PPO近乎为零且表示/CDF无变化，才升coef。不能同时改Weibull、output activation、PID或quantile grid追逐偶然点。
+- P-M3单run纯训练约6.5分钟。actor-feature baseline预计7～9分钟；共享candidate因每rollout约9次额外recurrent刷新和8次轻量cost forward，预计10～15分钟。两条并行使用40个CPU worker且显存远低于A100 80GB，预计训练墙钟12～18分钟；内置140评估后，两条fresh520预计再需约5～8分钟并行。全部通过`launch_background.sh`持久化，W&B online名称/tag只含公开算法语义，不上传绝对路径或敏感配置。
