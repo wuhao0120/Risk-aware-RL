@@ -104,6 +104,31 @@ KEY_METRICS: Tuple[str, ...] = (
     "critic/cost_mean_anchor_scale",
     "critic/cost_mean_anchor_loss",
     "critic/cost_mean_anchor_scaled_loss",
+    # QCPO_refs-style Weibull tail auxiliary. Keep per-step and C-update aggregates:
+    # the final loss alone cannot reveal early collapse, persistent clamp, or vanishing head gradients.
+    "critic/cost_weibull_loss",
+    "critic/cost_weibull_scaled_loss",
+    "critic/cost_weibull_tail_clamp_fraction",
+    "critic/cost_weibull_alpha_mean",
+    "critic/cost_weibull_alpha_min",
+    "critic/cost_weibull_alpha_max",
+    "critic/cost_weibull_beta_mean",
+    "critic/cost_weibull_log_beta_abs_max",
+    "critic/cost_weibull_head_grad_norm",
+    "critic/cost_weibull_loss_first",
+    "critic/cost_weibull_loss_mean",
+    "critic/cost_weibull_loss_last",
+    "critic/cost_weibull_tail_clamp_fraction_mean",
+    "critic/cost_weibull_tail_clamp_fraction_last",
+    "critic/cost_weibull_head_grad_norm_mean",
+    "critic/cost_weibull_head_grad_norm_max",
+    "critic/cost_weibull_head_grad_norm_last",
+    "debug/cost_weibull_enabled",
+    "debug/cost_weibull_tail_coef",
+    "debug/cost_weibull_tail_prob",
+    "debug/cost_weibull_tail_index",
+    "debug/cost_weibull_cost_scale",
+    "debug/cost_weibull_epsilon",
     "critic/cost_target_mean",
     "critic/cost_target_is_mc",
     "critic/cost_objective_loss",
@@ -302,6 +327,15 @@ PLOT_PANELS: Tuple[Tuple[str, Tuple[str, ...], bool], ...] = (
     ("actor weight scale", ("actor/w_std",), True),
     ("reward critic", ("critic/reward_qr_loss", "ref/r_value_loss"), True),
     ("cost critic", ("critic/cost_qr_loss", "critic/cost_s0_aux_loss"), True),
+    # Weibull is an optional critic-internal regularizer. Separate its fit quality
+    # from clamp/gradient health so different numerical scales remain readable.
+    ("Weibull tail loss", (
+        "critic/cost_weibull_loss_first",
+        "critic/cost_weibull_loss_mean",
+        "critic/cost_weibull_loss_last"), True),
+    ("Weibull tail health", (
+        "critic/cost_weibull_tail_clamp_fraction_mean",
+        "critic/cost_weibull_head_grad_norm_mean"), True),
     ("s0 holdout probability", (
         "critic/s0_holdout_pre_cdf",
         "critic/s0_holdout_pre_qr_cdf",
