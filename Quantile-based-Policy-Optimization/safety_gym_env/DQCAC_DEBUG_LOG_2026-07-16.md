@@ -1012,3 +1012,12 @@
 - 按预注册规则，不做 fresh520，不启动 uniform-IQN live 1M，也不扫 `Ntrain/Nquery/cosines`。定级为：`IQN 在足量固定策略数据下可能带来约 16%～19% 的校准收益，但当前非单调输出和收益幅度不足以证明值得进入非平稳 actor–PID 闭环`。
 - 最重要的算法含义不只是 IQN 输赢：当前 live B20 每 20 条轨迹就改变一次 policy，而固定 policy 的 critic 需要数百条轨迹才接近校准；更多同批 gradient steps不能制造新的独立 tail trajectory。下一优先验证应增加每个 policy 版本的独立轨迹数或减慢 actor 更新频率，首选固定 1M 总步的 `B20→B40`，而不是继续增加同一批 critic epoch。
 - 正式 history/图/表位于 `_runs/wandb_export/dqc_frozen_qr32_vs_iqn32q128_600k_lenaudit_2026-07-17/` 与 `_runs/profiles/dqc_frozen_qr32_vs_iqn32q128_600k_lenaudit_2026-07-17/`；端点图 `length_audit_endpoint_comparison.png` 为 `2356×748`，PIL 解码验证通过。
+
+### E74：P-M6 B40 长预算预注册——增加每个 policy 版本的独立轨迹（2026-07-17）
+
+- 以 P-M3 seed1 为压力基线，只把 `num_envs=20→40`、`num_iterations=50→25`，总环境步与总完整轨迹仍严格为 `1M/1000`。网络、QR-N32、20次critic update、8次PPO epoch、actor LR、PID、T1 smooth CDF、cost time weighting与所有seed均不变。
+- B40每次policy更新有40条独立初始状态轨迹，outage=.2时预期tail事件由4增至8；policy/dual更新次数由50降至25。每次batch翻倍但update次数减半，固定1M下actor与critic看到的总transition-pass不增加，检验的是更低batch方差、更慢policy漂移和更多同版本tail样本。
+- `pid_reference_episodes=10`保持不变。代码按episode_scale和几何leak缩放，因此常值error下一次B40积分更新严格等价于两次B20，不会因batch变大暗改每episode的I增益；`pid_window_episodes=50`仍是同样的50条轨迹窗口。
+- 不用300k早停。P-M1/C-X1已证明慢变量可在100k～600k改变方向，P-M6除NaN/OOM/确定性错误外完整跑1M，并每5个iteration（200k）保存phase checkpoint。内置160条只作screen；通过才做统一`num_envs=20`的fresh520。
+- 压力seed1 fresh520门：相对P-M3的`reward/outage=0.8622/0.3058`，候选需outage `≤0.22`且至少下降`.08`，reward `≥0.75`；同时末200k不出现更大lambda/outage周期。通过才原配置扩seed0/2，否则停止B40，不扫B30/B50/B60。
+- A100 80GB对B20只占少量显存，B40+N32预计安全；单条独占训练预计`7～9min`，内置160约1min，若晋级fresh520约5min。全程由`launch_background.sh`持久化，输出写入`/vepfs`。
