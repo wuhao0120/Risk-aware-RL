@@ -1795,3 +1795,11 @@ QCPO_refs不是只做quantile regression。它额外用`0.5 × 0.5(mean(c_dist)-
 这个错误不是等到600k后用坏结果解释出来的。在线run到320k时，anchor缩放后约793、QR约76且全部update撞clip，正好符合理论上的10倍失真；行为truth仍与基线逐值相同。实验立即停止并标为无效工程run，不把它用于算法结论，也不浪费剩余预算。
 
 修正后参数同时记录source cost scale与effective scale。default-off的60个checkpoint tensor、eval和共享summary再次完全一致；enabled smoke确认effective scale为1.6且梯度真正改变cost网络。正式C-H4M将从头重跑，除源代码规定的cost-unit补偿外不改变任何预注册配置或通过门。
+
+### 13.99 mean anchor修复分布位置，但没有修复条件概率（2026-07-17）
+
+corrected C-H4M2完整跑满600k。最清楚的正结果是独立mean-cost：raw、无anchor cost-LSTM、mean-anchor的绝对误差分别为0.776、1.173、0.034。97%左右的改善说明QCPO_refs额外监督分布均值是有效组件，也验证了cost单位和loss尺度换算。
+
+但actor真正依赖的是逐状态、逐action的超限概率，不只是总体均值。mean-anchor的独立hard Brier为0.258，比raw的0.203差27%；AUC为0.561，虽比raw高0.042并保留history信号，却低于无anchor的0.590。crossing从无anchor的0.268降到0.199，仍远高于raw的0.057。更严重的是末5批更新前Brier为0.332，比raw恶化43%，而同批更新后能降到0.083；这仍是明显的当前批拟合、下一批失真。
+
+所以mean anchor可以保留为后续复合候选的基础组件，但当前单组件不能进入live闭环，也没有理由扫描0.1/0.25/1.0系数。下一步继续按QCPO_refs拆组件：先单独验证非负cost quantiles；若只能减少负值而不能改善Brier/AUC，则转Weibull tail或共享多任务history。exp是源实现路线，softplus是更稳定但不完全同构的分歧路线，两者应先做轻量数值/梯度验证再选择一个正式单变量，不能同时当作同一实验。

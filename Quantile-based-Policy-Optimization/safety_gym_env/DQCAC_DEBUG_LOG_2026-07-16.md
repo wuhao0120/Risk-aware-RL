@@ -1417,3 +1417,13 @@
 - 第一条正式run `tk2m896n`按旧scale16运行到16批/320k时被中途审计识别为失真：末5批mean-anchor原始loss均值49.59，乘16后约793.37，而QR均值75.93，anchor约强10.45倍；20/20次update裁剪率为100%，crossing约0.275。13个behavior/truth控制字段与C-H1W前16批仍逐值exact，说明不是轨迹漂移。该run随即向训练子进程发送SIGTERM，launcher记录exit143；它被标记为无效尺度工程run，不进入模型比较，也不补剩余280k。
 - 新增`cost_mean_anchor_cost_scale`，默认10且必须为正；W&B/summary显式记录configured coefficient、cost unit scale和effective scale。默认关闭的修正前后回归仍有60个tensor leaves逐位exact、eval差异0、共享summary差异0；唯一新summary键是cost scale。corrected enabled smoke得到coef=.5/S=10/effective=1.6，40个cost/history tensor非零变化且全部有限。
 - C-H4M的其他预注册条件与门槛不变，但正式单变量现在明确定义为`cost_mean_anchor_coef=.5,cost_mean_anchor_cost_scale=10`。这不是事后调参：10来自QCPO_refs源代码的固定单位换算，1.6由归约和单位解析推导，不由320k效果选择。重跑仍从头使用seed101和同一成熟冻结policy，不能从失真run续训。
+
+### E115：C-H4M2 600k结果——mean校准几乎修复，但条件风险仍不过门（2026-07-17）
+
+- corrected正式run绑定提交`adaac26`，W&B `w7n417ze`、30批/600k完整、exit0，纯训练282.8秒；effective anchor scale始终1.6，anchor/QR比例全程均值0.716、末5批0.674，已回到同量级。远端状态finished、30行history、119个公开config键；无敏感键或绝对路径值，只同步3个标准文件，隐私审计通过。
+- 公平性控制严格通过：与raw和无anchor cost-LSTM的env step、iteration、trajectory、四项reward、经验outage、两种cost mean、两种action统计、三个budget统计及reward quantile共16列逐元素exact，所有最大差为0；独立140条reward/outage也同为0.865756/0.257143。
+- mean anchor直接目标取得了巨大收益。独立predicted/truth mean cost为11.7227/11.7571，绝对误差0.03444；raw为0.77573、无anchor cost-LSTM为1.17272，因此分别改善95.56%和97.06%。这证明QCPO_refs的mean MSE不是装饰，确实能修复distribution整体位置。
+- 但末5批prequential全面失败。raw→anchor的pre-CDF error为0.10656→0.15844，恶化48.68%；pre-Brier 0.23253→0.33247，恶化42.98%；聚合mean bias绝对值0.18675→1.80078。post-Brier仍能到0.08312，明显好于raw的0.20023，却差于无anchor LSTM的0.05465；同批拟合好、下一批失真的核心问题没有解决。
+- 独立140条上，hard CDF absolute error为0.01585，略差于raw 0.01071、但比无anchor LSTM 0.06942改善77.17%。hard Brier为0.25822，相对raw恶化27.32%，相对无anchor只改善9.83%，未过20%机制门；hard AUC 0.56143相对raw增加0.04167，保留了超过一半history排序增益。crossing 0.19885虽比无anchor 0.26751下降25.67%，仍远高于≤0.10门和raw 0.05737。
+- 因此主门、独立门、机制门全部失败，不做fresh520、不进入live、不扫描anchor系数。结论不是“mean anchor无用”，而是它主要校准无条件一阶矩，无法单独约束逐状态概率、quantile形状和跨rollout泛化。QCPO_refs的稳定性更可能来自mean、非负输出、Weibull tail与共享多任务history的组合。
+- 正式证据包位于`_runs/profiles/dqc_frozen_ch4m2_meananchor05_scale10_600k_2026-07-17/`，包含独立/末段CSV、完整history、decision、W&B隐私审计和2682×1507对比图；PNG可由PIL完整解码。下一单变量优先审计并移植QCPO_refs的`c_dist=exp(linear)`非负输出；softplus稳定替代、Weibull tail和共享backbone作为分歧路线分别记录，不能与首轮正输出混改。
