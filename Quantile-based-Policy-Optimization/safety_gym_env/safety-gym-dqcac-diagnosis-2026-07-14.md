@@ -1463,3 +1463,16 @@ B40也没有解决最关键的critic偏差。fresh520的hard-CDF预测只有0.08
 因此不扩B40多seed，也不继续扫B。下一条单变量应直接针对用户真正需要的查询量：训练action-conditioned exceedance/CDF head，输入state、action和remaining budget，用MC remaining cost产生二元标签，直接最小化校准BCE/Brier，而不是先回归32个quantile再数阈值。distributional QR仍保留用于mean/quantile诊断，首个冻结600k实验只比较CDF head与QR的跨批/独立初始状态误差；不过门就不进入actor/PID。这个设计也自然消除IQN的quantile crossing问题。
 
 完整B20/B40曲线、phase CSV、fresh520比较表、区间JSON和图位于`_runs/wandb_export/dqc_pm3_b20_vs_pm6_b40_seed1_1m_2026-07-17/`与`_runs/profiles/dqc_pm3_b20_vs_pm6_b40_seed1_1m_2026-07-17/`。
+
+
+### 13.63 对训练过短质疑的正式修正：1M是筛查预算，5M才是最终对齐预算（2026-07-17）
+
+这个质疑成立，但要区分“验证代码/机制”和“宣布算法最终好坏”。当前B20每100k只有5个policy版本，300k只有15个；B40即使跑1M也只有25次policy/PID更新。QCPO_refs的正式配置是5M环境步，因此100k/300k结果只能说明早期样本效率或机制方向，1M只能作为压力seed筛查；它们都不是论文级最终排序。
+
+数据已经证明早停会双向误判。固定策略下，IQN在300k时比QR差，到600k时独立CDF和mean-cost误差反而小16.1%和19.4%；B40在前300k几乎不涨，到1M末段已追上B20。相反，C-X3在300--600k看似以很小reward代价换来安全改善，到1M后段reward和闭环周期明显恶化。训练更长不是必然更好，但只有足够长才能看到critic收敛时间和actor--PID慢周期。
+
+因此旧实验按证据强度重新解释。确定性bug、错误importance ratio、错误RMS更新、NaN/OOM、标签或梯度错误可以用短跑裁决；C-X3完整1M的32% reward损失和uniform-IQN持续约0.18的crossing差足以阻止当前版本晋级。另一方面，300k的MLP/LSTM排序、100k--300k的N32/N64和局部tau、早期PID参数以及B40的渐近收益都不是“永久失败”，只是没有证明更好的早期样本效率。
+
+后续采用多保真但不草率的预算：smoke只检查全链路；300k只做机制门；冻结critic至少600k，若末五批相对前五批的关键误差仍改善超过10%则延到1.2M；live候选完整1M并做fresh520，仍接近门或末段继续改善者扩2M。最终DQCAC、QCPO和QCPO_refs必须在相同5M步、至少3 seeds、统一独立评估下比较。单seed差异不足约20%或区间跨0时不再下最终结论；使用配对随机数和多初始化区分算法效应与初始化偶然性。
+
+这不意味着把全部旧组合都重跑5M。优先验证直接query-point exceedance/CDF head（冻结600k，必要时1.2M）；若通过再进入live 1M。网络公平性方面，DQCAC最佳MLP与LSTM最终各需完整1M筛查。若QR仍承担actor的CDF查询，再补N32/N64或局部tau的600k严格配对；B40保留为可与有效CDF表示组合的减振组件，不立即扫描更多batch size。论文最终候选才消耗5M多seed预算。

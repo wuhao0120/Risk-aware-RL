@@ -1039,3 +1039,15 @@
 - 预注册裁决：reward门通过，但outage既未到`≤0.22`、也未下降`.08`；不扩seed0/2，不扫B30/B50/B60。B40定级为“降低更新方差、略提高reward并略降风险，但不足以成为主配置”。
 - 下一路线不再单纯增大B或重复同批QR epoch。优先实现直接查询点exceedance/CDF critic：用MC remaining-cost与remaining-budget的二元标签直接拟合`P(C_remaining≥budget|s,a)`，先在固定policy 600k配对校准；只有跨状态CDF泛化显著优于QR，才进入live闭环。
 - 正式history/profile在`_runs/wandb_export/dqc_pm3_b20_vs_pm6_b40_seed1_1m_2026-07-17/`与`_runs/profiles/dqc_pm3_b20_vs_pm6_b40_seed1_1m_2026-07-17/`；后者含phase/eval CSV、置信区间JSON和`1872×1277`的fresh520比较图。
+
+
+### E77：训练长度重新分级——短跑只筛机制，不能裁决最终性能（2026-07-17）
+
+- 用户质疑“当前训练是否普遍太短”。结论是：**对工程正确性和明显机制失效，现有短跑够用；对网络结构、慢critic、PID闭环和最终算法性能，100k/300k明显不够，1M也只是压力筛查而非论文级终局**。QCPO_refs正式配置为`runner.n_steps=5e6`；因此目前任何1M结果都不能支持“DQCAC最终优于/劣于QCPO_refs”的论文结论。
+- 以当前`B20,T1000`计，100k/300k/600k/1M分别只有5/15/30/50个policy版本；B40的1M更只有25次policy/PID更新。LSTM、IQN、更大batch或更慢actor更新在相同env steps下天然启动更慢，不能只看300k reward点估计判死。
+- 已经观察到双向反例。冻结critic的IQN在300k比QR更差，到600k反而在独立CDF/mean error上好约16.1%/19.4%；B40在0--300k reward仅0.0237，到末200k追到0.8034且fresh520 reward超过B20。反方向上，C-X3在300--600k reward几乎持平且更安全，到1M末200k reward却降至0.6130；600k停掉会产生false positive。故“前半段不好就停”和“中段好就晋级”都不可靠。
+- 既有结论重新定级：确定性代码bug、NaN/OOM、错误梯度/错误标签等仍可短跑裁决；C-X3的1M大幅reward代价和IQN持续crossing足以阻止当前版本晋级，但只表示“当前预算/当前实现不过门”，不等于它们在无限训练下绝无改善。`MLP vs LSTM`的300k、`N32 vs N64/局部tau`的100k--300k、早期PID组合和B40的渐近性能均改标为“早期样本效率证据”，不能作为最终排序。
+- 新分层协议：smoke只验证全链路；300k只看机制方向和是否值得投入，不以reward单独判败；冻结policy critic至少600k，并比较最后5批与此前5批，若关键误差仍改善超过10%则预注册延到1.2M；live actor--critic--PID候选至少完整1M、每200k看phase、最终fresh520，除数值/确定性机制错误外不早停；1M仍趋势上升或结果接近门槛者扩到2M。最终入论文的DQCAC/QCPO/QCPO_refs按相同5M预算、至少3 seeds和统一独立评估比较。
+- 随机初始化处理：单seed中小差异不再定论。共享actor的critic消融继续使用common-random-number配对；差异小于约20%或置信区间跨0时至少补3个初始化/seed。只有效应巨大、方向在多个phase一致且直接机制指标也恶化，才允许单压力seed停止。
+- 复验优先级不是把所有旧组合全部5M重跑。先做直接query-point CDF head的冻结600k--1.2M门；通过后做live 1M。与此同时，最终网络公平性需要把DQCAC的MLP/LSTM最佳配置各跑完整1M；N64/局部tau只有在QR仍是主CDF表示时再做严格配对600k。B40保留为可与有效CDF head组合的减振组件，不因单独1M不过安全门永久删除，也不立即盲扫B30/B50/B60。
+- 本条记录时没有活动训练进程；下一条正式实验仍只通过`launch_background.sh`持久化启动，预计时长在启动前记录，输出继续写入`/vepfs-mlp2/c20250510/251204033/`。
