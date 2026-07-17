@@ -2021,3 +2021,19 @@ C-H8的单seed fresh512为reward 0.745、outage 0.215，是现有DQCAC中最接�
 因为B40在1M时只有25次策略和控制事件，直接宣布配置无效仍可能混入欠训练。下一条从头运行同一seed1到2M，只把iteration从25改成50；前1M必须逐点复现当前run，才能把后续变化归因于长度。它不是尝试用更长预算掩盖失败：fresh512仍要求outage位于[0.18,0.22]且reward不低于1M的0.8195，末段周期不能放大；失败后不跑3M。
 
 这项长度审计与算法改进路线分开。如果50次事件仍形成极限环，就不再扫描固定PID target或quantile结构。更直接的下一步是给actor增加真实轨迹二元outage的on-policy policy-gradient校正，让风险方向不完全依赖AUC约0.55--0.59的action-conditioned critic；distributional critic继续提供局部低方差信息。该混合估计需要先验证符号、尺度、leave-one-out基线、trajectory长度归一化和PPO ratio，不能直接把QCPO轨迹loss未经校准地叠加。window100或更小Kp/Ki保留为控制消融，因为它们能减振和移动工作点，却没有证据改善条件风险排序。
+
+### 13.124 2M改善了终点位置，没有消除闭环极限环（2026-07-17）
+
+长度因果性得到严格证明：2M run的前1M有25行、313个数值指标与原1M完全相同，800k和1M checkpoint的全部44个tensor叶子及32个runtime也逐项相同。新增1M把训练reward均值从0.440提高到0.901，却也把outage均值从0.137推到0.246；最后400k的outage均值为0.270，批间平均跳变0.092。
+
+fresh512终点比训练末段好：1M→2M的reward为`0.8195→0.7954`，outage为`0.2500→0.2129`。两项差的95%区间都跨0，2M outage点估计进入目标带，但reward没有达到预注册的不下降门。更重要的是1.0M以后反复出现0.075到0.325的跨带摆动，所以这个终点不能证明控制器已稳定收敛。严格裁决是不跑3M、不扩seed，同时保留“更多更新有时能移动到更合理工作点”的事实。
+
+critic也没有全面变好。AUC从0.551升到0.593、CDF误差下降约33%，但Brier Skill仍为负，mean cost误差恶化约45%，预测偏差从低估翻成高估。总体概率或单个终点改善仍不足以保证actor收到可靠的动作间风险方向。
+
+### 13.125 用真实trajectory residual校正有偏action-risk，而不是抛弃distributional critic（2026-07-17）
+
+下一候选采用控制变量形式。当前advantage为`p_hat(s,a)-V_hat(s)`；加入系数eta后的形式为`p_hat-V_hat+eta(I-p_hat)`。eta等于0严格恢复当前DQCAC，eta等于1得到`I-V_hat`：实际动作的有偏critic预测被真实二元outage标签替换，而critic仍作为action-independent状态基线降低方差。中间eta提供明确的偏差--方差插值，不是再给lambda随意乘一个gain。
+
+完整轨迹标签沿时间广播是有依据的：remaining-budget递推使`C_total>=d`与任一时刻`C_remaining>=b_t`等价。仍保留beta时间权重，所以这是DQCACBeta的真实标签校正，而不是声称完全恢复未折扣QCPO梯度。PPO中old log-prob继续固定为采样策略，reward与risk分别做min/max clip；多epoch后不覆盖分母。
+
+工程关键是尺度。critic action advantage的EMA标准差约0.004，而二元residual自然标准差约0.4；若仍除以前者会把风险梯度放大约100倍。因此constraint RMS必须跟随混合后的实际advantage更新，并以eta0逐tensor回归证明默认路径不变。首条正式实验只用eta=1检验“真实方向是否解决跨seed分叉”；若方向正确但过保守，再把eta=.25/.5作为预先记录的消融，而不是扫描PID和eta寻找漂亮终点。

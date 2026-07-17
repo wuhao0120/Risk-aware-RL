@@ -1704,3 +1704,19 @@
 - 2M的前1M理论上应与当前seed1逐点复现。先比较25条history以及1M pre-update checkpoint的六个module、lambda和公共runtime；若不一致，后1M不能被解释为纯长度效应。纯训练预计13--16分钟，内部128约1--2分钟；除NaN/OOM/确定性错误外跑满，任务继续使用持久化后台和脱敏W&B online。
 - 内部评估仅作节省明显失败评估的宽screen：reward至少`.60`、outage在`.05--.40`且所有关键量有限，才花约3--4分钟做fresh512。正式晋级要求fresh512 outage落入[.18,.22]、reward至少不低于seed1 1M的`.81951`，且末段outage振幅和critic Brier/AUC不能明显恶化。失败则停止原样3M，不用选择某个漂亮训练窗口改写结论。
 - 若2M通过，再扩seed0/2并进入同预算QCPO/QCPO_refs比较；若失败，下一算法路线不是继续压低PID target，而是给DQCAC actor加入默认关闭的真实轨迹outage policy-gradient校正。该校正用on-policy二元违约标签提供无偏风险方向，distributional critic保留为低方差局部项/基线；先做梯度尺度、leave-one-out baseline与PPO-Clip机制验证，再决定live 1M。PID window100/降低Kp-Ki保留为控制消融，但已有P-M10表明它主要沿reward--risk前沿移动工作点，不能单独修复AUC接近随机的问题。
+
+### E144：B40–2M长度审计——终点回到目标带，但更多更新没有形成稳态（2026-07-17）
+
+- 正式持久化job绑定提交`c307fff`，W&B run `yfxjglt0`、exit0；B40×50共2M、50次Actor/PID事件，纯训练`803.2s`。前1M与原1M run的25行、313个共同数值metric逐项exact；800k和1M pre-update checkpoint各44个tensor leaves、32个runtime与5个rollout metric也exact，最大差0。
+- 第二个1M的训练均值相对第一个1M为reward `.43962→.90098`、outage `.137→.246`、lambda `.0652→.2786`。末400k reward/outage/lambda为`.94349/.270/.36411`，outage标准差`.05986`、相邻批平均绝对跳变`.09167`；末200k仍为`.83649/.265`。长度提高reward，但没有把真实风险稳定在0.20。
+- 内置128为reward/outage `.8816/.2578`，critic CDF `.2979`；按宽screen执行fresh512。统一fresh512的1M→2M为reward `.81951→.79542`，差`-.02408`、Welch95 `[-.09223,+.04406]`；outage `128/512=.25→109/512=.21289`，差`-.03711`、Newcombe95 `[-.08857,+.01458]`。2M点估计进入[.18,.22]，Wilson95为`[.17964,.25042]`，但reward低于预注册`.81951`门，因此不扩seed、不跑3M。
+- critic变化是混合的：hard CDF error改善32.6%，Brier改善9.96%、AUC `.5510→.5928`、crossing下降`.0376`；但Brier Skill `-.0587→-.0667`仍为负且更差，mean-cost error `3.457→5.002`恶化44.7%，预测从低估翻为高估。终点更安全不能解释为distributional critic全面变准。
+- 结论不是“更久完全没用”，而是“1M欠更新不是主要瓶颈”。2M得到一个更接近目标的终点，却发生多轮`.075↔.325`跨带摆动；最后400k训练均值仍明显不安全。按预注册规则停止原样延长，转向risk-credit校正。
+- 证据位于`_runs/wandb_export/dqc_ch8b40_seed1_1m_vs_2m_2026-07-17/`和`_runs/profiles/dqc_ch8b40_seed1_1m_vs_2m_2026-07-17/`；两条公开config共274个值，无敏感键或绝对路径。common1m/full2m/fresh512三张PNG均通过PIL解码。
+
+### E145：真实轨迹outage residual校正预注册（2026-07-17）
+
+- 当前risk advantage是`Acritic=p_hat(s,a)-V_hat(s)`，低方差但其方向受fresh AUC约.55--.59限制。新增默认关闭系数`cost_actor_mc_correction_coef=eta∈[0,1]`，定义`Aeta=Acritic+eta*(I_outage-p_hat)= (1-eta)Acritic+eta*(I_outage-V_hat)`。
+- `I_outage`由每条完整on-policy trajectory的`disc_cost>=limit`产生并沿时间广播。budget递推保证同一标签等价于每时刻“remaining cost是否超过remaining budget”。`V_hat`仍由behavior policy下K个独立动作的CDF均值给出，是action-independent control variate；即使不准也不改变score-function期望。eta=1时实际动作的critic预测完全抵消，只保留真实标签方向和critic状态基线。
+- DQCACBeta的`beta^t`时间权重、PPO old log-prob、每epoch重算ratio、reward min/risk max clip、sum normalization与经验PID全部不变。constraint RMS必须改为跟踪真正使用的`Aeta`，否则真实0/1 residual会被旧critic约`.004`的尺度放大；eta=0必须逐tensor exact保持当前路径。
+- 实现先通过解析代数/符号测试、eta0金样本回归、mixed-outage PPO梯度方向、recurrent B40×T1000 smoke和checkpoint恢复。首条live只测试eta=1、seed1、C-H8 B40 1M，预计训练7--9分钟、fresh512约3--4分钟；正式门为outage落入[.18,.22]且reward至少`.82`，并要求末段振荡不放大。eta=.25/.5作为偏差--方差消融保留，只有eta1方向正确但明显过强时才依次轻量验证，不能事后无界扫描。
