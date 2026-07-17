@@ -974,6 +974,10 @@ class DQCACBetaGPU(VecAgentBase):
 
             # ===== 2. 内层更新 (双 critic + actor) =====
             critic_info, actor_info = {}, {}
+            # update_critic返回的是“本次”optimizer step的统计；过去这里每轮覆盖，
+            # 因而日志中的grad_clip_fraction只代表最后一次更新，而不是全部更新的比例。
+            # 保存Python标量不会保留计算图、消耗随机数或改变任一optimizer状态。
+            critic_update_diagnostics = []
             actor_updated = False
             actor_updates_completed = 0
             actor_early_stopped = False
@@ -1015,11 +1019,53 @@ class DQCACBetaGPU(VecAgentBase):
                 # value每个epoch拟合同一批冻结λ-return，actor复用冻结advantage。
                 if self.reward_actor_mode != 'distributional' and not self.recurrent_policy:
                     critic_info.update(self.update_reward_value(batch))
+                critic_update_diagnostics.append({
+                    'cost_grad_norm': float(critic_info['critic/cost_grad_norm']),
+                    'joint_grad_norm': float(critic_info['critic/joint_grad_norm']),
+                    'reward_grad_norm': float(critic_info['critic/reward_grad_norm']),
+                    'grad_clipped': float(critic_info['critic/grad_clip_fraction']),
+                    'cost_qr_loss': float(critic_info['critic/cost_qr_loss']),
+                })
                 if actor_epoch_allowed and not actor_before_critic:
                     apply_actor_epoch()
                 if self.learning_steps % self.target_update_interval == 0:
                     self._soft_update_target()
                 self.learning_steps += 1
+
+            # 同一rollout被重复拟合时，first→last轨迹比单独记录最后一次更能识别
+            # “当前batch loss下降，但跨rollout泛化变差”的重复更新过拟合。保留原有
+            # critic/grad_clip_fraction的末次语义，新增字段才是全部update的真比例。
+            if critic_update_diagnostics:
+                diagnostic_sequences = {
+                    key: np.asarray(
+                        [item[key] for item in critic_update_diagnostics],
+                        dtype=np.float64)
+                    for key in ('cost_grad_norm', 'joint_grad_norm',
+                                'reward_grad_norm', 'grad_clipped',
+                                'cost_qr_loss')
+                }
+                cost_grad = diagnostic_sequences['cost_grad_norm']
+                joint_grad = diagnostic_sequences['joint_grad_norm']
+                reward_grad = diagnostic_sequences['reward_grad_norm']
+                cost_loss = diagnostic_sequences['cost_qr_loss']
+                critic_info.update({
+                    'critic/update_count': float(len(critic_update_diagnostics)),
+                    'critic/update_grad_clip_fraction': float(
+                        diagnostic_sequences['grad_clipped'].mean()),
+                    'critic/cost_grad_norm_first': float(cost_grad[0]),
+                    'critic/cost_grad_norm_mean': float(cost_grad.mean()),
+                    'critic/cost_grad_norm_max': float(cost_grad.max()),
+                    'critic/cost_grad_norm_last': float(cost_grad[-1]),
+                    'critic/joint_grad_norm_first': float(joint_grad[0]),
+                    'critic/joint_grad_norm_mean': float(joint_grad.mean()),
+                    'critic/joint_grad_norm_max': float(joint_grad.max()),
+                    'critic/joint_grad_norm_last': float(joint_grad[-1]),
+                    'critic/reward_grad_norm_mean': float(reward_grad.mean()),
+                    'critic/cost_qr_loss_first': float(cost_loss[0]),
+                    'critic/cost_qr_loss_mean': float(cost_loss.mean()),
+                    'critic/cost_qr_loss_min': float(cost_loss.min()),
+                    'critic/cost_qr_loss_last': float(cost_loss[-1]),
+                })
 
             if self.cost_actor_query_mode == 'preupdate':
                 # actor缓存发生在首个critic step之前；这里用同一实际动作和budget

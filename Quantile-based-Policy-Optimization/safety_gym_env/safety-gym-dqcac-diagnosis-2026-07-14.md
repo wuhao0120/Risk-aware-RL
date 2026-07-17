@@ -1723,3 +1723,15 @@ C-H1W完成600k且行为truth与raw对照30批逐元素完全相同。这个控�
 优化健康度给出了直接线索：cost-LSTM末5批每一次critic过程都发生梯度裁剪，raw只有20%；crossing约为raw的5.6倍。当前20次update重复使用同一个B20，对容量更大的LSTM相当于在低独立样本数下做强优化。延长到1.2M不会增加每个policy版本的独立样本，且候选Brier在末5批相对前5批还恶化31.8%，所以“继续跑就会好”没有证据。
 
 因此不做fresh520、不进入live，也不立刻宣布LSTM路线失败。下一步先审计recurrent输入尺度、TBPTT边界、参数量、pre-clip gradient和有效学习率；若接线正确，优先解决独立样本与更新强度失配。可分开验证的路线是：降低recurrent critic学习率、使用跨rollout replay/held-out early stop、或增加num_envs而保持update预算。三者因果不同，必须作为独立消融，不能一次混合。当前证据尤其反对用同批post loss或post Brier做模型选择，因为它会系统性偏爱过拟合的LSTM。
+
+### 13.88 旧的clip fraction只记录最后一次update，现已补齐全过程（2026-07-17）
+
+`update_critic()`每次返回一组统计，但20次循环一直覆盖同一个字典。因此旧`critic/grad_clip_fraction`只表示最后一次optimizer step是否超过阈值，不是“20次中有多少次裁剪”。这不推翻C-H1W最后一步长期撞clip的事实，却意味着旧日志不能回答梯度是在前几步爆发后消退，还是20步持续过大。
+
+现在每个rollout额外记录全部update的真实裁剪率、cost/joint gradient的first/mean/max/last，以及cost QR loss的first/mean/min/last。实现只聚合既有标量。补丁前后同seed短回归的全部checkpoint tensor逐元素一致，独立评估一致，所以新日志不改变训练。算法层面也要区分：actor重复更新会让数据相对新policy变成off-policy，因此必须保存rollout时的old log-prob并使用importance ratio/PPO clip；critic对同一固定target重复监督不需要policy IS，但会过拟合有限B20，这正是当前要测的机制。
+
+### 13.89 先复用冻结policy hidden，再决定是否训练独立cost-LSTM（2026-07-17）
+
+C-H1W已经证明history有信息：独立评估AUC约从0.52升到0.59；它也证明当前实现不能泛化：Brier、mean误差和crossing全面恶化。独立cost-LSTM的可训练cost路径约2.60M参数，是raw路径的30倍，在同一B20上做20次更新，很容易得到漂亮的同批post指标却损害下一批。
+
+下一条C-H0.5W复用成熟actor真正采用的固定LSTM feature，cost head仍显式输入action。这样既保留QCPO_refs共享history backbone的关键条件信息，又去掉约2.39M个会在B20上快速记忆的独立encoder参数。正式冻结600k只改变`cost_history_mode=actor_feature`，以prequential和独立Brier/AUC为门，不用post loss选模型。通过才做live；失败后优先单独比较独立cost-LSTM的C20与C5，再考虑跨rollout replay或增加num_envs。

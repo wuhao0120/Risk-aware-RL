@@ -1315,3 +1315,19 @@
 - E100的history门、hard/smooth独立联合门、mean error门、crossing门及持续改善门全部失败。严格裁决为：不做fresh520、不跑1.2M、不进入live PID，也不盲扫hidden/TBPTT/LR。旧C-H1的“history无用”结论需修正为：history可能补充policy hidden信息，但现有`B20×20 update`的recurrent优化无法泛化。
 - 下一步先做零训练开销工程审计：比较raw/LSTM的pre-clip grad norm、loss、参数量、TBPTT状态边界和输入尺度。若没有接线bug，再从三条分歧路线中各做单变量轻量验证：①降低recurrent critic LR/控制有效步长；②用跨rollout replay或留出批做early-stop，直接约束prequential泛化；③增加独立trajectory数而不增加同批update。不能直接把cost-LSTM装进live网络，也不能用同批post-Brier选择checkpoint。
 - 正式表、机械门和图位于`_runs/profiles/dqc_frozen_raw_vs_ch1w_costlstm_600k_2026-07-17/`：`gate_summary.csv`、`gate_decision.json`、`paired_history.csv`、`history_generalization.png`及独立评估比较图；完整W&B导出位于`_runs/wandb_export/dqc_frozen_ch1w_costlstm_qr32_600k_2026-07-17/`。
+
+### E103：20次critic更新诊断修正与零行为影响回归（2026-07-17）
+
+- 代码审计发现旧`critic/grad_clip_fraction`并不是一次rollout内全部critic update的裁剪比例：`critic_info`在循环中被覆盖，所以该字段只代表最后一次update。此前“cost-LSTM末5批每次都裁剪”仍成立，因为末次均为1；但raw的20%只能解释为“5个rollout中有1个末次被裁剪”，不能解释成20次内部update的真实比例。
+- 现在保留旧字段语义以兼容历史，并新增每个rollout的`update_count`、全update真实裁剪率、cost/joint gradient norm的first/mean/max/last、reward gradient mean，以及cost QR loss的first/mean/min/last。新增逻辑只复制已经计算出的Python标量，不增加forward/backward、不访问RNG、不改变optimizer或scheduler。
+- 补丁前后使用同一P-M3策略、seed303、B2、2批、每批3次critic update做持久化严格回归。两个final checkpoint的全部tensor逐元素相同，tensor差异数为0；除checkpoint目录外所有非tensor状态相同；独立4条评估的全部语义指标相同。补丁后job正常exit 0，证明这是纯诊断改动。
+- 该诊断直接回答用户提出的“10/20次更新是否关键”：actor的多次更新确实需要旧策略log-prob和PPO ratio修正；critic反复使用同批数据不产生策略off-policy ratio问题，但会产生统计过拟合。新字段用于区分“首步梯度很大后快速收敛”与“20步始终撞clip”，不再用最后一次冒充全过程。
+
+### E104：C-H0.5W固定actor历史特征600k预注册（2026-07-17）
+
+- C-H1W把独立cost-LSTM从约86k参数的raw cost path扩大到约2.60M参数，约30.1倍，并在每个B20上重复优化20次。其独立AUC从约0.52升到0.59说明history有信号，但post-Brier大幅改善而pre/独立Brier恶化，最符合大容量encoder记忆当前20条轨迹。
+- 下一候选不再训练独立cost-history encoder，而是使用`cost_history_mode=actor_feature`：复用冻结成熟policy实际用于产生动作的LSTM hidden作为历史表示，再由action-conditioned cost head估计分布。它比独立cost-LSTM少约2.39M个可训练encoder参数，仍保留DQCAC必须的action输入；也更接近QCPO_refs的共享MLP+LSTM backbone，但此冻结筛选不会让cost梯度回灌policy，因果更干净。
+- 正式配置与raw/C-H1W严格相同：P-M3 seed1成熟策略、rollout seed101、B20、T1000、30批=600k、MC、risk-discount=.995、QR32、C20、chunk2500、冻结policy与observation统计；唯一算法变量为`cost_history_mode=actor_feature`。30批reward/cost/outage等truth必须与两条对照逐值exact。
+- 预注册主门：末5批prequential CDF absolute error或Brier相对raw至少改善20%，另一项不得恶化超过10%，聚合mean-cost bias绝对值不高于1；独立140条要求hard或smooth Brier至少改善10%且对应AUC至少增加0.03，或Brier改善20%且AUC下降不超过0.02，同时mean-cost error不高于0.90、crossing不高于0.10。只有通过才做fresh520并考虑live。
+- 该路线的判别重点不是同批post loss。若AUC保留C-H1W至少一半增益且Brier回到不差于raw，说明“固定共享history+action head”能抑制encoder过拟合；若仍失败，下一项优先把独立cost-LSTM的C20降到C5，直接检验重复更新强度。跨rollout replay/held-out early stop与B40/B80增加独立轨迹保留为独立消融，不能和C5一次混合。
+- 预计纯训练5--8分钟、独立140条评估约1分钟；只用`launch_background.sh`持久化，W&B online名称、group和tags仅包含算法语义，不包含绝对路径或隐私字段。600k失败且末段无一致改善时不延长到1.2M。
