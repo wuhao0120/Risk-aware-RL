@@ -350,6 +350,16 @@ class DQCACBetaGPU(VecAgentBase):
             getattr(args, 'cost_shared_backbone_cost_scale', 10.0))
         self.cost_shared_backbone_huber_kappa = float(
             getattr(args, 'cost_shared_backbone_huber_kappa', 1.0))
+        # full_backbone逐式保留C-H6L；adapter把cost梯度限制在零初始化瓶颈，
+        # 让PPO/value仍训练基础MLP+LSTM，而cost辅助只能改变小残差子空间。
+        self.cost_shared_gradient_mode = str(
+            getattr(args, 'cost_shared_gradient_mode', 'full_backbone')).lower()
+        self.cost_adapter_width = int(getattr(args, 'cost_adapter_width', 0))
+        self.cost_adapter_scale = float(getattr(args, 'cost_adapter_scale', 1.0))
+        # 显式诊断用两次autograd.grad分别测primary与cost在共享参数上的方向；
+        # 默认False不增加历史实验的反向开销或计算图遍历。
+        self.cost_gradient_diagnostics = bool(
+            getattr(args, 'cost_gradient_diagnostics', False))
         self.cost_s0_replay_batches = int(
             getattr(args, 'cost_s0_replay_batches', 4))
         # C-H9默认关闭：缓存若干“已经完成更新的旧rollout”完整cost监督。coef是
@@ -384,6 +394,16 @@ class DQCACBetaGPU(VecAgentBase):
             raise ValueError("cost_shared_backbone_cost_scale must be positive")
         if self.cost_shared_backbone_huber_kappa <= 0.0:
             raise ValueError("cost_shared_backbone_huber_kappa must be positive")
+        if self.cost_shared_gradient_mode not in {'full_backbone', 'adapter'}:
+            raise ValueError(
+                "cost_shared_gradient_mode must be 'full_backbone' or 'adapter'")
+        if self.cost_adapter_width < 0:
+            raise ValueError("cost_adapter_width must be non-negative")
+        if self.cost_adapter_scale <= 0.0:
+            raise ValueError("cost_adapter_scale must be positive")
+        if self.cost_gradient_diagnostics and self.cost_shared_backbone_coef <= 0.0:
+            raise ValueError(
+                "cost_gradient_diagnostics requires cost_shared_backbone_coef>0")
         if self.cost_s0_replay_batches <= 0:
             raise ValueError("cost_s0_replay_batches must be positive")
         if self.cost_transition_replay_batches < 0:
@@ -437,6 +457,14 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_shared_cost_policy_head_grad_norm = 0.0
         self.last_shared_cost_value_head_grad_norm = 0.0
         self.last_shared_cost_head_grad_present = 0.0
+        self.last_shared_cost_primary_grad_norm = 0.0
+        self.last_shared_cost_aux_grad_norm = 0.0
+        self.last_shared_cost_gradient_dot = 0.0
+        self.last_shared_cost_gradient_cosine = 0.0
+        self.last_shared_cost_gradient_conflict = 0.0
+        self.cost_gradient_diagnostic_events = 0
+        self.cost_gradient_conflict_events = 0
+        self.cost_gradient_cosine_sum = 0.0
         self.advantage_norm = getattr(args, 'advantage_norm', 'qcpo')
         self.entropy_coef = getattr(args, 'entropy_coef', 0.0)
         self.lambda_max = getattr(args, 'lambda_max', 50.0)
@@ -520,7 +548,9 @@ class DQCACBetaGPU(VecAgentBase):
                 init_std=float(getattr(args, 'init_std', 1.0)),
                 learn_std=bool(getattr(args, 'learn_std', True)),
                 normalize_observation=self.normalize_observation,
-                var_clip=self.obs_norm_var_clip).to(self.device)
+                var_clip=self.obs_norm_var_clip,
+                cost_adapter_width=self.cost_adapter_width,
+                cost_adapter_scale=self.cost_adapter_scale).to(self.device)
 
         # cost history 三路线：
         # - raw：历史默认，只看当前 Markov observation；
@@ -589,9 +619,10 @@ class DQCACBetaGPU(VecAgentBase):
             if self.cost_s0_aux_coef > 0.0:
                 raise ValueError(
                     "cost transition replay currently requires cost_s0_aux_coef=0")
-            if self.cost_shared_backbone_coef > 0.0:
+            if (self.cost_shared_backbone_coef > 0.0
+                    or self.cost_adapter_width > 0):
                 raise ValueError(
-                    "cost transition replay currently requires shared backbone coef=0")
+                    "cost transition replay currently requires shared cost and adapter disabled")
             if self.actor_update_interval != 1:
                 raise ValueError(
                     "cost transition replay currently requires actor_update_interval=1")
@@ -632,9 +663,10 @@ class DQCACBetaGPU(VecAgentBase):
             if self.cost_s0_aux_coef > 0.0:
                 raise ValueError(
                     "cost holdout guard currently requires cost_s0_aux_coef=0")
-            if self.cost_shared_backbone_coef > 0.0:
+            if (self.cost_shared_backbone_coef > 0.0
+                    or self.cost_adapter_width > 0):
                 raise ValueError(
-                    "cost holdout guard currently requires shared backbone coef=0")
+                    "cost holdout guard currently requires shared cost and adapter disabled")
             if self.actor_update_interval != 1:
                 raise ValueError(
                     "cost holdout guard currently requires actor_update_interval=1")
@@ -676,6 +708,42 @@ class DQCACBetaGPU(VecAgentBase):
             if self.freeze_policy_updates or self.actor_updates_per_episode <= 0:
                 raise ValueError(
                     "cost_shared_backbone_coef>0 requires live actor updates")
+            if (self.cost_shared_gradient_mode == 'adapter'
+                    and self.cost_adapter_width <= 0):
+                raise ValueError(
+                    "adapter gradient mode requires cost_adapter_width>0")
+            if (self.cost_shared_gradient_mode == 'full_backbone'
+                    and self.cost_adapter_width > 0):
+                raise ValueError(
+                    "first adapter ablation cannot combine adapter with full-backbone cost gradients")
+
+        # adapter-only control允许shared coef=0，但其余数据、policy和cost-head协议必须
+        # 与C-H8/C-H6L一致。这样paired run只区分“额外PPO容量”与“cost辅助梯度”。
+        if self.cost_adapter_width > 0:
+            if not self.recurrent_policy or self.reward_actor_mode != 'gae_ppo':
+                raise ValueError("cost adapter requires recurrent gae_ppo")
+            if self.cost_history_mode != 'actor_feature':
+                raise ValueError("cost adapter requires actor_feature history")
+            if self.cost_target_mode != 'mc':
+                raise ValueError("cost adapter currently requires MC cost targets")
+            if self.cost_distribution_model != 'qr':
+                raise ValueError("cost adapter currently requires QR cost distribution")
+            if self.cost_quantile_grid_mode != 'uniform':
+                raise ValueError("cost adapter currently requires uniform quantiles")
+            if self.cost_cdf_estimator != 'quantile':
+                raise ValueError("cost adapter currently requires quantile CDF")
+            if self.cost_actor_query_mode != 'online':
+                raise ValueError("cost adapter currently requires online cost query")
+            if self.cost_quantile_output != 'linear':
+                raise ValueError("cost adapter currently requires linear cost output")
+            if self.cost_actor_feature_refresh:
+                raise ValueError("first cost adapter ablation requires feature refresh disabled")
+            if self.cost_s0_aux_coef > 0.0:
+                raise ValueError("cost adapter currently requires cost_s0_aux_coef=0")
+            if self.actor_update_interval != 1:
+                raise ValueError("cost adapter currently requires actor_update_interval=1")
+            if self.freeze_policy_updates or self.actor_updates_per_episode <= 0:
+                raise ValueError("cost adapter requires live actor updates")
         # 主cost critic继续使用已验证的huber_kappa=0.1；共享辅助项单独使用
         # cost_shared_backbone_huber_kappa=1，精确对应QCPO_refs而不暗改head优化目标。
 
@@ -1101,7 +1169,10 @@ class DQCACBetaGPU(VecAgentBase):
               f"/scale{self.cost_quantile_output_scale:g}, "
               f"shared_cost={self.cost_shared_backbone_coef:g}"
               f"/scale{self.cost_shared_backbone_cost_scale:g}"
-              f"/k{self.cost_shared_backbone_huber_kappa:g}, "
+              f"/k{self.cost_shared_backbone_huber_kappa:g}"
+              f"/grad{self.cost_shared_gradient_mode}"
+              f"/adapter{self.cost_adapter_width}x{self.cost_adapter_scale:g}"
+              f"/diag{self.cost_gradient_diagnostics}, "
               f"cost_cdf={self.cost_cdf_estimator}/{self.cost_cdf_mode}"
               f"/T{self.cost_cdf_temperature:g}"
               f"/lr{self.cost_direct_cdf_lr:g}"
@@ -2575,7 +2646,7 @@ class DQCACBetaGPU(VecAgentBase):
     def _shared_backbone_reference_cost_loss(
             self, actor_features, batch):
         """
-        返回只训练共享actor MLP+LSTM的QCPO_refs尺度cost辅助目标。
+        返回只训练指定共享表示路径的QCPO_refs尺度cost辅助目标。
 
         参考实现先把cost和quantiles都除以10，再对batch、prediction quantile和
         target quantile三维全部取mean。当前MC标签每个transition只有一个realization；
@@ -2583,8 +2654,9 @@ class DQCACBetaGPU(VecAgentBase):
         避免无信息的[M,N,N]张量。可选risk-discount权重与主cost critic一致。
 
         前向期间临时关闭cost head参数的requires_grad。这样固定head仍对输入feature
-        提供Jacobian，但autograd不会为head创建参数梯度；actor Adam只拥有共享骨干，
-        critic Adam只拥有head，彻底避免同一参数被两个优化器交替写入。
+        提供Jacobian，但autograd不会为head创建参数梯度；full_backbone模式把梯度
+        传到MLP+LSTM，adapter模式因输入已detach而只传到瓶颈。actor Adam拥有actor
+        路径参数，critic Adam只拥有head，避免同一参数被两个优化器交替写入。
         """
         if self.cost_shared_backbone_coef <= 0.0:
             zero = actor_features.new_zeros(())
@@ -2661,6 +2733,103 @@ class DQCACBetaGPU(VecAgentBase):
             'shared_cost/mean_loss': float(mean_loss.detach().item()),
             'shared_cost/objective_loss': float(objective.detach().item()),
             'shared_cost/weighted_loss': float(weighted_loss.detach().item()),
+        }
+
+    def _shared_objective_gradient_stats(
+            self, primary_loss, auxiliary_loss):
+        """
+        分离测量primary(PPO+V)与cost辅助目标在实际共享参数上的梯度方向。
+
+        full_backbone模式测MLP+LSTM；adapter模式只测瓶颈adapter。autograd.grad
+        不写Parameter.grad，随后total_loss.backward仍是唯一真正的优化梯度。
+        cosine<0表示两个目标在本次PPO epoch的一阶局部方向相互冲突。
+        """
+        zero_info = {
+            'shared_cost/primary_grad_norm': 0.0,
+            'shared_cost/aux_grad_norm': 0.0,
+            'shared_cost/gradient_dot': 0.0,
+            'shared_cost/gradient_cosine': 0.0,
+            'shared_cost/gradient_conflict': 0.0,
+            'shared_cost/gradient_diagnostic_events': float(
+                self.cost_gradient_diagnostic_events),
+            'shared_cost/gradient_conflict_rate': (
+                float(self.cost_gradient_conflict_events)
+                / max(1.0, float(self.cost_gradient_diagnostic_events))),
+            'shared_cost/gradient_cosine_running_mean': (
+                self.cost_gradient_cosine_sum
+                / max(1.0, float(self.cost_gradient_diagnostic_events))),
+        }
+        if not self.cost_gradient_diagnostics:
+            return zero_info
+
+        if self.cost_shared_gradient_mode == 'adapter':
+            if self.actor.cost_adapter is None:
+                raise RuntimeError(
+                    "adapter gradient diagnostics require an initialized adapter")
+            shared_parameters = list(self.actor.cost_adapter.parameters())
+        else:
+            shared_parameters = (
+                list(self.actor.body.parameters())
+                + list(self.actor.lstm.parameters()))
+        if not shared_parameters:
+            raise RuntimeError("shared gradient diagnostic parameter set is empty")
+
+        primary_grads = torch.autograd.grad(
+            primary_loss, shared_parameters, retain_graph=True,
+            create_graph=False, allow_unused=True)
+        auxiliary_grads = torch.autograd.grad(
+            auxiliary_loss, shared_parameters, retain_graph=True,
+            create_graph=False, allow_unused=True)
+
+        primary_squared = torch.zeros(
+            (), dtype=torch.float32, device=self.device)
+        auxiliary_squared = torch.zeros_like(primary_squared)
+        gradient_dot = torch.zeros_like(primary_squared)
+        for primary_grad, auxiliary_grad in zip(
+                primary_grads, auxiliary_grads):
+            if primary_grad is not None:
+                primary_squared += primary_grad.detach().float().pow(2).sum()
+            if auxiliary_grad is not None:
+                auxiliary_squared += auxiliary_grad.detach().float().pow(2).sum()
+            if primary_grad is not None and auxiliary_grad is not None:
+                gradient_dot += (
+                    primary_grad.detach().float()
+                    * auxiliary_grad.detach().float()).sum()
+
+        primary_norm = primary_squared.sqrt()
+        auxiliary_norm = auxiliary_squared.sqrt()
+        norm_product = primary_norm * auxiliary_norm
+        valid_direction = float(norm_product.item()) > 1e-20
+        gradient_cosine = (
+            gradient_dot / norm_product.clamp_min(1e-20)
+            if valid_direction else torch.zeros_like(gradient_dot))
+        conflict = float(valid_direction and float(gradient_dot.item()) < 0.0)
+
+        self.last_shared_cost_primary_grad_norm = float(primary_norm.item())
+        self.last_shared_cost_aux_grad_norm = float(auxiliary_norm.item())
+        self.last_shared_cost_gradient_dot = float(gradient_dot.item())
+        self.last_shared_cost_gradient_cosine = float(gradient_cosine.item())
+        self.last_shared_cost_gradient_conflict = conflict
+        self.cost_gradient_diagnostic_events += 1
+        self.cost_gradient_conflict_events += int(conflict)
+        self.cost_gradient_cosine_sum += self.last_shared_cost_gradient_cosine
+
+        return {
+            'shared_cost/primary_grad_norm': (
+                self.last_shared_cost_primary_grad_norm),
+            'shared_cost/aux_grad_norm': self.last_shared_cost_aux_grad_norm,
+            'shared_cost/gradient_dot': self.last_shared_cost_gradient_dot,
+            'shared_cost/gradient_cosine': (
+                self.last_shared_cost_gradient_cosine),
+            'shared_cost/gradient_conflict': conflict,
+            'shared_cost/gradient_diagnostic_events': float(
+                self.cost_gradient_diagnostic_events),
+            'shared_cost/gradient_conflict_rate': (
+                float(self.cost_gradient_conflict_events)
+                / float(self.cost_gradient_diagnostic_events)),
+            'shared_cost/gradient_cosine_running_mean': (
+                self.cost_gradient_cosine_sum
+                / float(self.cost_gradient_diagnostic_events)),
         }
 
     # ============================================================ Critic 更新 (双 QR-TD) ============================================================
@@ -3627,16 +3796,27 @@ class DQCACBetaGPU(VecAgentBase):
 
         shared_cost_enabled = self.cost_shared_backbone_coef > 0.0
         if shared_cost_enabled:
-            # 同一次actor forward同时产生policy/value和可微history feature；这样cost
-            # 辅助梯度与PPO/value看到完全相同的当前MLP+LSTM表示，不重复构建recurrent图。
-            means, log_stds, value_pred, _final_state, actor_features = self.actor(
-                observations, prev_actions, prev_rewards, (hidden0, cell0),
-                return_features=True)
-            actor_features = self._inverse_transform_recurrent(
-                actor_features, B).reshape(n * B, self.actor.lstm_size)
+            if self.cost_shared_gradient_mode == 'adapter':
+                # policy/value使用正常可微adapter；cost分支重新对base.detach()应用同一个
+                # adapter，因此cost只写adapter参数，不能直接污染MLP/LSTM基础表示。
+                (means, log_stds, value_pred, _final_state, _policy_features,
+                 base_features) = self.actor(
+                    observations, prev_actions, prev_rewards, (hidden0, cell0),
+                    return_features=True, return_base_features=True)
+                base_features = self._inverse_transform_recurrent(
+                    base_features, B).reshape(n * B, self.actor.lstm_size)
+                shared_cost_features = self.actor.apply_cost_adapter(
+                    base_features, detach_input=True)
+            else:
+                # C-H6L full-backbone逐式路径：cost与PPO/value看到同一个可微当前表示。
+                means, log_stds, value_pred, _final_state, actor_features = self.actor(
+                    observations, prev_actions, prev_rewards, (hidden0, cell0),
+                    return_features=True)
+                shared_cost_features = self._inverse_transform_recurrent(
+                    actor_features, B).reshape(n * B, self.actor.lstm_size)
             shared_cost_loss, shared_cost_info = (
                 self._shared_backbone_reference_cost_loss(
-                    actor_features, batch))
+                    shared_cost_features, batch))
         else:
             # 默认关闭分支保留历史四元actor forward，保证旧checkpoint数值路径不变。
             means, log_stds, value_pred, _final_state = self.actor(
@@ -3734,14 +3914,29 @@ class DQCACBetaGPU(VecAgentBase):
             - self.entropy_coef * entropy)
         value_error = value_pred - value_targets
         value_loss = 0.5 * value_error.pow(2).mean()
+        primary_loss = policy_loss + self.recurrent_value_loss_coef * value_loss
+        gradient_info = {
+            'shared_cost/primary_grad_norm': 0.0,
+            'shared_cost/aux_grad_norm': 0.0,
+            'shared_cost/gradient_dot': 0.0,
+            'shared_cost/gradient_cosine': 0.0,
+            'shared_cost/gradient_conflict': 0.0,
+            'shared_cost/gradient_diagnostic_events': float(
+                self.cost_gradient_diagnostic_events),
+            'shared_cost/gradient_conflict_rate': (
+                float(self.cost_gradient_conflict_events)
+                / max(1.0, float(self.cost_gradient_diagnostic_events))),
+            'shared_cost/gradient_cosine_running_mean': (
+                self.cost_gradient_cosine_sum
+                / max(1.0, float(self.cost_gradient_diagnostic_events))),
+        }
         if shared_cost_enabled:
-            total_loss = (
-                policy_loss
-                + self.recurrent_value_loss_coef * value_loss
-                + shared_cost_loss)
+            total_loss = primary_loss + shared_cost_loss
+            gradient_info = self._shared_objective_gradient_stats(
+                primary_loss, shared_cost_loss)
         else:
             # coef=0保持原表达式与加法顺序，避免默认回归因无效+0改变浮点图。
-            total_loss = policy_loss + self.recurrent_value_loss_coef * value_loss
+            total_loss = primary_loss
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         approx_kl = ((ratio.detach() - 1.0) - log_ratio.detach()).mean()
@@ -3819,6 +4014,16 @@ class DQCACBetaGPU(VecAgentBase):
             'shared_cost/coefficient': self.cost_shared_backbone_coef,
             'shared_cost/cost_scale': self.cost_shared_backbone_cost_scale,
             'shared_cost/huber_kappa': self.cost_shared_backbone_huber_kappa,
+            'shared_cost/gradient_mode_adapter': float(
+                self.cost_shared_gradient_mode == 'adapter'),
+            'shared_cost/adapter_width': float(self.cost_adapter_width),
+            'shared_cost/adapter_scale': self.cost_adapter_scale,
+            'shared_cost/adapter_parameter_count': float(
+                0 if self.actor.cost_adapter is None else
+                sum(parameter.numel()
+                    for parameter in self.actor.cost_adapter.parameters())),
+            'shared_cost/gradient_diagnostics_enabled': float(
+                self.cost_gradient_diagnostics),
             'shared_cost/feature_refresh_abs_mean': float(
                 batch.get('_shared_cost_feature_refresh_abs_mean', 0.0)),
             'shared_cost/joint_body_grad_norm': float(body_grad_norm.item()),
@@ -3829,6 +4034,7 @@ class DQCACBetaGPU(VecAgentBase):
                 value_head_grad_norm.item()),
             'shared_cost/cost_head_grad_present': cost_head_grad_present,
             **shared_cost_info,
+            **gradient_info,
             'advantage/mean_adv_std': float(
                 batch['_reward_advantage_raw'].std(unbiased=False).item()),
             'advantage/risk_adv_std': float(raw_adv_c.std(unbiased=False).item()),
@@ -4587,6 +4793,12 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_shared_backbone_cost_scale),
             'debug/cost_shared_backbone_huber_kappa': (
                 self.cost_shared_backbone_huber_kappa),
+            'debug/cost_shared_gradient_is_adapter': float(
+                self.cost_shared_gradient_mode == 'adapter'),
+            'debug/cost_adapter_width': float(self.cost_adapter_width),
+            'debug/cost_adapter_scale': self.cost_adapter_scale,
+            'debug/cost_gradient_diagnostics': float(
+                self.cost_gradient_diagnostics),
             'debug/cost_iqn_train_quantiles': float(
                 self.cost_iqn_train_quantiles),
             'debug/cost_iqn_query_quantiles': float(
@@ -4978,6 +5190,24 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_shared_backbone_cost_scale),
             'cost_shared_backbone_huber_kappa': (
                 self.cost_shared_backbone_huber_kappa),
+            'cost_shared_gradient_mode': self.cost_shared_gradient_mode,
+            'cost_adapter_width': self.cost_adapter_width,
+            'cost_adapter_scale': self.cost_adapter_scale,
+            'cost_adapter_parameter_count': (
+                0 if self.actor.cost_adapter is None else
+                sum(parameter.numel()
+                    for parameter in self.actor.cost_adapter.parameters())),
+            'cost_gradient_diagnostics': self.cost_gradient_diagnostics,
+            'cost_gradient_diagnostic_events': (
+                self.cost_gradient_diagnostic_events),
+            'cost_gradient_conflict_events': (
+                self.cost_gradient_conflict_events),
+            'cost_gradient_conflict_rate': (
+                float(self.cost_gradient_conflict_events)
+                / max(1.0, float(self.cost_gradient_diagnostic_events))),
+            'cost_gradient_cosine_running_mean': (
+                self.cost_gradient_cosine_sum
+                / max(1.0, float(self.cost_gradient_diagnostic_events))),
             's0_holdout_pre': dict(self.last_s0_holdout_pre),
             's0_holdout_post': dict(self.last_s0_holdout_post),
             'cost_cdf_mode': self.cost_cdf_mode,
@@ -5032,6 +5262,16 @@ class DQCACBetaGPU(VecAgentBase):
                 self.last_shared_cost_value_head_grad_norm),
             'shared_cost_last_head_grad_present': (
                 self.last_shared_cost_head_grad_present),
+            'shared_cost_last_primary_grad_norm': (
+                self.last_shared_cost_primary_grad_norm),
+            'shared_cost_last_aux_grad_norm': (
+                self.last_shared_cost_aux_grad_norm),
+            'shared_cost_last_gradient_dot': (
+                self.last_shared_cost_gradient_dot),
+            'shared_cost_last_gradient_cosine': (
+                self.last_shared_cost_gradient_cosine),
+            'shared_cost_last_gradient_conflict': (
+                self.last_shared_cost_gradient_conflict),
             'ppo_target_kl': self.ppo_target_kl,
             'freeze_policy_updates': self.freeze_policy_updates,
             'freeze_observation_stats': self.freeze_observation_stats,

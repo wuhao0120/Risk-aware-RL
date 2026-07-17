@@ -1927,3 +1927,24 @@ C-H10G证明上一rollout确实可以用于选择cost-critic更新位置。24个
 闭环结果是显著的安全--收益交换。fresh512 reward从0.745降到0.579，差值95%区间为`[-0.228,-0.104]`；outage从0.215降到0.141，差值区间为`[-0.121,-0.027]`。两项变化都有统计把握。它不是无效机制，而是优化了错误的单一目标：把策略稳定推到更保守盆地，却远离DQCAC应达到的高reward Pareto区域。
 
 因此不扩seed，也不扫描guard容忍带。当前主要瓶颈已经从“多epoch off-policy”“输入未归一化”“网络没有LSTM”“quantile数量不够”收敛为更具体的问题：action-conditioned cost critic缺乏稳定且有区分力的跨策略监督，现有控制器会放大其基率/排序误差。下一步应隔离cost与reward/PPO表示冲突：先用小adapter并记录梯度cosine，必要时做PCGrad；另一条独立消融是QCPO_refs式Weibull低维尾部辅助。只有同时改善fresh reward、outage和AUC的组件才晋级，多加quantile或继续调PID都不是当前首选。
+
+
+### 13.114 最终目标是约束边界上的高reward，不是最小化outage（2026-07-17）
+
+DQCACBeta在这里解决的是带概率约束的收益最大化，不是第二个cost最小化问题。名义alpha为0.20时，理想工作点应在真实outage约0.20附近：高于它违反风险预算；显著低于它通常说明策略没有充分使用风险预算，mean reward仍有可提升空间。因此C-H10G的0.141 outage不能因为数值更小就判优，它同时把reward从0.745降到0.579，落到了明显过度保守的策略盆地。
+
+后续模型选择改成两层规则。第一层用独立fresh512检查outage点估计是否落入[0.18,0.22]，并同时报告二项置信区间和相对0.20的有符号误差；第二层只在满足工作带的候选中最大化mean reward。这个带宽是当前有限评估预算下的工程筛选标准，不是概率约束的数学置信保证。最终候选仍需更多seed和更大评估样本确认。
+
+PID内部target=.15与最终目标=.20并不矛盾：前者是存在采样延迟、critic偏差和闭环超调时的补偿setpoint，后者是环境中真正希望得到的违约率。若critic表示尚在变化，同时把PID target改回.20会把表示改进和控制校准混在一起。正确顺序是先固定PID比较representation，再对胜出representation单独标定内部setpoint，使fresh真实outage回到0.20附近。
+
+retention guard的准确定位也随之明确。它在当前rollout训练critic，每个step用上一rollout Brier检查是否遗忘；一旦超过容忍带，就回滚cost head及其Adam状态或提前停止。它不读取最终outage偏差，不调整lambda，也不直接优化reward，所以本质上是critic跨批稳定性保护器，而不是风险预算控制器。C-H10G证明它能校准总体基率，却降低AUC并使策略过度保守，因此只保留为诊断工具。
+
+### 13.115 小型adapter把cost辅助梯度隔离到可测量子空间（2026-07-17）
+
+完整共享backbone失败后，不能直接断言任何cost监督都不应进入policy表示。更精确的问题是：高方差action-conditioned QR梯度不应无约束地改写整个512维MLP+LSTM。新增残差adapter位于recurrent feature之后，policy/value正常经过它；cost辅助分支先detach原backbone feature，再通过同一个adapter。这样PPO/value和cost仍能共同塑造一个小表示子空间，但cost无法破坏产生history的主干。
+
+adapter末层零初始化，开启时初始policy/value输出与无adapter网络一致；构造时恢复CPU RNG，保证后续critic初始化也一致。默认关闭的完整训练回归中，新旧checkpoint的60个tensor逐位相同。全尺寸smoke又确认adapter有66112个参数、PPO首epoch ratio误差仅2.861e-6、cost head不接收actor梯度，作用链和IS语义都正确。
+
+新增梯度诊断不通过backward累积，也不改optimizer状态。它分别求PPO+value与cost辅助目标对adapter的梯度，并记录余弦。192步smoke的平均cosine约0.009，6次中3次为负，提示局部冲突存在但没有稳定同向或反向趋势。这个统计不足以证明PCGrad有益；PCGrad只应在1M候选显示持续冲突且性能退化时作为下一独立消融。
+
+严格因果对照需要同样带adapter的coef0控制组。若直接拿adapter+cost与原C-H8比较，任何reward变化都可能来自多出的两层PPO容量。C-H11A和C-H11B因此都用adapter64，只有共享cost系数为0或1；两条都按outage在[.18,.22]内后最大化reward的新规则裁决。这个对照比单纯继续扫描共享coef更能回答算法问题。

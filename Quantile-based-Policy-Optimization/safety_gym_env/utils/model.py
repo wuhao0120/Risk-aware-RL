@@ -142,7 +142,8 @@ class RecurrentActorValue(nn.Module):
     def __init__(self, observation_dim, action_dim, hidden=None, lstm_size=512,
                  lstm_skip=True, init_std=1.0, learn_std=True,
                  normalize_observation=True, var_clip=1e-6,
-                 hidden_nonlinearity='tanh'):
+                 hidden_nonlinearity='tanh', cost_adapter_width=0,
+                 cost_adapter_scale=1.0):
         """
         Args:
             observation_dim: 已追加 previous_cost 后的维度，即 raw_state_dim+1。
@@ -152,6 +153,9 @@ class RecurrentActorValue(nn.Module):
             lstm_skip:       True 时使用 MLP feature + LSTM output 残差。
             init_std:        初始高斯探索标准差；QCPO_refs 为 1。
             learn_std:       是否训练 log_std；公平对比应为 True。
+            cost_adapter_width: 正数时在共享feature后增加H→W→H零初始化残差adapter；
+                                0保持QCPO与历史DQCAC逐式结构不变。
+            cost_adapter_scale: adapter残差的固定缩放系数。
         """
         super().__init__()
         hidden = [512, 512] if hidden is None else list(hidden)
@@ -190,6 +194,41 @@ class RecurrentActorValue(nn.Module):
         self.obs_rms = ObservationNormalizer(
             int(observation_dim), var_clip=float(var_clip), value_clip=10.0)
 
+        # cost adapter是DQCAC共享监督的可选小参数子空间。输出层严格零初始化，
+        # 所以启用时初始policy/value/cost feature仍与无adapter网络逐元素相同。
+        # 构造前后恢复CPU RNG，避免新增模块推进随后reward/cost critic初始化随机流。
+        self.cost_adapter_width = int(cost_adapter_width)
+        self.cost_adapter_scale = float(cost_adapter_scale)
+        if self.cost_adapter_width < 0:
+            raise ValueError("cost_adapter_width must be non-negative")
+        if self.cost_adapter_scale <= 0.0:
+            raise ValueError("cost_adapter_scale must be positive")
+        self.cost_adapter = None
+        if self.cost_adapter_width > 0:
+            rng_state = torch.get_rng_state()
+            try:
+                self.cost_adapter = nn.Sequential(
+                    nn.Linear(self.lstm_size, self.cost_adapter_width),
+                    nn.Tanh(),
+                    nn.Linear(self.cost_adapter_width, self.lstm_size))
+                nn.init.zeros_(self.cost_adapter[-1].weight)
+                nn.init.zeros_(self.cost_adapter[-1].bias)
+            finally:
+                torch.set_rng_state(rng_state)
+
+    def apply_cost_adapter(self, base_feature, detach_input=False):
+        """
+        返回base+scale*adapter(base)，可选阻断梯度进入MLP/LSTM基础表示。
+
+        policy/value路径传detach_input=False，因此PPO与V loss仍训练完整网络；
+        adapter-only cost辅助路径传True，使cost loss只能更新adapter参数。
+        """
+        source = base_feature.detach() if detach_input else base_feature
+        if self.cost_adapter is None:
+            return source
+        residual = self.cost_adapter(source)
+        return source + self.cost_adapter_scale * residual
+
     def initial_state(self, batch_size, device=None):
         """返回零初始化 (h,c)，形状均为 [1,B,H]。"""
         device = self.log_std.device if device is None else device
@@ -198,7 +237,7 @@ class RecurrentActorValue(nn.Module):
         return h, c
 
     def forward(self, observation, prev_action, prev_reward, init_rnn_state=None,
-                return_features=False):
+                return_features=False, return_base_features=False):
         """
         前向调用。
 
@@ -208,6 +247,8 @@ class RecurrentActorValue(nn.Module):
             prev_reward: [T,B]。
             init_rnn_state: (h,c)，各 [1,B,H]；None 表示零状态。
             return_features: True 时额外返回产生 policy/value 的历史条件特征。
+            return_base_features: True时再返回adapter之前的MLP+LSTM基础特征；
+                                  仅供DQCAC隔离cost梯度，要求return_features=True。
 
         返回:
             默认返回 mean [T,B,A]、log_std [T,B,A]、value [T,B]、(h_n,c_n)。
@@ -228,13 +269,22 @@ class RecurrentActorValue(nn.Module):
         # nn.LSTM 返回所有时刻输出与末状态；显式 tuple 保证兼容参考实现 namedtuple 状态。
         recurrent_output, final_state = self.lstm(recurrent_input, init_rnn_state)
         recurrent_flat = recurrent_output.reshape(T * B, self.lstm_size)
-        feature = mlp_feature + recurrent_flat if self.lstm_skip else recurrent_flat
+        base_feature = (
+            mlp_feature + recurrent_flat if self.lstm_skip else recurrent_flat)
+        feature = self.apply_cost_adapter(base_feature, detach_input=False)
 
         mean = self.mu(feature).view(T, B, -1)
         log_std = self.log_std.repeat(T * B, 1).view(T, B, -1)
         value = self.value(feature).squeeze(-1).view(T, B)
+        if return_base_features and not return_features:
+            raise ValueError("return_base_features requires return_features=True")
         if return_features:
-            return mean, log_std, value, final_state, feature.view(T, B, -1)
+            feature_view = feature.view(T, B, -1)
+            if return_base_features:
+                return (
+                    mean, log_std, value, final_state, feature_view,
+                    base_feature.view(T, B, -1))
+            return mean, log_std, value, final_state, feature_view
         return mean, log_std, value, final_state
 
     @torch.no_grad()

@@ -1596,3 +1596,21 @@
 - 预注册性能门中，outage、Brier和mean error通过，reward `.57864<.75`与AUC `.53609<.56387`失败；训练末5批Brier机制门也失败。因此严格裁决为`strict_fail_no_seed_expansion`：不补seed0/1，不扫描`.05/.002`容忍带，不与training replay叠加。该机制保留为“灾难性遗忘/安全优先”消融，而不是DQCAC主配置。
 - 证据位于`_runs/wandb_export/dqc_ch10g_holdoutguard_actorfeature_meananchor_b40_1m_s2_2026-07-17/`、配对导出和训练曲线`_runs/wandb_export|profiles/dqc_ch8b40_vs_ch10g_holdoutguard_seed2_1m_2026-07-17/`，以及fresh统计与图`_runs/profiles/dqc_ch10g_holdoutguard_actorfeature_meananchor_b40_1m_s2_2026-07-17/ch8_fresh512_comparison/`。两张PNG均通过PIL解码。远端128个公开config键无绝对路径或真实敏感字段，name/group/tags均只含公开算法语义；同步文件仍只有标准`config.yaml/output.log/wandb-summary.json`。
 - 下一独立路线不再用旧rollout直接决定整个cost head的停止位置。优先测试参数隔离的小cost adapter，并在共享表示梯度上记录cosine/冲突率；若冲突显著，再做PCGrad门控。与此并列保留QCPO_refs式Weibull/parametric tail辅助头，用低维尾部监督提供稳定信号。两条都必须保持B40/seed2/1M及现有PPO、PID、QR32不变，先过reward/outage/AUC联合门；不得同时混入IQN、quantile加密或PID调参。
+
+
+### E133：目标口径纠正——outage必须接近alpha，而不是越低越好（2026-07-17）
+
+- 用户明确最终任务是约束优化：真实违约概率应落在名义alpha=0.20附近，在满足该条件后尽可能提高mean reward。outage低于目标不是无条件收益；它通常代表lambda、critic概率或闭环控制把策略推入过度保守盆地，牺牲了本可获得的reward。
+- 后续候选统一使用独立fresh512点估计的双侧工作带[0.18,0.22]。高于0.22记为风险过大，低于0.18记为过度保守或闭环失配；只有进入工作带的候选才按mean reward排序。边界附近仍报告二项比例置信区间，不能把一次点估计伪装成精确约束保证。
+- 既有实验中使用的pid_target_prob=0.15是为有限样本、critic偏差与控制滞后设置的内部补偿setpoint，不等于最终希望达到15% outage。它是否仍应为0.15，只能在cost representation稳定后用独立大样本重新校准；当前不因C-H10G过度保守而立即和adapter同时调PID。
+- 按新口径重评C-H10G：reward/outage=.57864/.14063，虽outage更低且Brier更好，但落到工作带下方，属于明显过度保守，不是优于C-H8的安全解。retention guard只作为cross-rollout遗忘诊断保留，不进入性能主线，也不扩seed或扫描容忍带。
+- 以前预注册的单侧outage<=.22只可视为早期安全上界，不能继续充当最终模型选择规则。后续所有正式decision、表格和最终summary必须同时报告与0.20的有符号偏差、是否落入双侧带和mean reward。
+
+### E134：C-H11小型cost adapter实现、零影响回归与梯度诊断（2026-07-17）
+
+- 为隔离C-H6中QR辅助梯度直接扰动整个actor MLP+LSTM的问题，在recurrent base feature之后新增默认关闭的残差adapter：H→W→H、Tanh、末层零初始化，正式W=64、scale=1。policy/value始终使用adapter后的feature；共享cost辅助分支把base feature detach后再经过同一个adapter，因此cost梯度只能训练约束小子空间，不能写入原MLP/LSTM backbone。
+- adapter既接受PPO/value主任务梯度，也接受cost辅助梯度，所以新增无副作用的autograd.grad诊断，记录两者在adapter参数上的范数、dot、cosine和冲突率。正式首轮不直接加入PCGrad；先测量冲突，只有长期负内积与性能退化共同出现时，正交投影才有证据基础。
+- 默认cost_adapter_width=0严格兼容。相同seed305、B2、两批、C3的持久化金样本回归均exit0；补丁前后checkpoint各60个tensor leaves，键集合、shape、dtype和逐元素值全部相同，different_count=0、最大浮点差=0。额外纯张量测试还确认adapter构造保存并恢复CPU RNG，零初始化时初始policy/value输出完全一致。
+- 正式尺寸H=512、W=64的持久化smoke训练11.7秒并exit0，adapter参数为66112；3个rollout产生3次actor事件、6次梯度诊断。首epoch PPO ratio最大误差2.861e-6，cost head在actor backward中的梯度存在标志为0，主任务与cost辅助在adapter上的梯度都非零且有限。
+- smoke中6次诊断有3次负内积，冲突率0.5；running cosine均值0.00897，最后一次cosine 0.04032。它说明两个目标在小adapter上大体近乎正交、但局部冲突真实存在；样本只有192 env steps，不能推断最终性能，也不能据此提前启用PCGrad。
+- 正式比较必须成对运行：C-H11A为adapter64、shared coef0的容量控制，C-H11B为同一adapter64、shared coef1的cost监督候选。两条初始输出/RNG、B40/T1000/C20/A8、1M预算、seed2、actor-feature、mean-anchor及PID全部相同，唯一有效差异是cost辅助梯度。两条都必须做fresh512；outage在[.18,.22]内后再比较reward。若只有control提升，归因为额外PPO容量；若candidate提升且control不提升，才归因为隔离后的cost supervision。

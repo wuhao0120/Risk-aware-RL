@@ -224,6 +224,12 @@ def base_args(algo, seed, device, env_key):
         a.cost_shared_backbone_coef = 0.0
         a.cost_shared_backbone_cost_scale = 10.0
         a.cost_shared_backbone_huber_kappa = 1.0             # QCPO_refs固定阈值
+        # 默认逐式保留C-H6L的full-backbone梯度；adapter模式用零初始化瓶颈
+        # 隔离cost监督，并可显式记录PPO+V与cost在共享参数上的梯度cosine。
+        a.cost_shared_gradient_mode = 'full_backbone'
+        a.cost_adapter_width = 0
+        a.cost_adapter_scale = 1.0
+        a.cost_gradient_diagnostics = False
         # cost history 消融：raw=历史 Markov critic；actor_feature=C-H0.5 共享并
         # detach policy feature；cost_lstm=C-H1 独立同输入 MLP+LSTM（当前要求 MC）。
         a.cost_history_mode = 'raw'
