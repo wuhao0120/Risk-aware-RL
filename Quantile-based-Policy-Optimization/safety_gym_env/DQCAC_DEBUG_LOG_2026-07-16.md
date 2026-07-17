@@ -1552,3 +1552,15 @@
 - 严格裁决为`strict_fail_no_seed_expansion`：不补seed0/1、不扫B60/B80，也不因reward置信区间覆盖`.75`而事后改门。B40仍保留为下一机制实验的工程底座，因为它把训练吞吐提高约1.75倍、消除了最严重的末批过拟合，并把压力seed2推到接近目标的reward/outage区域。
 - 下一主路线按E127转向默认关闭的跨rollout cost replay或held-out critic selection。首选只缓存上一批detached actor feature、action、time-step和MC cost，与当前B40目标做等权凸组合；它直接把critic监督从“同一40条重复C20次”扩展到两个rollout，同时保持reward critic、PPO、PID和总环境步不变。若一批stale feature的坐标漂移成为问题，再与已经实现的current feature refresh作独立消融，不能同时混入Weibull、IQN或PID调参。
 - 证据包位于`_runs/profiles/dqc_ch8b40_actorfeature_meananchor_b40_1m_s2_2026-07-17/e121_comparison/`，包含fresh512对比CSV、训练history、末段汇总、门槛JSON、W&B隐私审计和六面板图。隐私审计覆盖123个公开config键，没有敏感键或绝对路径值；远端仅同步标准W&B配置、输出与summary文件。
+
+### E129：C-H9R跨rollout完整cost replay实现、验证与1M预注册（2026-07-17）
+
+- 新增默认关闭的`cost_transition_replay_batches=0,cost_transition_replay_coef=1`。首轮正式路线只允许MC、actor-feature、QR、uniform grid、linear output、online quantile query、actor interval1、shared coef0、s0 aux0和feature refresh False；它只改变cost head监督，不重放reward、PPO、PID或observation RMS。
+- 启用`batches=1,coef=1`后，第一个rollout仍用100% current cost objective；该轮全部critic/actor/log完成后才把detached feature、action、step和MC cost入队。从第二轮起，current/replay各占0.5，两个权重和为1；K批replay先内部求均值再乘统一权重，不随K放大critic learning-rate。
+- default-off用既有seed305、4k cost-LSTM金样本回归，补丁前后60个checkpoint tensor leaves逐元素完全相同，差异数0。B2/T32、3 rollout、C3/A2、chunk16启用smoke正常exit0；首次replay在critic learning step3激活，后两轮共6个replay update，每次1批/64 transitions，PPO首epochratio误差`7.43e-5`，44个checkpoint tensor全部有限。
+- 纯张量full/chunk对拍使用64条、QR8、risk-discount和mean-anchor：QR/mean/combined/scaled loss最大差`9.54e-7`，cost-head梯度最大差`1.19e-7`。这证明chunk只改变浮点归约顺序，没有按块重复放大replay梯度。
+- 第一版故意缓存stale behavior actor feature，而不同时缓存recurrent输入并重算current feature。C-H7C actor×critic四格显示一次actor更新只让固定critic预测约变化0.03，而换最后critic会变化约9.88；因此先隔离“增加跨rollout监督”更有信息量。若本轮校准改善但出现feature drift证据，再把旧批current-feature重算作为独立消融。
+- 正式C-H9R以C-H8B40 seed2为逐项基线：B40×25、总1M、C20/A8、QR32、MC、risk-discount=.995、actor-feature、mean-anchor=.5/scale10、LSTM512、obs RMS、sigmoid T1、经验PI/PID target=.15及全部LR不变；唯一变量是transition replay `0→1 batch,coef1`。预计首轮20个critic step无replay，后24轮×20=480个replay update，每次40,000条旧transition；缓存feature约81.9MB，A100 80GB有充分余量。
+- 工程门：first active step=20、update events=480、active时samples=40,000/batches=1/current scale=.5/replay scale=.5；ratio≤`1e-3`、无NaN/Inf/OOM。机制门：末5批pre-Brier相对C-H8的约`.15842`改善至少10%，pre-CDF error不得恶化10%；最后一批current/replay target mean及两个loss透明报告，防止只把旧批平均值机械写入head。
+- 性能门保持fresh512 reward≥`.75`且outage≤`.22`；hard Brier必须≤E121 seed2的1.10倍即约`.15898`、AUC不得比C-H8 `.59387`下降超过`.03`、mean-cost error≤1。全部通过才扩seed0/1；失败不扫replay coef或B60/B80，优先实现上一rollout held-out选择critic epoch，区分“混合旧标签有用”与“需要显式泛化选择”。
+- B40无replay纯训练403.94秒。完整replay额外做一次等规模cost-head前向/反向，预计纯训练9--13分钟、内置128评估约1--2分钟、fresh512约4--5分钟；正式训练只用持久化后台和脱敏W&B online。

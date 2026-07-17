@@ -201,6 +201,10 @@ def base_args(algo, seed, device, env_key):
         # 质量，coef 按 auxiliary/base ratio 解释并归一化总梯度尺度。
         a.cost_s0_aux_coef = 0.0
         a.cost_s0_replay_batches = 4
+        # 完整transition replay默认关闭；显式设batches=1时缓存上一rollout的
+        # detached actor feature/action/step/MC cost，与当前cost目标做等尺度凸组合。
+        a.cost_transition_replay_batches = 0
+        a.cost_transition_replay_coef = 1.0
         # QCPO_refs cost mean MSE 默认关闭；显式0.5时按本实现QR target-sum
         # 尺度自动换算相对权重，不需要随N手动重调。
         a.cost_mean_anchor_coef = 0.0

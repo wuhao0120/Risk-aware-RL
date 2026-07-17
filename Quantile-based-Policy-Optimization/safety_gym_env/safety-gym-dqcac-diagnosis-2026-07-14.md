@@ -1887,3 +1887,13 @@ C-H8B40在固定100万环境步下把每次更新的独立轨迹从20增到40、
 所以现在最重要的诊断不是网络太小、quantile太少、没有PPO clip或训练太短。PPO的behavior log-prob/importance ratio已经正确固定，MLP+LSTM、GAE、PID、mean anchor和100万步也已验证；当前首要瓶颈是action-conditioned cost critic只在当前rollout上重复C20次，学会当前批比学会未见轨迹快得多。增加B只能减轻，不能消除这个监督结构。
 
 严格按预注册不扩B40 seed0/1，也不扫B60/B80。下一项应把上一rollout作为训练replay或held-out验证：前者增加跨批监督，后者选择对未见批次不过拟合的critic epoch。首轮建议在B40上缓存一个旧批并与当前批等权，保持Actor/PID/QR32/mean-anchor和1M预算不变；先用seed2检验fresh reward≥0.75、outage≤0.22，同时要求Brier≤E121的1.10倍、mean error≤1。若仍失败，再考虑held-out early stopping、小adapter/PCGrad或Weibull低方差辅助，而不是继续堆quantile数量。
+
+### 13.110 跨rollout replay已经实现为真正的监督重用，而不是off-policy PPO重放（2026-07-17）
+
+新机制只缓存上一rollout的detached recurrent feature、实际action、time step和完整MC remaining cost。它不会把旧动作再次送入policy loss，也不会用旧trajectory更新经验PID；所以这里没有第二套actor importance ratio。PPO仍只对当前behavior batch保存固定old log-prob并做ratio/clip。replay解决的是cost critic统计泛化，不是policy replay。
+
+权重定义也刻意避免隐含学习率变化。第一批replay为空，当前cost objective权重为1；以后coef1时当前批与旧批各0.5，QR和mean anchor在两边使用相同risk-discount测度与物理尺度。完整replay分块只累计梯度并执行一次joint optimizer step。默认关闭的60个tensor逐位回归、启用smoke的first-active-step=3/6次事件，以及full/chunk最大梯度差1.19e-7共同证明了这条作用链。
+
+第一版没有重算旧rollout在current actor下的feature。这样做不是忽略非平稳性，而是根据四格证据控制变量：固定critic换actor只改变预测约0.03，固定actor换critic改变约9.88。若直接同时加入raw recurrent replay和current-feature重算，就无法判断收益来自跨批标签还是坐标刷新。正式C-H9R先检验一批stale feature是否已经足以抑制C20当前批记忆；若成功，再单独比较refresh；若失败且出现明显feature方向冲突，才升级缓存协议。
+
+正式实验在B40/seed2/1M上只打开一批等权replay。它必须同时改善下一rollout的prequential Brier和fresh reward/outage，而不是只降低混合训练loss。通过门为reward≥0.75、outage≤0.22、hard Brier≤0.15898、mean error≤1且AUC无明显下降；否则下一路线是held-out critic-step selection，而不是继续把同一旧批权重调成0.25/2或无限加深buffer。

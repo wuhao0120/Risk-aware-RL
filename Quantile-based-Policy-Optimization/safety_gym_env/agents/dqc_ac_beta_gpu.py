@@ -352,6 +352,13 @@ class DQCACBetaGPU(VecAgentBase):
             getattr(args, 'cost_shared_backbone_huber_kappa', 1.0))
         self.cost_s0_replay_batches = int(
             getattr(args, 'cost_s0_replay_batches', 4))
+        # C-H9默认关闭：缓存若干“已经完成更新的旧rollout”完整cost监督。coef是
+        # replay objective/current objective的相对比值；激活后使用1/(1+coef)与
+        # coef/(1+coef)做凸组合，避免把数据复用偷偷变成更大的critic learning rate。
+        self.cost_transition_replay_batches = int(
+            getattr(args, 'cost_transition_replay_batches', 0))
+        self.cost_transition_replay_coef = float(
+            getattr(args, 'cost_transition_replay_coef', 1.0))
         if self.cost_s0_aux_coef < 0.0:
             raise ValueError("cost_s0_aux_coef must be non-negative")
         if self.cost_mean_anchor_coef < 0.0:
@@ -371,6 +378,10 @@ class DQCACBetaGPU(VecAgentBase):
             raise ValueError("cost_shared_backbone_huber_kappa must be positive")
         if self.cost_s0_replay_batches <= 0:
             raise ValueError("cost_s0_replay_batches must be positive")
+        if self.cost_transition_replay_batches < 0:
+            raise ValueError("cost_transition_replay_batches must be non-negative")
+        if self.cost_transition_replay_coef <= 0.0:
+            raise ValueError("cost_transition_replay_coef must be positive")
         # step feature 默认跟随 episodic: 有限期界下剩余 cost 分布依赖剩余步数 (已验证配方)
         _csf = getattr(args, 'critic_step_feature', None)
         self.critic_step_feature = bool(_csf) if _csf is not None else self.episodic
@@ -534,6 +545,44 @@ class DQCACBetaGPU(VecAgentBase):
                 raise ValueError("cost_s0_aux_coef>0 currently requires cost_target_mode='mc'")
             if self.cost_history_mode != 'raw':
                 raise ValueError("cost_s0_aux_coef>0 currently requires cost_history_mode='raw'")
+
+        # 首轮完整replay只服务已经得到最好闭环信号的detach actor-feature主线。
+        # 这些限制使正式差异唯一来自“上一rollout是否继续监督cost head”；后续若
+        # 机制通过，再分别开放IQN/current-feature refresh/shared-backbone等消融。
+        if self.cost_transition_replay_batches > 0:
+            if self.cost_target_mode != 'mc':
+                raise ValueError(
+                    "cost transition replay currently requires MC cost targets")
+            if self.cost_history_mode != 'actor_feature':
+                raise ValueError(
+                    "cost transition replay currently requires actor_feature history")
+            if self.cost_distribution_model != 'qr':
+                raise ValueError(
+                    "cost transition replay currently requires QR cost distribution")
+            if self.cost_quantile_grid_mode != 'uniform':
+                raise ValueError(
+                    "cost transition replay currently requires uniform quantiles")
+            if self.cost_actor_query_mode != 'online':
+                raise ValueError(
+                    "cost transition replay currently requires online cost query")
+            if self.cost_cdf_estimator != 'quantile':
+                raise ValueError(
+                    "cost transition replay currently requires quantile CDF")
+            if self.cost_quantile_output != 'linear':
+                raise ValueError(
+                    "cost transition replay currently requires linear cost output")
+            if self.cost_actor_feature_refresh:
+                raise ValueError(
+                    "cost transition replay first ablation requires feature refresh disabled")
+            if self.cost_s0_aux_coef > 0.0:
+                raise ValueError(
+                    "cost transition replay currently requires cost_s0_aux_coef=0")
+            if self.cost_shared_backbone_coef > 0.0:
+                raise ValueError(
+                    "cost transition replay currently requires shared backbone coef=0")
+            if self.actor_update_interval != 1:
+                raise ValueError(
+                    "cost transition replay currently requires actor_update_interval=1")
 
         # C-H6首轮只改变QCPO_refs式共享表示梯度，不同时混入IQN、局部网格、
         # target/crossfit查询、独立cost-LSTM或actor cadence。严格限制组合使中长跑
@@ -928,6 +977,16 @@ class DQCACBetaGPU(VecAgentBase):
         # replay 只保存少量 GPU tensor；原始 state 在使用时重新走当前 RMS，不能
         # 缓存旧归一化结果，否则 observation statistics 漂移会污染监督输入。
         self.cost_s0_replay = deque(maxlen=self.cost_s0_replay_batches)
+        # batches=0时deque仍保持空且append helper直接返回；默认路径不clone tensor。
+        # replay条目只含cost head所需字段，不保存reward、log-prob或actor optimizer状态。
+        self.cost_transition_replay = deque(
+            maxlen=max(1, self.cost_transition_replay_batches))
+        self.last_cost_transition_replay_samples = 0.0
+        self.last_cost_transition_replay_batches = 0.0
+        self.last_cost_transition_replay_qr_loss = 0.0
+        self.last_cost_transition_replay_mean_loss = 0.0
+        self.cost_transition_replay_update_events = 0
+        self.cost_transition_replay_first_active_step = -1
         self.last_s0_holdout_pre = {}                          # 最新新批训练前校准
         self.last_s0_holdout_post = {}                         # 同一批critic更新后校准
         self.empirical_cost_window = deque(maxlen=self.pid_window_episodes)
@@ -969,6 +1028,8 @@ class DQCACBetaGPU(VecAgentBase):
               f"/floor{self.cost_critic_weight_floor:g}, "
               f"s0_aux={self.cost_s0_aux_coef:g}"
               f"/replay{self.cost_s0_replay_batches}, "
+              f"transition_replay={self.cost_transition_replay_batches}"
+              f"/coef{self.cost_transition_replay_coef:g}, "
               f"cost_mean_anchor={self.cost_mean_anchor_coef:g}"
               f"/scale{self.cost_mean_anchor_cost_scale:g}, "
               f"cost_output={self.cost_quantile_output}"
@@ -1340,6 +1401,10 @@ class DQCACBetaGPU(VecAgentBase):
 
             # ===== 4. 日志 + 调度 =====
             self._log(it, batch, critic_info, actor_info)
+            # 当前batch必须在全部C次critic/全部A次actor更新完成后才进入replay。
+            # 若在prequential阶段提前入队，本轮会把同一批同时当current和replay，
+            # 既没有新增跨rollout监督，又会破坏预注册的50/50语义。
+            self._append_cost_transition_replay(batch)
             if actor_updated:
                 self.actor_scheduler.step()                    # 每个有 actor update 的 rollout 推进一步
             if dual_updated and self.dual_update_mode == 'critic_adam':
@@ -2024,6 +2089,117 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/cost_s0_target_mean': float(scalar_targets.mean().item()),
         }
 
+    @torch.no_grad()
+    def _append_cost_transition_replay(self, batch):
+        """
+        在本轮全部更新结束后缓存完整cost transition监督，供后续rollout复用。
+
+        actor feature、action、step与MC cost保持同一time-major索引；feature显式
+        detach/clone，保证旧批不会保留actor计算图。第一版接受一批stale behavior
+        feature：C-H7C四格已证明一次actor更新造成的坐标变化远小于critic末批过拟合；
+        是否重算旧feature留作独立消融，不能在首轮同时改变监督量和表示时序。
+        """
+        if self.cost_transition_replay_batches <= 0:
+            return
+        if 'cost_feature' not in batch or 'mc_cost' not in batch:
+            raise RuntimeError(
+                "cost transition replay requires aligned cost_feature and mc_cost")
+        features = batch['cost_feature']
+        if features.requires_grad:
+            raise RuntimeError("replayed actor features must be detached")
+        sample_count = int(batch['actions'].shape[0])
+        if features.ndim != 2 or features.shape[0] != sample_count:
+            raise ValueError(
+                "cost transition replay feature rows must match transition count")
+        self.cost_transition_replay.append({
+            'features': features.detach().clone(),
+            'actions': batch['actions'].detach().clone(),
+            'steps': batch['steps'].detach().clone(),
+            'targets': batch['mc_cost'].detach().clone(),
+        })
+
+    def _backward_cost_transition_replay(self, replay_scale, mean_anchor_scale):
+        """
+        对旧rollout cost监督反传一次加权目标，并返回与当前批分离的诊断。
+
+        所有缓存批先组成一个replay测度，再由replay_scale整体加权；因此把缓存从
+        1批增到K批只增加独立样本覆盖，不会把总梯度权重乘K。chunking仍共享一次
+        optimizer step，每块乘元素占比，数学上等价于整个replay bank的加权均值。
+        """
+        if replay_scale <= 0.0 or not self.cost_transition_replay:
+            return {
+                'critic/cost_transition_replay_active': 0.0,
+                'critic/cost_transition_replay_batches': 0.0,
+                'critic/cost_transition_replay_samples': 0.0,
+                'critic/cost_transition_replay_qr_loss': 0.0,
+                'critic/cost_transition_replay_mean_loss': 0.0,
+                'critic/cost_transition_replay_objective_loss': 0.0,
+                'critic/cost_transition_replay_scaled_loss': 0.0,
+                'critic/cost_transition_replay_target_mean': 0.0,
+            }
+
+        def merge(key):
+            """单批直接复用tensor；多批才cat，避免正式K=1每个epoch额外复制80MB feature。"""
+            values = [entry[key] for entry in self.cost_transition_replay]
+            return values[0] if len(values) == 1 else torch.cat(values, dim=0)
+
+        features = merge('features')
+        actions = merge('actions')
+        steps = merge('steps')
+        scalar_targets = merge('targets')
+        if features.requires_grad:
+            raise RuntimeError("cost transition replay feature graph must be detached")
+        total_size = int(features.shape[0])
+        if not (actions.shape[0] == steps.shape[0] == scalar_targets.shape[0]
+                == total_size):
+            raise RuntimeError("cost transition replay fields lost row alignment")
+
+        # actor_feature模式不读取raw state；传None能避免为接口占位额外分配[M,state_dim]。
+        inputs = self._cost_inputs(None, steps, features)
+        targets = scalar_targets.unsqueeze(1).expand(-1, self.num_quantiles)
+        sample_weights = self._cost_critic_sample_weights(steps)
+        configured_chunk = self.critic_minibatch_size
+        chunk_size = (
+            total_size if configured_chunk <= 0 else min(configured_chunk, total_size))
+        qr_loss_value = 0.0
+        mean_loss_value = 0.0
+
+        for begin in range(0, total_size, chunk_size):
+            finish = min(begin + chunk_size, total_size)
+            weight = float(finish - begin) / float(total_size)
+            prediction = self._cost_training_quantiles(
+                inputs[begin:finish], actions[begin:finish], None)
+            chunk_weights = (
+                None if sample_weights is None else sample_weights[begin:finish])
+            qr_loss = self._cost_quantile_huber_loss(
+                prediction, targets[begin:finish], chunk_weights)
+            if self.cost_mean_anchor_coef <= 0.0:
+                (replay_scale * weight * qr_loss).backward()
+                mean_loss = None
+            else:
+                mean_loss = self._cost_mean_anchor_loss(
+                    prediction, targets[begin:finish], chunk_weights)
+                (replay_scale * weight * (
+                    qr_loss + mean_anchor_scale * mean_loss)).backward()
+                mean_loss_value += weight * float(mean_loss.item())
+            qr_loss_value += weight * float(qr_loss.item())
+
+        objective_value = (
+            qr_loss_value + mean_anchor_scale * mean_loss_value)
+        return {
+            'critic/cost_transition_replay_active': 1.0,
+            'critic/cost_transition_replay_batches': float(
+                len(self.cost_transition_replay)),
+            'critic/cost_transition_replay_samples': float(total_size),
+            'critic/cost_transition_replay_qr_loss': qr_loss_value,
+            'critic/cost_transition_replay_mean_loss': mean_loss_value,
+            'critic/cost_transition_replay_objective_loss': objective_value,
+            'critic/cost_transition_replay_scaled_loss': float(
+                replay_scale * objective_value),
+            'critic/cost_transition_replay_target_mean': float(
+                scalar_targets.mean().item()),
+        }
+
     def _cost_mean_anchor_scale(self, num_target_samples):
         '''
         把 QCPO_refs 的 mean-cost 系数换算到本实现 QR 的 target-sum 尺度。
@@ -2302,6 +2478,20 @@ class DQCACBetaGPU(VecAgentBase):
         cost_mean_anchor_scale = self._cost_mean_anchor_scale(
             cost_target.shape[-1])
 
+        # 第一个rollout的replay为空，current_scale严格为1；从第二个rollout起，
+        # coef=1得到current/replay各0.5。只由是否已有“旧批”决定，不把当前批提前入队。
+        transition_replay_active = bool(
+            self.cost_transition_replay_batches > 0
+            and self.cost_transition_replay)
+        if transition_replay_active:
+            transition_current_scale = (
+                1.0 / (1.0 + self.cost_transition_replay_coef))
+            transition_replay_scale = (
+                self.cost_transition_replay_coef * transition_current_scale)
+        else:
+            transition_current_scale, transition_replay_scale = 1.0, 0.0
+        transition_replay_info = None
+
         # 辅助目标只改变 cost 监督在 transition 与 recent-s0 间的质量分配。
         # coef=0 时 s0_aux_loss=None，下面保留历史 backward 表达式逐位不变。
         s0_aux_loss, s0_aux_info = self._cost_s0_auxiliary_loss()
@@ -2396,7 +2586,21 @@ class DQCACBetaGPU(VecAgentBase):
                     self._cost_mean_anchor_loss(
                         cost_pred, cost_target, cost_sample_weights)
                     if self.cost_mean_anchor_coef > 0.0 else None)
-            if s0_aux_loss is None and cost_mean_loss is None:
+            if transition_replay_active:
+                # 构造期已拒绝s0_aux/crossfit组合；先释放current大图，再逐块构建旧批图。
+                if s0_aux_loss is not None:
+                    raise RuntimeError(
+                        "transition replay cannot share an update with s0 auxiliary")
+                if cost_mean_loss is None:
+                    (reward_loss
+                     + transition_current_scale * cost_loss).backward()
+                else:
+                    (reward_loss + transition_current_scale * (
+                        cost_loss
+                        + cost_mean_anchor_scale * cost_mean_loss)).backward()
+                transition_replay_info = self._backward_cost_transition_replay(
+                    transition_replay_scale, cost_mean_anchor_scale)
+            elif s0_aux_loss is None and cost_mean_loss is None:
                 # 两个可选目标都关闭时保持历史图和浮点运算顺序。
                 (reward_loss + cost_loss).backward()
             elif s0_aux_loss is None:
@@ -2441,7 +2645,20 @@ class DQCACBetaGPU(VecAgentBase):
                         None if cost_sample_weights is None
                         else cost_sample_weights[begin:finish])
                     if self.cost_mean_anchor_coef > 0.0 else None)
-                if s0_aux_loss is None and cost_mean_loss_chunk is None:
+                if transition_replay_active:
+                    if cost_mean_loss_chunk is None:
+                        (weight * (
+                            reward_loss_chunk
+                            + transition_current_scale
+                            * cost_loss_chunk)).backward()
+                    else:
+                        (weight * (
+                            reward_loss_chunk
+                            + transition_current_scale * (
+                                cost_loss_chunk
+                                + cost_mean_anchor_scale
+                                * cost_mean_loss_chunk))).backward()
+                elif s0_aux_loss is None and cost_mean_loss_chunk is None:
                     # 两个可选目标都关闭时保持原 chunk backward 顺序。
                     (weight * (reward_loss_chunk + cost_loss_chunk)).backward()
                 elif s0_aux_loss is None:
@@ -2468,6 +2685,15 @@ class DQCACBetaGPU(VecAgentBase):
             if s0_aux_loss is not None:
                 # recent-s0 图很小，只在全部 transition chunk 释放后反传一次。
                 (cost_aux_scale * s0_aux_loss).backward()
+            if transition_replay_active:
+                # current chunks已经逐块释放；现在复用同一optimizer梯度槽累加旧批目标。
+                transition_replay_info = self._backward_cost_transition_replay(
+                    transition_replay_scale, cost_mean_anchor_scale)
+
+        # 首个rollout或默认关闭时不构造replay图，只返回全零诊断；该helper也不采样RNG。
+        if transition_replay_info is None:
+            transition_replay_info = self._backward_cost_transition_replay(
+                0.0, cost_mean_anchor_scale)
 
         # 分开记录两个critic及cost head/history encoder的裁剪前梯度范数，
         # 诊断joint clip究竟由reward、quantile head还是循环表示主导。
@@ -2582,11 +2808,21 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/cost_s0_aux_enabled': float(s0_aux_loss is not None),
             'critic/cost_s0_base_scale': float(cost_base_scale),
             'critic/cost_s0_aux_scale': float(cost_aux_scale),
+            'critic/cost_transition_replay_configured': float(
+                self.cost_transition_replay_batches > 0),
+            'critic/cost_transition_replay_coef': (
+                self.cost_transition_replay_coef),
+            'critic/cost_transition_current_scale': float(
+                transition_current_scale),
+            'critic/cost_transition_replay_scale': float(
+                transition_replay_scale),
             'critic/cost_objective_loss': float(
-                cost_base_scale * (
+                cost_base_scale * transition_current_scale * (
                     cost_loss_value
                     + cost_mean_anchor_scale * cost_mean_loss_value)
-                + s0_aux_info['critic/cost_s0_aux_scaled_loss']),
+                + s0_aux_info['critic/cost_s0_aux_scaled_loss']
+                + transition_replay_info[
+                    'critic/cost_transition_replay_scaled_loss']),
         }
         if self.cost_actor_query_mode == 'crossfit':
             critic_info.update({
@@ -2597,6 +2833,23 @@ class DQCACBetaGPU(VecAgentBase):
                 'critic/cost_crossfit_fold1_fraction': crossfit_fold1_fraction,
             })
         critic_info.update(s0_aux_info)
+        critic_info.update(transition_replay_info)
+        self.last_cost_transition_replay_samples = float(
+            transition_replay_info['critic/cost_transition_replay_samples'])
+        self.last_cost_transition_replay_batches = float(
+            transition_replay_info['critic/cost_transition_replay_batches'])
+        self.last_cost_transition_replay_qr_loss = float(
+            transition_replay_info['critic/cost_transition_replay_qr_loss'])
+        self.last_cost_transition_replay_mean_loss = float(
+            transition_replay_info['critic/cost_transition_replay_mean_loss'])
+        if bool(transition_replay_info['critic/cost_transition_replay_active']):
+            if self.cost_transition_replay_first_active_step < 0:
+                self.cost_transition_replay_first_active_step = self.learning_steps
+            self.cost_transition_replay_update_events += 1
+        critic_info['critic/cost_transition_replay_update_events'] = float(
+            self.cost_transition_replay_update_events)
+        critic_info['critic/cost_transition_replay_first_active_step'] = float(
+            self.cost_transition_replay_first_active_step)
         critic_info.update(direct_cdf_info)
         return critic_info
 
@@ -3954,6 +4207,8 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_history_mode == 'actor_feature'),
             'debug/cost_actor_feature_refresh_enabled': float(
                 self.cost_actor_feature_refresh),
+            'debug/cost_transition_replay_enabled': float(
+                self.cost_transition_replay_batches > 0),
             'debug/cost_history_cost_lstm': float(
                 self.cost_history_mode == 'cost_lstm'),
             'debug/cost_critic_time_weighted': float(
@@ -4337,6 +4592,21 @@ class DQCACBetaGPU(VecAgentBase):
                 self.last_risk_query_target_online_abs_mean),
             'cost_s0_aux_coef': self.cost_s0_aux_coef,
             'cost_s0_replay_batches': self.cost_s0_replay_batches,
+            'cost_transition_replay_batches': (
+                self.cost_transition_replay_batches),
+            'cost_transition_replay_coef': self.cost_transition_replay_coef,
+            'cost_transition_replay_samples_last': (
+                self.last_cost_transition_replay_samples),
+            'cost_transition_replay_batches_last': (
+                self.last_cost_transition_replay_batches),
+            'cost_transition_replay_qr_loss_last': (
+                self.last_cost_transition_replay_qr_loss),
+            'cost_transition_replay_mean_loss_last': (
+                self.last_cost_transition_replay_mean_loss),
+            'cost_transition_replay_update_events': (
+                self.cost_transition_replay_update_events),
+            'cost_transition_replay_first_active_step': (
+                self.cost_transition_replay_first_active_step),
             'cost_mean_anchor_coef': self.cost_mean_anchor_coef,
             'cost_mean_anchor_cost_scale': self.cost_mean_anchor_cost_scale,
             'cost_mean_anchor_scale': self._cost_mean_anchor_scale(
