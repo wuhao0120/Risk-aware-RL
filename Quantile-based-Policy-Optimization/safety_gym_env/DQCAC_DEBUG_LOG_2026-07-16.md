@@ -1486,3 +1486,22 @@
 - 严格裁决：C-H6L不通过机制门和性能门，不扩seed0/2，不作为默认配置，也不通过调小/调大coef追逐单seed。当前证据最符合“在线action-conditioned QR辅助梯度与reward/PPO对共享history发生负迁移”：它能改变表示、略推高reward并减少crossing，却破坏对未见轨迹的风险排序/概率尺度，使PID拿到更危险的策略。
 - 证据位于`_runs/wandb_export/dqc_shared_backbone_pair_1m_s1_2026-07-17/`和`_runs/profiles/dqc_shared_backbone_pair_1m_s1_2026-07-17/`；后者包含`metric_profile.csv/profile.json/report.md/overview.png`。两份fresh512 JSON分别为`_runs/DQCAC_DynamicButton_ch6l_coef0_b20_1m_s1_final_eval520_20260717_s1.json`和`_runs/DQCAC_DynamicButton_ch6l_sharedcoef1_b20_1m_s1_final_eval520_20260717_s1.json`；文件名沿用预注册的eval520标签，但JSON内`num_episodes=512`是修复后的真实精确口径。
 - 下一步不继续给同一个actor backbone增加QR权重。优先路线是把“cost信息进入policy history”和“高方差QR直接扰动PPO”分开：①默认保留actor-feature detach head，用跨rollout replay/held-out选择抑制C20同批过拟合；②加入小型cost adapter或对共享cost梯度做PCGrad/正交投影，仅在与PPO/value不冲突时更新共享层；③先验证QCPO_refs的Weibull tail是否提供比32点QR更低方差的共享监督。三条作为独立消融，先做冻结/短程机制门，不同时混入PID、quantile grid或output activation。
+
+### E121：C-H6L coef0三种子——平均安全改善但reward方差扩大（2026-07-17）
+
+- seed1 coef0不是共享梯度候选，却相对旧P-M3 seed1同时把fresh reward/outage从`.86220/.30577`改善到`.99587/.22656`。因此补跑seed0/2，验证`cost_history_mode=actor_feature + mean-anchor=.5/scale10`是否能成为独立的新主线；其它B20/T1000/C20/A8、LSTM512、GAE-PPO、obs RMS、T1、PID target=.15及1M预算保持不变。
+- 第一次seed0/2启动把CLI `--tag`错误插入`--set`列表，两条均在argparse阶段立即exit2，没有构造环境、没有checkpoint、没有W&B run也没有训练。修正argv边界后复用job名从头启动；正式W&B run为seed0 `yx08vswe`、seed2 `u75gmeuf`，与seed1 `vvfok94n`共同组成150行完整history，三条均正常exit0。
+- 精确fresh512分别为seed0/1/2 reward=`.90480/.99587/.62779`，outage=`.21484/.22656/.16602`；三seed mean±sample-SD为reward `.84282±.19171`、outage `.20247±.03211`。seed0/2通过`≤.22`工程门，seed1只高`.00656`；三seed平均仅高名义alpha `.00247`，但reward的seed2低谷使其尚不稳定。
+- 旧P-M3三seed fresh520为reward `.81574±.08468`、outage `.22821±.07072`。新组合平均reward增加`.02708`即3.32%，outage绝对下降`.02573`即相对11.28%，安全seed方差下降约55%；但reward标准差从`.0847`扩大到`.1917`。结论是“有用的平均安全/校准改进”，不是“稳定性能提升”。
+- 新组合独立hard Brier/AUC三seed聚合为`.16794±.02029/.57857±.00749`，smooth为`.16772±.02028/.57982±.00776`；AUC跨seed稳定高于随机，优于此前独立cost-LSTM的方向反转。predicted/true mean cost聚合为`8.3019/8.9896`，crossing `.20189±.01735`，说明actor-feature+mean anchor改善了条件排序稳定性，但shape单调性仍差。
+- 训练末10批聚合reward/outage为`.76151±.15349/.20667±.07848`。seed0末段为高reward高风险，seed2为低reward安全，训练中多次风险周期；fresh结果不是简单由最后一个B20决定。故不直接跑5M，也不声称超过QCPO_refs；优先把已验证的P-M8 Actor/PID同频组件与更好的cost表示组合，检验是否减少闭环分叉。
+- 正式W&B/profile位于`_runs/wandb_export/dqc_actorfeature_meananchor_coef0_1m_multiseed_2026-07-17/`与`_runs/profiles/dqc_actorfeature_meananchor_coef0_1m_multiseed_2026-07-17/`。seed0/2 fresh JSON使用明确`eval512`标签；seed1旧文件名保留`eval520`预注册字符串，但JSON内部精确`num_episodes=512`。
+
+### E122：C-H7C 更好cost表示叠加Actor/PID同频cadence预注册（2026-07-17）
+
+- C-H7C以E121 coef0为基线，只把`actor_update_interval=1→2`和`pid_update_interval=1→2`作为一个已经在P-M8独立验证过的“同频控制组件”加入。critic仍每个B20立即C20；Actor连续收集两批同一behavior共40条轨迹后做8次PPO，经验PID也在相同B40边界用40条真实MC cost更新一次，随后该lambda立即供Actor使用。
+- 这不是盲目叠加两个失败trick。E121的actor-feature+mean anchor使三seed outage均值降到`.2025`且AUC稳定约`.579`，但reward seed方差变大；P-M8证明同频cadence能减少成熟期outage/lambda振荡，却因raw critic多seed平均outage`.25`失败。两者分别针对cost表示与controller时序，存在互补作用链。
+- 首轮同时跑两个压力端：seed0代表E121的高reward/较高风险端，seed2代表低reward/安全端；每条完整1M，不以300k早停。相对各自E121 final，seed0要求fresh512 outage≤`.22`且reward不低于`.8143`（不损失超过10%）；seed2要求outage≤`.22`且reward≥`.75`。两条同时过门才补seed1，不因其中一条漂亮而扩5M。
+- 机制门：25个Actor事件与25个PID事件一一对应，每次Actor batch=40条；首epochratio误差≤`1e-3`，无NaN/Inf；末200k outage或lambda标准差相对E121同seed下降至少20%，或至少不再出现更大的闭环周期。Brier/AUC不能相对E121恶化10%以上，mean/crossing透明报告。
+- 若seed0安全但seed2仍低reward，说明cadence不能解决策略盆地/初始化方差，停止该组合并转cost-gradient conflict/adapter或held-out replay；若seed2恢复reward但seed0不安全，说明主要缺口仍是risk guard/PID而非表示。只有两条同时通过才运行seed1并以三seedmean±SD裁决。
+- 正式job为`DQCAC_DynamicButton_ch7c_actorfeature_meananchor_cadence2_b20_1m_s0/s2`，W&B online名称、group和tags只含公开算法语义，CLI tag与checkpoint目录均唯一。两条使用`launch_background.sh`持久化；预计并行训练加内置评估约10--14分钟，条件fresh512再约7--9分钟。

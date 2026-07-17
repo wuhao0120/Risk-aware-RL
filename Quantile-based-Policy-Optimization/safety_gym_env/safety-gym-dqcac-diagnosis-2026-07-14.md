@@ -1843,3 +1843,11 @@ C-H6L最终证明“共享梯度确实接通”和“共享梯度有益”是两
 因此QCPO_refs的共享结构不能机械移植为“把DQCAC的32点action-conditioned QR loss加到PPO backbone”。reference的cost quantile、mean和Weibull head在state/history层面共同约束表示；DQCAC的risk advantage则要求action-conditioned条件分布，QR目标噪声和PPO/reward目标会直接竞争同一LSTM。当前最符合证据的解释是负迁移，而不是共享系数太小、训练太短或IS修正缺失。
 
 后续不把coef1扩到多seed，也不立即扫描0.1/0.25/2.0。优先把两件事解耦：保留detach actor feature作为主cost head输入，再用跨rollout held-out/replay约束其泛化；若仍需cost更新共享表示，只给一个小adapter，或用PCGrad/梯度余弦门控去掉与PPO/value冲突的分量。另一条独立路线是先检验Weibull tail是否能提供比全32点QR更低方差的共享辅助监督。每条都必须先过prequential Brier/AUC和fresh outage门，不能因训练reward上升就晋级。
+
+### 13.104 detach actor history加mean anchor是小幅有用改进，但还不是稳定主线（2026-07-17）
+
+共享coef1失败不意味着整个C-H6L对照没有信息。coef0保留actor-feature detach和mean anchor，三seed fresh512得到reward `0.843±0.192`、outage `0.202±0.032`；旧P-M3是`0.816±0.085/0.228±0.071`。平均reward提高3.3%、outage下降2.57个百分点且安全方差减半，说明成熟policy history和额外mean监督确实比raw state-only QR更有用。
+
+代价是reward初始化敏感性明显增大。seed0/1 reward约0.905/0.996，seed2只有0.628；对应outage又从0.215/0.227降到0.166。它不是所有seed都沿同一Pareto前沿平移，而是把seed2推到低reward安全盆地。虽然hard AUC三seed稳定为`0.579±0.007`，条件风险排序不再像独立cost-LSTM那样反向，critic仍不足以保证策略闭环收敛到同一个工作点。
+
+因此该组合值得保留为新的cost表示基线，但不直接扩5M。下一实验加入P-M8已经独立验证的Actor/PID同频cadence：critic仍逐B20学习，Actor与PID每两批在B40边界共同响应。若它能让seed0保持安全并把seed2 reward恢复到0.75以上，才说明“更好表示+低噪声控制时序”具有互补性；否则回到梯度冲突门控、adapter或跨rollout held-out，而不是继续扫描固定PID target。
