@@ -1803,3 +1803,13 @@ corrected C-H4M2完整跑满600k。最清楚的正结果是独立mean-cost：raw
 但actor真正依赖的是逐状态、逐action的超限概率，不只是总体均值。mean-anchor的独立hard Brier为0.258，比raw的0.203差27%；AUC为0.561，虽比raw高0.042并保留history信号，却低于无anchor的0.590。crossing从无anchor的0.268降到0.199，仍远高于raw的0.057。更严重的是末5批更新前Brier为0.332，比raw恶化43%，而同批更新后能降到0.083；这仍是明显的当前批拟合、下一批失真。
 
 所以mean anchor可以保留为后续复合候选的基础组件，但当前单组件不能进入live闭环，也没有理由扫描0.1/0.25/1.0系数。下一步继续按QCPO_refs拆组件：先单独验证非负cost quantiles；若只能减少负值而不能改善Brier/AUC，则转Weibull tail或共享多任务history。exp是源实现路线，softplus是更稳定但不完全同构的分歧路线，两者应先做轻量数值/梯度验证再选择一个正式单变量，不能同时当作同一实验。
+
+### 13.100 QCPO_refs非负cost输出必须连同cost/10单位一起迁移（2026-07-17）
+
+QCPO_refs的exp不是孤立trick。训练标签和cost limit先除以10，网络才输出exp(linear)。DQCAC一直用原始cost和原始budget，所以等价输出必须是10×exp(linear)。如果只用exp，零初始化预测1而不是10，既不公平也会加重已经观察到的cost低估；如果直接把DQCAC标签也除以10，则budget递推、CDF查询、PID和日志都要同时换单位，改动面更大且容易再次混用。因此本轮采用输出适配器恢复raw单位，是更小且语义完整的迁移。
+
+实现没有改变公共DistributionalCritic。DQCAC统一用一个helper完成QR/IQN前向，再把cost输出映射为linear、exp或softplus。这样reward critic完全不受影响，旧state_dict键也不改变；online、target、crossfit、LSTM训练、actor查询、dual和独立评估都共享同一个物理定义。默认linear回归的60个checkpoint tensor、评估与共享summary逐位exact，证明兼容性不是“数值接近”，而是严格相同。
+
+softplus路线定义为10×softplus(logit)/log(2)，因此与exp在零logit处都有输出10，比较不会把不同初始化均值误当作激活函数优劣。两个4k smoke都有限且冻结行为exact。只有4条终评，不足以评价泛化；它只排除了exp立刻溢出、映射单位错误和漏接评估路径。exp在小样本上的Brier/CDF也优于softplus，且与源算法完全同构，所以600k正式实验选择exp，softplus暂不消耗同等预算。
+
+这条实验检验的是“正值几何是否能在mean已校准后修复条件分布形状”。exp严格单调，单次前向不会自行消除quantile crossing；潜在收益来自优化参数化：低cost区梯度较小，高cost区梯度随输出放大，且不存在负cost解。若600k后mean仍准但Brier/crossing不过门，说明非负约束不是QCPO_refs稳定性的主要来源，下一步应转Weibull tail或共享policy/reward/cost history backbone，而不是扫描任意output scale。若exp导致持续100%裁剪或非有限值，才按预注册改用同初始化尺度的softplus，以区分“正值约束有用”与“指数尾部不稳定”。

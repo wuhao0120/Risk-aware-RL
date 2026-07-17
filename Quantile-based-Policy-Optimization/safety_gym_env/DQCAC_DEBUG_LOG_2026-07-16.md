@@ -1427,3 +1427,15 @@
 - 独立140条上，hard CDF absolute error为0.01585，略差于raw 0.01071、但比无anchor LSTM 0.06942改善77.17%。hard Brier为0.25822，相对raw恶化27.32%，相对无anchor只改善9.83%，未过20%机制门；hard AUC 0.56143相对raw增加0.04167，保留了超过一半history排序增益。crossing 0.19885虽比无anchor 0.26751下降25.67%，仍远高于≤0.10门和raw 0.05737。
 - 因此主门、独立门、机制门全部失败，不做fresh520、不进入live、不扫描anchor系数。结论不是“mean anchor无用”，而是它主要校准无条件一阶矩，无法单独约束逐状态概率、quantile形状和跨rollout泛化。QCPO_refs的稳定性更可能来自mean、非负输出、Weibull tail与共享多任务history的组合。
 - 正式证据包位于`_runs/profiles/dqc_frozen_ch4m2_meananchor05_scale10_600k_2026-07-17/`，包含独立/末段CSV、完整history、decision、W&B隐私审计和2682×1507对比图；PNG可由PIL完整解码。下一单变量优先审计并移植QCPO_refs的`c_dist=exp(linear)`非负输出；softplus稳定替代、Weibull tail和共享backbone作为分歧路线分别记录，不能与首轮正输出混改。
+
+### E116：QCPO_refs非负cost输出审计、实现与正式实验选择（2026-07-17）
+
+- 源码单位已逐式核对。QCPO_refs在process_returns开头执行cost /= cost_scale，正式cost_scale=10，cost_limit也在初始化时除以10；模型随后计算c_dist=torch.exp(self.constraint(fc_x))。因此当前始终使用raw cost与raw budget的DQCAC不能直接照抄exp(logit)，物理等价形式是10×exp(logit)。零logit由此预测raw cost 10，接近DynamicButton当前约11--12的真实均值；不乘10则初始化只有1，既不等价也会重新制造严重低估。
+- 新增默认关闭的cost_quantile_output=linear|exp|softplus和cost_quantile_output_scale=10。linear直接返回同一个Tensor对象；exp使用S×exp(raw)；softplus使用S×softplus(raw)/log(2)，使零logit也严格映射到S，只改变正值映射的尾部梯度。适配器位于DQCAC层，不包装或改写公共critic，因而不改变网络参数名、初始化、optimizer或旧checkpoint。
+- 全链路搜索后，online/target/crossfit、QR/IQN训练、cost-LSTM TBPTT、recent-s0、preupdate漂移、actor概率、critic-Adam dual、初始CDF日志和独立评估全部经过统一_cost_quantiles()；静态搜索已确认没有遗留直接self.cost_critic(...)、self.cost_target_critic(...)或self.cost_crossfit_critic(...)前向。W&B/profile/summary显式记录输出模式与scale。
+- 纯张量门通过：linear返回对象identity；exp与softplus的零logit输出都严格为10，所有输出为正，测试区间内前向和反向均有限。默认linear使用同一P-M3成熟策略、seed305、B2×2批×3次update的持久化回归，训练12.56秒、exit0；相对补丁前linear checkpoint，60个tensor leaves逐位相同、最大差0，全部eval字段和共享summary字段差异0，新增summary仅为模式/scale。这证明默认路径没有被适配器调用层次改变。
+- mean-anchor=.5/S=10的exp与softplus均按同一4k协议持久化运行，训练12.75/12.62秒、exit0；三条linear/exp/softplus的冻结策略reward、outage、cost及4条终评行为完全exact，三个checkpoint都无NaN/Inf。相对linear-anchor，exp与softplus各有40个cost/history tensor发生非零变化，证明新机制实际进入反向而不是只改日志。
+- 4条终评只作工程门，不能作为算法性能证据。透明报告：linear/exp/softplus的predicted mean为1.776/10.794/10.274，mean absolute error为16.474/7.456/7.976；hard CDF error为.500/.375/.484，hard Brier为.500/.349/.485，crossing为.532/.492/.452。exp在这个极小样本上没有数值异常且概率指标优于softplus，并且它是QCPO_refs源实现的精确单位映射，因此正式候选选exp；softplus只保留为exp出现溢出/持续极端梯度时的预注册替代，不把4条偶然AUC当作模型选择证据。
+- 正式C-H5E复用C-H4M2的成熟冻结policy、rollout seed101、B20×30×T1000=600k、C20、MC、risk-discount=.995、QR32、cost-LSTM、mean-anchor .5/S=10、chunk2500与独立140条评估；唯一变量是cost_quantile_output: linear→exp，scale10来自QCPO_refs单位而非调参。30批behavior/truth的16个控制字段及独立reward/outage必须与raw、C-H1W、C-H4M2逐值exact。
+- 晋级门预先固定：所有checkpoint/history有限；末5批prequential CDF error或Brier相对C-H4M2至少改善20%，另一项不得恶化10%；独立hard Brier须从.25822至少改善20%到≤.20658且AUC不低于.55，mean error保持≤.20，crossing降到≤.10。同时记录20-update裁剪率与anchor/QR比；若长期100% clip且独立门失败，不用“exp来自reference”豁免。通过才做fresh520；失败则不扫output scale，因为10由单位固定。
+- 既有同配置C-H4M2纯训练282.8秒；exp仅增加逐元素指数，预计纯训练4.7--5.5分钟、140评估和W&B收尾约1--2分钟，总墙钟6--8分钟。使用launch_background.sh持久化与脱敏W&B online。分歧路线保留为：exp数值失败时跑softplus；exp稳定但Brier/crossing失败时转Weibull tail或共享多任务backbone；二者不与首个exp正式run混改。
