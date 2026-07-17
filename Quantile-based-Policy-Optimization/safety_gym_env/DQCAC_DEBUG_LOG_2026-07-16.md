@@ -1671,3 +1671,12 @@
 - 启用NQ的B2×T1000×3 rollout、C3、actor-feature smoke训练16.6秒并exit 0；43个模块tensor全有限，训练/8条评估crossing均为0。随后eval-only持久化任务正常重建nq/relu并加载6000步checkpoint，证明config、保存和恢复链路完整。短测CDF仍为0只说明6k监督不足，不用于性能裁决。
 - 正式机制门复用C-H12的冻结成熟policy与seed312：B40×15=600k、C20、QR/NQ32、MC、risk-discount=.995、actor-feature、mean-anchor=.5/scale10、LSTM512、obs RMS和T1完全相同，只把QR head换成ReLU-NQ。QR控制已由run k3pbid7r给出；默认回归证明可直接复用，不再重复消耗同一控制预算。NQ训练预计4--6分钟、内置128评估约1--2分钟，fresh512仅在机制门过后再花4--5分钟。
 - 晋级要求首先是crossing从QR约.185降到精确0；更重要的是末5批prequential Brier或CDF absolute error至少改善10%，另一项不得恶化10%，独立128条hard Brier不能恶化、AUC至少不低于QR .5773且mean-cost误差下降。若只消除crossing而proper score/AUC不改善，则严格失败，不跑live 1M；若ReLU出现大量dead gap并在早期100--200k明显欠拟合，记录后才运行ELU+1固定策略轻量消融，不能事后扫描未预注册gap bias。
+
+### E140：C-NQ1固定策略正式结果——零crossing没有改善查询概率（2026-07-17）
+
+- 正式ReLU-NQ任务由`launch_background.sh`持久化运行，绑定提交`ed3859f`；job为`DQCAC_DynamicButton_cnq1_nqrelu_frozen_b40_600k_s312`，W&B run为`8de2ybaw`。B40×15共600k监督步、C20、QR/NQ32、MC、risk-discount=.995、actor-feature、mean-anchor=.5/scale10、LSTM512与成熟冻结policy均和QR控制`k3pbid7r`相同。15批reward、真实cost、outage和env_steps逐点最大差均为0，比较只改变cost分布head。纯训练`246.67s`，相对QR控制`243.91s`只慢约1.13%；任务正常exit0、远端finished且只有15行history。
+- 结构门通过：训练全部15点和独立128条评估的crossing均为精确0；QR末5批crossing均值`.14597`，独立评估为`.18473`。但proper-score门失败。末5批pre-Brier为QR/NQ `.205674/.205894`，NQ恶化0.11%，远未达到10%改善；pre-CDF abs error `.069688→.066406`改善4.71%，pre mean-cost绝对bias `1.1830→1.0497`改善11.27%，但critic更新后的post-Brier、post-CDF error和post mean-bias分别恶化1.45%、4.93%和5.93%。
+- 独立128条终评的真实reward/outage/mean cost完全相同，均为`.869919/.25/11.21094`。QR→NQ的hard Brier为`.196060→.203445`，恶化3.77%；hard AUC `.577311→.564779`，下降`.01253`；Brier Skill `-.04565→-.08504`。smooth Brier同样`.195100→.200472`恶化；只有smooth AUC偶然增加`.00358`，不足以推翻hard查询和prequential proper score的共同失败。预测mean cost还从`8.0303`降到`7.8725`，对真实值低估更重。
+- ReLU gap没有发生“全部dead”的退化：独立评估预测分布std仍为`7.0328`、CDF为`.1616`，训练中的Ghat和mean均持续变化。因此不触发预注册的ELU+1补救路线；ELU+1会强迫离散cost原子之间严格正gap，反而可能制造不存在的插值。严格裁决为`strict_fail_no_live_policy`：不跑ELU+1、不跑live 1M、不扩seed，也不扫描gap bias。
+- 更关键的算法结论是，当前hard-CDF定义为`N^{-1}Σ_i 1[q_i≥d]`，对quantile排列是置换不变的；把同一组QR输出排序或仅消除crossing不会直接改变CDF或mean。NQ只有通过改变联合参数化和训练轨迹才可能间接改善概率，本实验表明这种耦合反而损害Brier/AUC。因此crossing不是当前DQCAC查询误差的主因，下一主线应转向action-conditioned风险credit/条件泛化与闭环setpoint，而不是继续优化分位数顺序。
+- 完整导出在`_runs/wandb_export/dqc_cnq1_nqrelu_frozen_b40_600k_s312_2026-07-17/`；QR/NQ配对history、`comparison.json`和profile位于`_runs/wandb_export|profiles/dqc_ch12_qr_vs_cnq1_nqrelu_frozen_seed312_600k_2026-07-17/`。`overview.png`为`2880×4128`且通过PIL解码。NQ公开config共139个键，无敏感键名或绝对路径值；W&B name/group/tags只含公开算法语义。

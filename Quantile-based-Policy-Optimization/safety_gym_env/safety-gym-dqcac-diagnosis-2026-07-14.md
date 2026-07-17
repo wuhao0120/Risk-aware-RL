@@ -1991,3 +1991,13 @@ DQCAC首版因此保持actor使用原quantile CDF，只把Weibull作为action-co
 DQCAC适配去掉了论文公式中会被中心化抵消的冗余首gap，只用一个mean和N-1个相邻gap生成N个quantile。这让NQ32与QR32拥有完全相同的最终Linear形状、参数量和初始化随机流；区别只有forward把raw logits解释为单调分布。默认qr的4k训练checkpoint仍有60个tensor逐位相同，说明新增类没有暗改历史基线。启用后的张量测试、6k训练和eval-only恢复均证明均值守恒、相邻差公式、零crossing、有限梯度与checkpoint重建成立。
 
 但零crossing本身不是成功标准。之前replay也把crossing明显降低，却让Brier、CDF和outage恶化；单调结构同样可能把若干quantile压成无区分力的平台。固定成熟policy的600k门会使用完全相同的真实MC轨迹比较QR与NQ，要求prequential proper score、独立Brier/AUC和mean-cost误差一起改善。只有这种改善才说明NQ把结构先验转化成更准确的action-conditioned风险信号，才值得进入live 1M闭环；如果只得到crossing=0，则作为形状消融保留并停止扩算。
+
+### 13.120 non-crossing只修复输出次序，不能替代条件风险学习（2026-07-17）
+
+固定同一个成熟policy和完全相同的15批真实轨迹后，ReLU-NQ把训练与评估crossing都压到0，而QR末5批仍有约14.6%的相邻交叉。这证明实现满足结构约束，也排除了actor、PID、环境随机轨迹和reward学习对比较的干扰；训练额外耗时仅约1.1%。
+
+但是结构正确没有转化为概率正确。末5批prequential Brier从QR的0.20567变为NQ的0.20589，基本不变且略差；critic更新后的Brier、CDF误差和mean误差均恶化。独立128条评估的hard Brier由0.19606升至0.20345，hard AUC由0.57731降至0.56478，预测mean cost也比QR低约0.158。NQ虽然让pre-CDF误差改善约4.7%、pre mean-bias改善约11.3%，但没有同时通过proper score、排序和更新后泛化门，因此不能进入live-policy实验。
+
+这与当前查询公式有关。DQCAC用超过budget的quantile个数估计CDF，`N^{-1}Σ_i1[q_i≥d]`只依赖每个输出位于budget哪一侧，不依赖这些输出的排列；quantile均值同样对排列不变。单纯排序QR输出会得到零crossing，却不会改变actor使用的risk probability。NQ改变的是输出间的参数耦合，而不是给critic增加真实风险信息；本实验中这种耦合降低了hard Brier和AUC意义下的质量。
+
+ReLU-NQ仍产生非零方差分布，CDF、Ghat和均值也持续变化，没有证据表明失败来自所有gap死亡。因此不运行强迫严格正gap的ELU+1。对离散累计cost而言，ELU+1还会拆开本应相等的quantile原子，不能把它当成默认修复。NQ作为“保证non-crossing但未改善查询质量”的消融保留，主线转向action-conditioned条件排序、actor风险credit及在表示固定后的PID setpoint校准。最终裁决继续以真实outage落入[0.18,0.22]后最大化mean reward为准，不能因某个结构指标变漂亮就晋级。
