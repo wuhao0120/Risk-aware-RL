@@ -213,6 +213,9 @@ def base_args(algo, seed, device, env_key):
         a.cost_direct_cdf_lr = 1e-3
         a.cost_direct_cdf_grad_clip = 10.0
         a.cost_direct_cdf_budget_scale = None
+        # C-DCF2默认online逐位复现C-DCF1；ema用每个head step的Polyak低通查询。
+        a.cost_direct_cdf_query_mode = 'online'
+        a.cost_direct_cdf_ema_tau = 0.005
         # C-Q4 cost-only τ grid；uniform 默认完全复现历史。query_mixture 围绕
         # τ*=1-alpha 加密，CDF/target 用 importance weight，prediction loss
         # 可选择 query-focused（局部优化）或 importance（全局 W1 保持）。
@@ -538,6 +541,14 @@ def main():
             f"[QR internal control] P(Z<=q): qr={res['cost_cdf_qr_initial']:.3f} "
             f"truth={emp:.3f} bias={res['cost_cdf_qr_initial']-emp:+.3f} "
             f"Brier={res['cost_cdf_qr_brier_initial']:.4f}")
+    if res.get('cost_cdf_direct_online_initial') is not None:
+        # EMA是selected estimator；online control揭示低通前是否仍追逐最近rollout。
+        print(
+            "[direct online control] "
+            f"online={res['cost_cdf_direct_online_initial']:.3f} "
+            f"truth={emp:.3f} "
+            f"bias={res['cost_cdf_direct_online_initial']-emp:+.3f} "
+            f"Brier={res['cost_cdf_direct_online_brier_initial']:.4f}")
     if res.get('cost_cdf_crossfit_peer_abs_mean') is not None:
         # crossfit的主/peer/ensemble必须一起打印；只报ensemble会掩盖模型不确定性。
         print(
@@ -579,6 +590,12 @@ def main():
         if res.get('cost_cdf_qr_smooth_initial') is not None:
             eval_log['eval/cost_cdf_qr_smooth_initial'] = (
                 res['cost_cdf_qr_smooth_initial'])
+        if res.get('cost_cdf_direct_online_initial') is not None:
+            eval_log['eval/cost_cdf_direct_online_initial'] = (
+                res['cost_cdf_direct_online_initial'])
+        if res.get('cost_cdf_direct_online_brier_initial') is not None:
+            eval_log['eval/cost_cdf_direct_online_brier_initial'] = (
+                res['cost_cdf_direct_online_brier_initial'])
         if res.get('pred_cost_mean') is not None:
             eval_log['eval/pred_cost_mean'] = res['pred_cost_mean']
         if res.get('pred_cost_std') is not None:

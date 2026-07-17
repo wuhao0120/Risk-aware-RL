@@ -28,7 +28,7 @@ def _cost_critic_initial_stats(agent, S0, A0, d):
     来自Bernoulli head，同时返回相同(s0,a0)上的QR hard-CDF作内部对照。
     """
     if not (hasattr(agent, 'cost_critic') and hasattr(agent, 'num_quantiles')):
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None
     with torch.no_grad():
         # episodic 配方下 critic 带 step 特征 → 用 agent._aug 做 s0(step=0) 增广
         S0_in = agent._aug(S0, 0) if hasattr(agent, '_aug') else S0
@@ -45,9 +45,20 @@ def _cost_critic_initial_stats(agent, S0, A0, d):
             selected_probability = agent._direct_cost_tail_probability(
                 S0_in, A0, d)
             cdf = float(selected_probability.mean().item())
+            if getattr(
+                    agent, 'cost_direct_cdf_query_mode', 'online') == 'ema':
+                # selected为EMA；同一(s0,a0)上的online只作遗忘诊断，不驱动策略。
+                online_probability = agent._direct_cost_tail_probability(
+                    S0_in, A0, d, source='online')
+                online_cdf = float(online_probability.mean().item())
+            else:
+                online_probability = None
+                online_cdf = None
         else:
             selected_probability = qr_probability
             cdf = qr_cdf
+            online_probability = None
+            online_cdf = None
         if hasattr(agent, '_cost_quantile_moments'):
             means, stds = agent._cost_quantile_moments(psi)
             pmean = float(means.mean().item())
@@ -64,7 +75,10 @@ def _cost_critic_initial_stats(agent, S0, A0, d):
         cdf, pmean, pstd, crossing,
         qr_cdf if direct_enabled else None,
         selected_probability.detach().cpu().numpy(),
-        qr_probability.detach().cpu().numpy() if direct_enabled else None)
+        qr_probability.detach().cpu().numpy() if direct_enabled else None,
+        online_cdf,
+        (online_probability.detach().cpu().numpy()
+         if online_probability is not None else None))
 
 
 def evaluate_policy_vec(agent, vec_env, num_episodes, gamma, cost_gamma, omega, cost_limit):
@@ -129,7 +143,8 @@ def evaluate_policy_vec(agent, vec_env, num_episodes, gamma, cost_gamma, omega, 
     S0 = torch.cat(S0_all, dim=0)
     A0 = torch.cat(A0_all, dim=0)
     (cdf, pmean, pstd, crossing, qr_cdf,
-     selected_probabilities, qr_probabilities) = _cost_critic_initial_stats(
+     selected_probabilities, qr_probabilities, online_cdf,
+     online_probabilities) = _cost_critic_initial_stats(
         agent, S0, A0, d)
     result['cost_cdf_initial'] = cdf
     if selected_probabilities is not None:
@@ -141,6 +156,12 @@ def evaluate_policy_vec(agent, vec_env, num_episodes, gamma, cost_gamma, omega, 
         result['cost_cdf_qr_initial'] = qr_cdf
         result['cost_cdf_qr_brier_initial'] = float(np.mean(
             (qr_probabilities.astype(np.float64)
+             - observed_outage) ** 2))
+    if online_cdf is not None:
+        # 该control只在EMA direct模式出现，默认quantile/online结果键保持不变。
+        result['cost_cdf_direct_online_initial'] = online_cdf
+        result['cost_cdf_direct_online_brier_initial'] = float(np.mean(
+            (online_probabilities.astype(np.float64)
              - observed_outage) ** 2))
     result['pred_cost_mean'] = pmean
     result['pred_cost_std'] = pstd

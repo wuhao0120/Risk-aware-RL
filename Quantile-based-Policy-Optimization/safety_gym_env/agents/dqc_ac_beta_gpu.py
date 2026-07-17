@@ -29,6 +29,7 @@ DQCACBetaGPU (safety_gym_env · CMDP 版) —— 用户 DQC-AC-β 迁移到 safe
     - 折扣口径 (cost_gamma=0.99): episodic=False → 截断恒 bootstrap (continuing 处理,
       γc^1000≈4e-5, episode 末残差可忽略), critic_step_feature=False。
 """
+import copy
 from collections import deque
 import numpy as np
 import torch
@@ -145,6 +146,12 @@ class DQCACBetaGPU(VecAgentBase):
                     getattr(args, 'critic_lr', 1e-3)))
         self.cost_direct_cdf_grad_clip = float(
             getattr(args, 'cost_direct_cdf_grad_clip', 10.0))
+        # C-DCF2 只改变direct head的查询参数版本：online保持C-DCF1 exact；
+        # ema对每次online Adam step做Polyak低通，抑制每批20条轨迹的比例噪声。
+        self.cost_direct_cdf_query_mode = str(
+            getattr(args, 'cost_direct_cdf_query_mode', 'online')).lower()
+        self.cost_direct_cdf_ema_tau = float(
+            getattr(args, 'cost_direct_cdf_ema_tau', 0.005))
         raw_direct_budget_scale = getattr(
             args, 'cost_direct_cdf_budget_scale', None)
         self.cost_direct_cdf_budget_scale = (
@@ -155,8 +162,17 @@ class DQCACBetaGPU(VecAgentBase):
             raise ValueError("cost_direct_cdf_lr must be positive")
         if self.cost_direct_cdf_grad_clip < 0.0:
             raise ValueError("cost_direct_cdf_grad_clip must be non-negative")
+        if self.cost_direct_cdf_query_mode not in {'online', 'ema'}:
+            raise ValueError(
+                "cost_direct_cdf_query_mode must be 'online' or 'ema'")
+        if not 0.0 < self.cost_direct_cdf_ema_tau <= 1.0:
+            raise ValueError("cost_direct_cdf_ema_tau must be in (0, 1]")
         if self.cost_direct_cdf_budget_scale <= 0.0:
             raise ValueError("cost_direct_cdf_budget_scale must be positive")
+        if (self.cost_cdf_estimator != 'direct'
+                and self.cost_direct_cdf_query_mode != 'online'):
+            raise ValueError(
+                "EMA direct query requires cost_cdf_estimator='direct'")
 
         # C-Q4 只改变 cost critic 的 τ grid；reward critic 始终保留 uniform midpoint。
         # query_mixture 默认中心为 τ*=1-alpha，即上尾机会约束的决策边界。
@@ -619,6 +635,7 @@ class DQCACBetaGPU(VecAgentBase):
         # direct CDF 是完全独立的Bernoulli critic/optimizer。只在显式开启时构造；
         # 默认None不消费RNG、不改变旧optimizer参数组，支持历史QR逐位回归。
         self.cost_exceedance_critic = None
+        self.cost_exceedance_ema_critic = None
         self.cost_exceedance_optimizer = None
         if self.cost_cdf_estimator == 'direct':
             # 多一个网络通常会推进全局torch RNG，继而改变首批Gaussian action noise。
@@ -641,6 +658,13 @@ class DQCACBetaGPU(VecAgentBase):
             self.cost_exceedance_optimizer = Adam(
                 self.cost_exceedance_critic.parameters(),
                 self.cost_direct_cdf_lr, eps=1e-5)
+            if self.cost_direct_cdf_query_mode == 'ema':
+                # deepcopy不执行随机初始化；EMA与online在step 0逐位一致，也不会推进
+                # Gaussian action RNG。requires_grad=False保证它只由显式Polyak更新。
+                self.cost_exceedance_ema_critic = copy.deepcopy(
+                    self.cost_exceedance_critic).to(self.device)
+                self.cost_exceedance_ema_critic.requires_grad_(False)
+                self.cost_exceedance_ema_critic.eval()
 
         # -------------------- 拉格朗日乘子 λ --------------------
         self.lambda_dual = torch.tensor([0.0], dtype=torch.float32,
@@ -657,6 +681,7 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_cdf_smooth_initial = 0.0                    # quantile平滑或direct同值
         self.last_qr_cdf_initial = 0.0                        # 始终保留QR hard-CDF作对照
         self.last_qr_cdf_smooth_initial = 0.0                 # 始终保留QR sigmoid-CDF
+        self.last_direct_online_cdf_initial = 0.0             # EMA实验的未平滑head对照
         self.last_pred_cost_mean = 0.0                        # cost-critic 估 E[C|s0]
         self.last_pred_cost_std = 0.0                         # cost-critic 估 std(C|s0)
         self.last_cost_quantile_crossing_fraction = 0.0       # 相邻 τ 输出违反单调性的比例
@@ -704,6 +729,8 @@ class DQCACBetaGPU(VecAgentBase):
               f"cost_cdf={self.cost_cdf_estimator}/{self.cost_cdf_mode}"
               f"/T{self.cost_cdf_temperature:g}"
               f"/lr{self.cost_direct_cdf_lr:g}"
+              f"/query{self.cost_direct_cdf_query_mode}"
+              f"/ema{self.cost_direct_cdf_ema_tau:g}"
               f"/bscale{self.cost_direct_cdf_budget_scale:g}, "
               f"cost_grid={self.cost_quantile_grid_mode}/{self.cost_quantile_prediction_weighting}"
               f"/local{self.cost_quantile_local_count}, "
@@ -1260,6 +1287,21 @@ class DQCACBetaGPU(VecAgentBase):
                 'qr_brier': float(
                     (qr_probability - observed_event).pow(2).mean().item()),
             })
+            if self.cost_direct_cdf_query_mode == 'ema':
+                # selected键是EMA；显式保留online对照，验证EMA是否减少跨批遗忘。
+                online_probability = self._direct_cost_tail_probability(
+                    initial_inputs, initial_actions, float(self.cost_limit),
+                    source='online')
+                online_bias = online_probability.mean() - observed_event.mean()
+                metrics.update({
+                    'direct_online_cdf': float(
+                        online_probability.mean().item()),
+                    'direct_online_cdf_bias': float(online_bias.item()),
+                    'direct_online_cdf_abs_error': float(
+                        online_bias.abs().item()),
+                    'direct_online_brier': float(
+                        (online_probability - observed_event).pow(2).mean().item()),
+                })
         return metrics
 
     @torch.no_grad()
@@ -1742,6 +1784,7 @@ class DQCACBetaGPU(VecAgentBase):
             nn.utils.clip_grad_norm_(
                 direct_parameters, self.cost_direct_cdf_grad_clip)
         self.cost_exceedance_optimizer.step()
+        ema_parameter_gap = self._soft_update_direct_cost_cdf_ema()
 
         # 理论上每条trajectory的T个标签完全相同；非零说明budget或MC回报的
         # 时间索引/折扣定义接错，比只看最终BCE更能发现静默监督bug。
@@ -1768,7 +1811,37 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/cost_direct_cdf_chunked_update': float(use_chunks),
             'critic/cost_direct_cdf_label_inconsistency_fraction': float(
                 label_inconsistency.item()),
+            'critic/cost_direct_cdf_query_is_ema': float(
+                self.cost_direct_cdf_query_mode == 'ema'),
+            'critic/cost_direct_cdf_ema_tau': self.cost_direct_cdf_ema_tau,
+            'critic/cost_direct_cdf_ema_online_parameter_abs_mean': (
+                ema_parameter_gap),
         }
+
+    @torch.no_grad()
+    def _soft_update_direct_cost_cdf_ema(self):
+        """
+        每个direct Adam step后对查询head做一次Polyak更新并返回参数平均差。
+
+        tau=0.005、每rollout 20次更新时，有效新权重约为
+        1-(1-0.005)^20=0.0954；query参数约跨10个rollout低通，而online仍可
+        快速拟合监督标签。online模式直接返回0，保持C-DCF1运算路径不变。
+        """
+        if self.cost_exceedance_ema_critic is None:
+            return 0.0
+
+        # EMA参数不在optimizer中；lerp_执行 θema←(1-tau)θema+tau·θonline。
+        absolute_gap = torch.zeros((), device=self.device)
+        parameter_count = 0
+        for ema_parameter, online_parameter in zip(
+                self.cost_exceedance_ema_critic.parameters(),
+                self.cost_exceedance_critic.parameters()):
+            ema_parameter.lerp_(
+                online_parameter, self.cost_direct_cdf_ema_tau)
+            absolute_gap += (
+                ema_parameter - online_parameter).abs().sum()
+            parameter_count += int(ema_parameter.numel())
+        return float((absolute_gap / max(parameter_count, 1)).item())
 
     def _sample_cost_iqn_taus(self, batch_size):
         """
@@ -2458,17 +2531,32 @@ class DQCACBetaGPU(VecAgentBase):
             device=quantiles.device, dtype=quantiles.dtype)
         return (tail_values * weights).sum(dim=-1)
 
-    def _direct_cost_tail_probability(self, inputs, actions, budgets):
+    def _direct_cost_tail_probability(
+            self, inputs, actions, budgets, source=None):
         """
-        查询直接Bernoulli critic并把logit映射到[0,1]上尾概率。
+        查询direct Bernoulli critic并把logit映射到[0,1]上尾概率。
 
-        此接口不detach，使单元测试可以检查head梯度；正式actor、dual和评估调用都在
-        no_grad上下文中，DQCAC仍使用score-function policy gradient，不会错误地
-        通过critic对action做确定性策略梯度。
+        source=None读取配置选择的online/EMA；source='online'用于EMA消融的内部
+        对照。接口不主动detach：online模式单元测试仍可检查head梯度；正式actor、
+        dual和评估均在no_grad中，不会通过critic对action做确定性策略梯度。
         """
         if self.cost_exceedance_critic is None:
             raise RuntimeError("direct cost CDF critic is not initialized")
-        logits = self.cost_exceedance_critic(inputs, actions, budgets)
+
+        # selected_source只路由网络，不改变输入、budget或概率定义。
+        selected_source = (
+            self.cost_direct_cdf_query_mode if source is None else str(source))
+        if selected_source == 'online':
+            selected_critic = self.cost_exceedance_critic
+        elif selected_source == 'ema':
+            selected_critic = self.cost_exceedance_ema_critic
+            if selected_critic is None:
+                raise RuntimeError(
+                    "direct cost CDF EMA critic is not initialized")
+        else:
+            raise ValueError(
+                f"unknown direct CDF source: {selected_source!r}")
+        logits = selected_critic(inputs, actions, budgets)
         return torch.sigmoid(logits)
 
     def _cost_actor_query_probability(
@@ -2772,6 +2860,11 @@ class DQCACBetaGPU(VecAgentBase):
                     selected_probability.mean().item())
                 # direct head已经输出连续概率，不存在hard/sigmoid两个表示。
                 self.last_cdf_smooth_initial = self.last_cdf_initial
+                if self.cost_direct_cdf_query_mode == 'ema':
+                    self.last_direct_online_cdf_initial = float(
+                        self._direct_cost_tail_probability(
+                            cost_input0, a0, self.cost_limit,
+                            source='online').mean().item())
             else:
                 self.last_cdf_initial = self.last_qr_cdf_initial
                 self.last_cdf_smooth_initial = (
@@ -2845,6 +2938,8 @@ class DQCACBetaGPU(VecAgentBase):
             'debug/cost_cdf_temperature': self.cost_cdf_temperature,
             'debug/cost_cdf_estimator_is_direct': float(
                 self.cost_cdf_estimator == 'direct'),
+            'debug/cost_direct_cdf_query_is_ema': float(
+                self.cost_direct_cdf_query_mode == 'ema'),
             'debug/cost_distribution_is_iqn': float(
                 self.cost_distribution_model == 'iqn'),
             'debug/cost_iqn_train_quantiles': float(
@@ -2887,6 +2982,13 @@ class DQCACBetaGPU(VecAgentBase):
                 'constraint/qr_cdf_calibration_error': abs(
                     self.last_qr_cdf_initial - empirical_prob),
             })
+            if self.cost_direct_cdf_query_mode == 'ema':
+                extra.update({
+                    'constraint/direct_online_cdf_estimate_initial': (
+                        self.last_direct_online_cdf_initial),
+                    'constraint/direct_online_cdf_calibration_error': abs(
+                        self.last_direct_online_cdf_initial - empirical_prob),
+                })
         extra.update(critic_info)
         extra.update(actor_info)
         if self.cost_actor_query_mode == 'crossfit':
@@ -2976,6 +3078,7 @@ class DQCACBetaGPU(VecAgentBase):
             qr_cdf_eval = None
             selected_probability_eval = None
             qr_probability_eval = None
+            direct_online_probability_eval = None
             if self.cost_actor_query_mode == 'crossfit':
                 # 新评估状态没有训练fold身份，因此用两个独立估计的等权ensemble。
                 # CDF先各自查询再平均，不能先平均quantiles后count，否则二者不等价。
@@ -3042,6 +3145,11 @@ class DQCACBetaGPU(VecAgentBase):
                         'cost_cdf_qr_smooth_initial': float(
                             qr_smooth.mean().item()),
                     }
+                    if self.cost_direct_cdf_query_mode == 'ema':
+                        direct_online_probability_eval = (
+                            self._direct_cost_tail_probability(
+                                cost_input0, a0, float(cost_limit),
+                                source='online'))
                 else:
                     selected_probability_eval = qr_hard
                     cost_cdf_initial = float(qr_hard.mean().item())
@@ -3094,6 +3202,14 @@ class DQCACBetaGPU(VecAgentBase):
                 qr_probability_eval.detach().cpu().numpy().astype(np.float64))
             result['cost_cdf_qr_brier_initial'] = float(np.mean(
                 (qr_probability_np - observed_outage) ** 2))
+        if direct_online_probability_eval is not None:
+            direct_online_probability_np = (
+                direct_online_probability_eval.detach().cpu().numpy().astype(
+                    np.float64))
+            result['cost_cdf_direct_online_initial'] = float(
+                direct_online_probability_np.mean())
+            result['cost_cdf_direct_online_brier_initial'] = float(np.mean(
+                (direct_online_probability_np - observed_outage) ** 2))
         return result
 
     # ============================================================ 总结接口 ============================================================
@@ -3135,6 +3251,10 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_direct_cdf_grad_clip': self.cost_direct_cdf_grad_clip,
             'cost_direct_cdf_budget_scale': (
                 self.cost_direct_cdf_budget_scale),
+            'cost_direct_cdf_query_mode': self.cost_direct_cdf_query_mode,
+            'cost_direct_cdf_ema_tau': self.cost_direct_cdf_ema_tau,
+            'direct_online_cdf_estimate_initial': (
+                self.last_direct_online_cdf_initial),
             'qr_cdf_estimate_initial': self.last_qr_cdf_initial,
             'cost_distribution_model': self.cost_distribution_model,
             'cost_iqn_train_quantiles': self.cost_iqn_train_quantiles,
