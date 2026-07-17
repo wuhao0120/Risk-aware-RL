@@ -1078,3 +1078,16 @@
 - 最后5批truth均值恰好由此前5批的`0.23`升到`0.33`。direct复制上一批比例时刚好撞上连续高outage区间，才产生末5批CDF error下降；独立评估分布回到`0.257`后，过估立刻暴露。因此该结果不满足E78“末段改善且相对QR方向一致”的1.2M延长条件；不运行无改动的1.2M，也不事后移动门槛。
 - 对用户“短跑是否误杀”的回答进一步细化：IQN 300k→600k属于真实慢收敛，应延长；C-DCF1则是跨批遗忘/高方差更新，保持同配方增加步数只会继续追逐最近20条轨迹。后续只允许针对已定位机制的单变量改动：首选每个rollout后更新一次EMA query head，让actor/eval读取跨批低通版本；备选是跨rollout replay或减少direct update次数。三条不能同时打开，均需重新预注册并从600k固定策略门开始。
 - 完整history/profile位于`_runs/wandb_export/dqc_frozen_direct_cdf_600k_2026-07-17/`与`_runs/profiles/dqc_frozen_direct_cdf_600k_2026-07-17/`；`overview.png`为`2880×3440`且PIL解码通过。正式checkpoint/history/profile合计约12.6MB，全部位于`/vepfs`。
+
+
+### E80：C-DCF2 EMA direct-CDF实现与600k预注册（2026-07-17）
+
+- C-DCF2已在提交`80b67b1`实现。新增`cost_direct_cdf_query_mode=online|ema`与`cost_direct_cdf_ema_tau`，默认`online/0.005`；默认不会构造额外网络。online head仍按C-DCF1对每批做20次BCE Adam step，EMA head不进optimizer，只在每次online step后执行`θ_ema←(1-τ)θ_ema+τθ_online`。actor、prequential和评估读取selected EMA，online只作内部对照。
+- `τ=0.005`沿用项目target网络的标准Polyak量级，不扫描。20次更新对应每rollout有效新权重`1-(1-.005)^20=0.0953895`，约10个rollout的低通记忆；600次head step后初始参数残余约`(1-.005)^600=0.0494`，故600k已覆盖约3个时间常数，不会因EMA天然慢热而只给极短预算。
+- EMA通过`deepcopy(online)`构造，step 0参数逐位相同且不消耗RNG；`requires_grad=False`，checkpoint自动保存独立`cost_exceedance_ema_critic`。日志同时记录selected EMA、online direct、QR、EMA-online参数差、pre/post CDF/Brier和独立评估proper score，能区分“online仍追批但EMA稳定”与“两者都没学到”。
+- 回归验证通过：新默认online相对C-DCF1旧smoke的41个checkpoint tensor及所有共享eval/summary数值逐项exact；online/EMA两条在首批更新前的41个共享tensor exact，EMA初始7个state tensor与online exact。解析小网络20次更新得到`0.0953895`，最大误差`7.45e-9`。
+- 持久化CPU online、CPU EMA、EMA eval-only与全尺寸`[512,512]+LSTM512` CUDA smoke均exit 0；后者覆盖GAE-PPO、observation normalization与循环评估。EMA checkpoint共8个module，EMA/online最大参数差已非零，eval-only全部评估字段逐项exact。短T=32全为0-cost，只验证链路，不评价算法。
+- 正式C-DCF2仍用P-M3 seed1成熟策略、rollout seed101、B20、T1000、30批=600k、20次critic update、MC/raw、risk-discount .995、chunk2500；唯一相对C-DCF1的变量是`query_mode=ema,tau=.005`。同run online head和QR必须与C-DCF1 checkpoint逐位exact，30批behavior truth逐值exact，标签不一致率0且无NaN/Inf。
+- 机制门：末5批selected EMA的prequential CDF error或Brier相对same-run online至少改善20%，另一项不得恶化超过10%；selected的平均post-pre概率漂移需不高于online的50%，且对上一批truth的滞后相关不能高于online。主效果门保持不变：末5批selected相对QR至少一项改善20%、另一项不恶化超过10%；独立140条至少一项改善25%、另一项不恶化超过10%。
+- 只有140通过才做fresh520，520通过才允许live 1M。若600k未过主门，只有在selected相对QR的末段与独立评估方向一致、且关键prequential误差从此前5批到末5批仍改善超过10%时，才允许一次从头1.2M长度审计；否则停止EMA005，不扫tau，也不同时加入replay/减少update。
+- C-DCF1纯训练245.2秒。EMA多一个78.6k参数的无梯度forward/lerp，预计纯训练4.5--5.5分钟、含140终评总墙钟5.5--7分钟；正式任务只由`launch_background.sh`持久化，checkpoint/W&B/history继续写入`/vepfs`。

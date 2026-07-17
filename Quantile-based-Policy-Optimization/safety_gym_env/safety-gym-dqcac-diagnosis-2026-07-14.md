@@ -1501,3 +1501,14 @@ C-DCF1完成了严格配对的600k固定策略实验。新增head没有扰动行
 因此本次不触发无改动的1.2M长度审计。这个裁决与“训练更长可能反转”并不矛盾：IQN在300k到600k的独立评估和mean-cost误差同步改善，属于真实慢收敛；C-DCF1只有受近期outage streak影响的窗口CDF变好，跨状态Brier和独立总体校准没有同方向证据。增加相同更新只会延长遗忘过程，不能增加每次更新所依据的独立tail样本。
 
 下一路线应直接抑制跨批遗忘，而不是继续加环境步。最小候选是保留online direct head的监督训练，但每个rollout只把其参数以固定tau合入EMA query head，actor、prequential和评估读取EMA；这等价于在参数空间对多个rollout低通，且不会给动作采样引入新随机数。备选消融是保存最近若干rollout做supervised replay，或单独减少direct每批更新次数。它们回答相近问题，首轮只能选一个，固定策略600k不过门就不进入PID闭环。完整history和含direct/QR对照曲线的profile保存在`_runs/wandb_export/dqc_frozen_direct_cdf_600k_2026-07-17/`与`_runs/profiles/dqc_frozen_direct_cdf_600k_2026-07-17/`。
+
+
+### 13.66 C-DCF2：用Polyak查询头隔离快速监督与稳定决策（2026-07-17）
+
+C-DCF1的问题不是Bernoulli目标本身无法优化，而是同一批20条轨迹被重复更新20次后，online head几乎复制了该批outage比例。C-DCF2保留这个快速监督网络，同时增加一个不接梯度的Polyak副本作为决策查询网络。每个online Adam step后以tau=0.005合入；20步的等效rollout更新率约0.0954，所以EMA约整合最近10个rollout，而不是只记住上一批。
+
+这个设计只分离“拟合速度”和“决策速度”。online BCE、QR、reward critic、actor网络、PID、数据和随机数都不变；EMA由online deepcopy，构造不推进动作RNG。actor和评估读取EMA，日志仍在同一状态动作上报告online与QR。因而若EMA改善，它可归因于跨批低通；若无改善，则说明direct条件概率表示本身或有效独立tail样本仍不足，不能再把失败解释为最近批遗忘。
+
+工程回归中，默认online的41个checkpoint张量和全部旧评估字段相对C-DCF1逐项exact；EMA初始参数与online exact，20次Polyak闭式误差低于8e-9。CPU训练、checkpoint恢复和全尺寸LSTM/CUDA路径均已通过。EMA模块自动进入checkpoint，eval-only会重建同一结构并同时给出selected、online和QR三套proper score。
+
+固定策略门仍是600k而非100k/300k。tau=0.005在600次更新后只保留约4.9%的初始权重，已经足够判断低通后的稳态方向；如果末段和独立评估都同方向改善且仍有超过10%的趋势，才扩到1.2M。正式晋级仍要求相对QR的末五批prequential至少20%和独立140至少25%改善，另一项不明显恶化；不能因为EMA相对失败的online变好就降低“必须超过QR”的标准。通过后还需fresh520和live 1M，最终算法仍按5M多seed比较。
