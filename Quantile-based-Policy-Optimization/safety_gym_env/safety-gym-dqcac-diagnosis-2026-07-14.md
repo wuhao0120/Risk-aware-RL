@@ -2007,3 +2007,17 @@ ReLU-NQ仍产生非零方差分布，CDF、Ghat和均值也持续变化，没有
 C-H8的单seed fresh512为reward 0.745、outage 0.215，是现有DQCAC中最接近“outage约0.20后最大化reward”的点。它当时因比0.75预注册门少0.005而没有扩seed；该门的严格裁决仍保留。但此后旧批replay、retention guard、adapter cost监督、Weibull和NQ均没有得到更好的reward--outage联合结果，继续只在seed2上堆结构会比补基本方差证据更容易过拟合实验选择。
 
 因此原样补C-H8 seed0/1各1M，连同seed2形成三seed底座。这个实验不修改PID、quantile、network或优化器，也不根据内置128决定是否做fresh512。B40存在明显慢启动，短跑不足以裁决，所以除工程失败外跑满1M；三条都用同一512回合协议报告outage相对0.20的偏差和reward。若结果稳定，才有资格决定是否延长到与QCPO_refs更接近的预算；若仍形成高reward高风险与低reward安全的seed分叉，则下一项应校准闭环setpoint或风险增益，而不是把任何单seed最好值称为算法提升。
+
+### 13.122 C-H8三seed说明B40降低了reward方差，却没有稳定约束边界（2026-07-17）
+
+三条fresh512结果为reward/outage：seed0 `0.7345/0.1680`、seed1 `0.8195/0.2500`、seed2 `0.7450/0.2148`。聚合outage是`324/1536=0.2109`，表面接近0.20；但它由一个过度保守seed、一个不安全seed和一个带内seed平均而成。训练seed标准差为0.0412，只有1/3点估计进入[0.18,0.22]，所以不能把聚合均值解释为稳定约束满足。
+
+开大num_envs也没有在统一1M预算下带来免费提升。对应B20三seedreward/outage均值为`0.8428/0.2025`，B40为`0.7663/0.2109`；平均绝对目标偏差由0.0251变为0.0323，带内seed仍是1/3。B40确实把reward的seed标准差从0.1917降到0.0464，但代价是平均reward下降0.0765，而且逐seed变化方向不一致。它更像把策略压到较窄的中低reward区域，而不是提高reward--risk前沿。
+
+原因之一是num_envs与学习时钟耦合。B20在1M步有50次Actor/PID事件，B40只有25次；每次batch翻倍使样本暴露量近似相同，却把Adam step和controller响应次数减半。末5批outage标准差仍有0.069--0.115，lambda增大通常会令下一批outage下降，但系统持续跨越目标两侧。因此当前证据支持“反馈方向大体正确、事件频率和条件risk误差造成滞后振荡”，不支持“只需进一步增大batch”。
+
+### 13.123 先做一次B40–2M因果长度审计，再决定是否更换risk credit（2026-07-17）
+
+因为B40在1M时只有25次策略和控制事件，直接宣布配置无效仍可能混入欠训练。下一条从头运行同一seed1到2M，只把iteration从25改成50；前1M必须逐点复现当前run，才能把后续变化归因于长度。它不是尝试用更长预算掩盖失败：fresh512仍要求outage位于[0.18,0.22]且reward不低于1M的0.8195，末段周期不能放大；失败后不跑3M。
+
+这项长度审计与算法改进路线分开。如果50次事件仍形成极限环，就不再扫描固定PID target或quantile结构。更直接的下一步是给actor增加真实轨迹二元outage的on-policy policy-gradient校正，让风险方向不完全依赖AUC约0.55--0.59的action-conditioned critic；distributional critic继续提供局部低方差信息。该混合估计需要先验证符号、尺度、leave-one-out基线、trajectory长度归一化和PPO ratio，不能直接把QCPO轨迹loss未经校准地叠加。window100或更小Kp/Ki保留为控制消融，因为它们能减振和移动工作点，却没有证据改善条件风险排序。

@@ -1687,3 +1687,20 @@
 - 两条完全复用C-H8：B40×25=1M、T1000、C20/A8、actor/PID interval1、QR32/MC、risk-discount=.995、detach actor-feature、mean-anchor=.5/scale10、LSTM512、obs RMS、T1 sigmoid、经验PI/PID内部target=.15及所有LR不变；只改训练seed、唯一tag/checkpoint和脱敏W&B name。当前提交上的NQ/Weibull/adapter/guard等新参数全部保持默认关闭，已有逐位回归覆盖默认路径。
 - 由于B40 seed2前300k几乎不涨而后段明显恢复，两条不以100k/300k reward早停；只有NaN/Inf/OOM、ratio断言或确定性工程错误才停止。每条纯训练按seed2实测约7--9分钟，内置128约1--2分钟；单A100串行。随后无论内置128好坏都做独立fresh512，每条约4分钟，以免小评估集选择性扩算。
 - 最终报告每seed相对`.20`的有符号outage偏差、Wilson区间和reward，并同时给3-seed mean±SD及合并事件率。工作带仍是fresh512点估计[.18,.22]；低于.18记为过度保守，高于.22记为风险过大。只有进入工作带后才按reward排序；更低outage不自动加分。若B40跨seed仍分叉，下一步优先做固定QR表示后的PID setpoint/risk-gain校准或延长当前底座，而不是继续增加quantile结构。
+
+### E142：C-H8 B40三seed审计——平均outage接近0.20是两侧失配相互抵消（2026-07-17）
+
+- seed0/1训练均由`launch_background.sh`持久化完成，纯训练`407.1/406.8s`、exit0；W&B run为`jmg0phkm/02gjpbeh`，连同既有seed2 `brtk50w8`均finished且每条25个记录点到1M。三条公开config共检查397个值，没有敏感键或绝对路径；每条只同步3个标准W&B文件。
+- fresh512逐seed reward/outage为seed0 `.73447/86÷512=.16797`、seed1 `.81951/128÷512=.25000`、seed2 `.74496/110÷512=.21484`。只有seed2落入[.18,.22]工作带；seed0过度保守，seed1违反风险预算。三seed均值为reward `.76631±.04637`、outage `.21094±.04115`，但合并`324/1536=.21094`不能掩盖两侧分叉。
+- 与完全同协议的B20三seed比较，B20 reward/outage均值为`.84282±.19171/.20247±.03211`，合并`311/1536=.20247`。B40使reward均值下降`.07651`，outage平均绝对目标偏差从`.02513`恶化到`.03229`，目标带命中仍为`1/3`；它只把reward的seed标准差压低，却没有把约束控制稳定在0.20。
+- B40相对B20的逐seedreward变化为`-.17033/-.17636/+.11717`，outage变化为`-.04688/+.02344/+.04883`，方向不一致；三个seed的配对t区间都很宽，不能宣称B40显著支配或退化。critic同样没有一致提升：平均Brier `.16794→.17055`，AUC `.57857→.58569`，逐seed正负混合。
+- 训练曲线也不是稳态。B40三个seed末5批outage均值/标准差分别为`.165/.115`、`.215/.084`、`.180/.069`；末5批落入工作带的比例为`0/0/.4`。lambda与下一批outage变化的相关为`-.50/-.48/-.61`，说明惩罚方向总体有效，但响应滞后且每批仍跨越目标两侧，符合负反馈极限环而非方向完全接反。
+- 公平解释必须包含更新事件数：相同1M环境步下，B20有50次Actor/PID事件和1000次critic Adam step，B40只有25次事件和500次critic step；批量翻倍使trajectory-epoch暴露量近似不变，但Adam/controller时间步减半。因此“num_envs更大”同时改变了梯度方差与学习时间尺度，不能只按batch大小解释。
+- 证据位于`_runs/wandb_export/dqc_ch8b40_multiseed_1m_2026-07-17/`和`_runs/profiles/dqc_ch8b40_multiseed_1m_2026-07-17/`，包括三seed完整history、fresh512 CSV/JSON、训练稳定性CSV、逐seed统计与`3300×1056`对比图；全部5张PNG通过PIL解码。
+
+### E143：B40–2M长度审计预注册——只回答25次更新是否欠训练（2026-07-17）
+
+- 下一条只在C-H8压力seed1把`num_iterations=25→50`，得到`B40×50×T1000=2M`；网络、QR32/MC、C20/A8、LSTM512、obs RMS、actor-feature、mean-anchor、PPO/GAE/IS、PID target=.15及所有增益完全不变。评估checkpoint不保存optimizer/scheduler动量，所以不能伪装成无损续训，必须从头运行。
+- 2M的前1M理论上应与当前seed1逐点复现。先比较25条history以及1M pre-update checkpoint的六个module、lambda和公共runtime；若不一致，后1M不能被解释为纯长度效应。纯训练预计13--16分钟，内部128约1--2分钟；除NaN/OOM/确定性错误外跑满，任务继续使用持久化后台和脱敏W&B online。
+- 内部评估仅作节省明显失败评估的宽screen：reward至少`.60`、outage在`.05--.40`且所有关键量有限，才花约3--4分钟做fresh512。正式晋级要求fresh512 outage落入[.18,.22]、reward至少不低于seed1 1M的`.81951`，且末段outage振幅和critic Brier/AUC不能明显恶化。失败则停止原样3M，不用选择某个漂亮训练窗口改写结论。
+- 若2M通过，再扩seed0/2并进入同预算QCPO/QCPO_refs比较；若失败，下一算法路线不是继续压低PID target，而是给DQCAC actor加入默认关闭的真实轨迹outage policy-gradient校正。该校正用on-policy二元违约标签提供无偏风险方向，distributional critic保留为低方差局部项/基线；先做梯度尺度、leave-one-out baseline与PPO-Clip机制验证，再决定live 1M。PID window100/降低Kp-Ki保留为控制消融，但已有P-M10表明它主要沿reward--risk前沿移动工作点，不能单独修复AUC接近随机的问题。
