@@ -1541,3 +1541,14 @@
 - 该变量同时让每个critic optimizer step看到40而非20条独立轨迹，并把每1M的critic/actor事件减半；每条trajectory仍被同一事件的20/8个epoch使用。这是扩大`num_envs`的真实工程语义，不通过C40偷偷增加总sample reuse。
 - 首轮只跑压力seed2完整1M，不用300k早停。性能门为fresh512 reward≥`.75`且outage≤`.22`；相对E121 seed2，末5批pre-Brier不得恶化10%，fresh Brier不得恶化10%、AUC不得下降超过`.03`、mean error≤1.0。机制门为25个Actor/PID事件、batch40、ratio≤`1e-3`、无NaN/Inf，并检查final pre/post critic均值是否仍被单批推移超过5。
 - seed2通过才扩seed0/1；失败则不扫B60/B80，直接实现跨rollout replay/held-out选择。单条B40预计训练加内置评估约8--13分钟，fresh512约4--5分钟；只用持久化后台和脱敏W&B online。
+
+### E128：C-H8B40 seed2 1M结果——吞吐和reward明显改善，但严格校准门失败（2026-07-17）
+
+- 正式任务绑定提交`82cddce`，由`launch_background.sh`以`nohup+setsid`持久化运行，job正常`exit 0`；W&B run为`brtk50w8`，25行history完整到1,000,000环境步，远端状态finished。纯训练403.94秒；W&B运行口径475.47秒，相比E121/B20 seed2的830.64秒缩短42.76%。B40在当前80GB A100上只提高并行采样量，没有形成显存或墙钟瓶颈。
+- 工程门全部通过：25个Actor事件与25个PID事件，每次batch严格40条trajectory；首epoch behavior/current ratio最大误差`1.43e-5`，末次KL/clip为`.00103/.0440`，无NaN/Inf。默认关闭的current actor-feature刷新计数为0，正式变量确实只有B20→B40及相应事件数减半。
+- fresh512的E121/B20→C-H8/B40 reward为`.62779→.74496`，绝对增加`.11717`、相对增加18.66%；outage为`.16602→.21484`，增加4.88个百分点但仍低于预注册上限`.22`。reward距离`.75`门只差`.00504`，但门槛不能在看见结果后放宽，所以性能联合门严格失败。
+- 条件风险结果有正有负。hard AUC `.58611→.59387`、Brier Skill `-.04384→-.00979`、crossing `.18246→.15732`，说明排序、相对常数基线的概率质量和quantile形状略有改善；但absolute hard Brier `.14452→.17034`，恶化17.86%，超过允许的10%。两条策略的真实outage基率不同，因此Brier与Brier Skill方向不冲突：B40不是完全失去排序，而是绝对概率误差仍较大。
+- predicted/true mean cost从`8.739/8.031`变为`7.823/9.254`，绝对误差`.708→1.431`，未过≤1门。末5批pre-Brier只比B20恶化6.58%，pre-CDF error由约`.120→.0913`改善，最后一批post predicted/target mean为`7.668/7.675`；没有再出现C-H7C seed2把fresh predicted mean从约10推到约20的终点爆炸。扩大独立trajectory确实缓解了最后一批记忆，但没有解决下一rollout/fresh策略下的条件校准。
+- 严格裁决为`strict_fail_no_seed_expansion`：不补seed0/1、不扫B60/B80，也不因reward置信区间覆盖`.75`而事后改门。B40仍保留为下一机制实验的工程底座，因为它把训练吞吐提高约1.75倍、消除了最严重的末批过拟合，并把压力seed2推到接近目标的reward/outage区域。
+- 下一主路线按E127转向默认关闭的跨rollout cost replay或held-out critic selection。首选只缓存上一批detached actor feature、action、time-step和MC cost，与当前B40目标做等权凸组合；它直接把critic监督从“同一40条重复C20次”扩展到两个rollout，同时保持reward critic、PPO、PID和总环境步不变。若一批stale feature的坐标漂移成为问题，再与已经实现的current feature refresh作独立消融，不能同时混入Weibull、IQN或PID调参。
+- 证据包位于`_runs/profiles/dqc_ch8b40_actorfeature_meananchor_b40_1m_s2_2026-07-17/e121_comparison/`，包含fresh512对比CSV、训练history、末段汇总、门槛JSON、W&B隐私审计和六面板图。隐私审计覆盖123个公开config键，没有敏感键或绝对路径值；远端仅同步标准W&B配置、输出与summary文件。

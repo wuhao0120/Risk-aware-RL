@@ -1875,3 +1875,15 @@ seed2最后B20的平均cost约20.2，C20后fresh predicted mean从10.06跳到19.
 最小直接实验是保持1M预算，把B20×50轮改为B40×25轮。这样每次QR/mean更新看到两倍独立轨迹，同时每条轨迹仍只在本事件内复用C20次；Actor和经验PID也自然在40条样本上响应。它检验“有效样本数不足”而不同时引入replay权重、held-out恢复或新的分布参数化。
 
 current actor-feature刷新已做成默认关闭的独立开关并通过interval2 smoke，但四格诊断表明它不是C-H7C终点爆炸主因，所以C-H8B40不打开它。若B40仍让最后一批把fresh预测推移超过5 cost units，下一步应直接缓存跨rollout监督或用上一rollout held-out选择critic step，而不是扫描B60/B80、PID参数或更多quantiles。
+
+### 13.109 B40证明样本并行有用，但不能替代跨rollout泛化（2026-07-17）
+
+C-H8B40在固定100万环境步下把每次更新的独立轨迹从20增到40、更新事件从50减到25。它是目前少数同时带来明显工程收益和reward收益的改动：seed2 fresh512 reward从0.628提高到0.745，增加18.66%；纯训练只需403.94秒，W&B同口径墙钟比B20缩短42.76%。25次Actor/PID事件、PPO ratio、KL和clip全部正常，因而提升不是off-policy概率接错或事件数量异常造成的。
+
+它也直接缓解了C-H7C暴露的“最后一批把critic写坏”。B40最后一批更新前后predicted mean只移动约1.33，post prediction与当前批truth几乎相等；fresh predicted mean没有从10跳到20。末5批pre-CDF error下降、crossing从0.182降到0.157、AUC从0.586升到0.594。这说明每个更新事件看到更多独立轨迹、并减少总优化事件数，确实降低了head对单个极端B20的记忆。
+
+但这仍不是可接受的最终提升。outage从0.166升到0.215，虽然低于0.22门，却已超过名义0.20约束；hard Brier从0.145恶化到0.170，predicted/true mean为7.823/9.254，均值误差1.431。reward又以0.005之差没有达到预注册0.75。Brier Skill从-0.0438改善到-0.0098、AUC上升而absolute Brier恶化，是因为两个最终策略的真实outage基率不同；它支持“排序略好”，不支持“概率已校准”。
+
+所以现在最重要的诊断不是网络太小、quantile太少、没有PPO clip或训练太短。PPO的behavior log-prob/importance ratio已经正确固定，MLP+LSTM、GAE、PID、mean anchor和100万步也已验证；当前首要瓶颈是action-conditioned cost critic只在当前rollout上重复C20次，学会当前批比学会未见轨迹快得多。增加B只能减轻，不能消除这个监督结构。
+
+严格按预注册不扩B40 seed0/1，也不扫B60/B80。下一项应把上一rollout作为训练replay或held-out验证：前者增加跨批监督，后者选择对未见批次不过拟合的critic epoch。首轮建议在B40上缓存一个旧批并与当前批等权，保持Actor/PID/QR32/mean-anchor和1M预算不变；先用seed2检验fresh reward≥0.75、outage≤0.22，同时要求Brier≤E121的1.10倍、mean error≤1。若仍失败，再考虑held-out early stopping、小adapter/PCGrad或Weibull低方差辅助，而不是继续堆quantile数量。
