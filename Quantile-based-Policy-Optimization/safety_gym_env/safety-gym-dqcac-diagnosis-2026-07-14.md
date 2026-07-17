@@ -1437,3 +1437,17 @@ distributional critic却显著变准：hard/smooth CDF error分别改善69.4%/66
 本次实现是cost-only uniform IQN。reward/PPO/PID/recurrent actor全部不变；训练随机采32个τ，查询用128个确定性τ。它输出Q(τ)，再通过uniform-τ积分得到hard/smooth CDF，并不是直接拟合CDF。专用τ RNG不改变行为动作流；评估前统一重置动作RNG，QR/IQN可以使用完全相同的随机策略样本。新增crossing比例监控IQN非单调输出。
 
 正式门使用P-M3 seed1成熟actor、rollout seed101、B20×T1000×15=300k固定数据，QR-N32与IQN-32/128/64只改变cost表示。先看末五批prequential CDF/Brier，再看独立140和必要时520回合的CDF/mean-cost误差。要求局部泛化至少改善20%、独立误差至少改善25%，另一项不明显恶化且crossing可控；不过门就停止standard IQN，不用延长live训练移动门槛。通过后才允许压力seed1跑完整1M闭环，再按原规则扩三seed。
+
+### 13.61 训练长度审计：问题是每个policy版本的独立轨迹太少，不只是网络容量（2026-07-17）
+
+300k初筛中，QR与IQN的140条独立评估truth完全相同；IQN的CDF和mean-cost误差反而略差，crossing从0.0486升到0.2008。末五批post-CDF相对差距却在缩小，所以没有把失败门槛直接后移，而是额外预注册了一次同seed、从头严格复现的600k长度审计。两条前300k所有共享history指标逐值exact，后300k是唯一新增信息。
+
+结果确认用户对“训练太短”的担心有实质依据。固定同一成熟policy时，QR的独立CDF误差从0.14442降到0.01071，mean-cost误差从3.15970降到0.77573；IQN对应从0.14777降到0.00898、从3.54291降到0.62543。也就是说，增加300条独立轨迹后，两种critic的CDF误差都下降约93%。此前300k数值主要描述有限样本/尚未收敛状态，不能当作表示能力上限。
+
+这不等于IQN已经获胜。600k同预算下，IQN相对QR的CDF和mean error只改善16.1%/19.4%，末五批prequential改善仅约3.0%/0.9%；其crossing仍为0.23397，对QR的0.05737，差0.17660。它没有达到预注册25%泛化门或crossing门，因此不做fresh520、不进live 1M。保留的研究结论是：uniform-IQN在固定策略、足量数据下可能有中等校准收益，但需要先解决单调性，且不能假定它在非平稳policy下仍有同样收益。
+
+更重要的是，这为DQCAC闭环振荡提供了新的直接机制证据。P-M3的B20配置每收集20条完整轨迹就更新policy；而冻结实验显示cost critic需要数百条独立轨迹才达到较好初始状态校准。同一批做20次QR更新只重复使用相同20条轨迹，不能增加tail事件的有效样本量。policy在critic追上之前持续移动，PID又根据20条轨迹、粒度0.05的outage作反应，自然容易形成critic lag、lambda延迟和PPO过冲耦合的极限环。
+
+所以后续优先级应从“再加critic epoch”转为“增加同一policy版本下的独立轨迹”。最小改动是总环境步仍为1M，把`num_envs=20→40`、iteration减半，使每次actor/PID决策看到40条轨迹并降低policy更新频率；硬件128 CPU/A100 80GB足以承载单条B40，cost update继续用chunk避免显存随B线性峰值增长。若B40有效，再实现默认关闭的`actor_update_interval=2`做机制分离：critic每个B20 rollout更新，actor每两个rollout才更新。二者都应在压力seed1完整跑1M，而不是用300k早停；通过后再扩seed0/2。
+
+正式对齐history、profile、CSV/JSON和三面板端点图保存在`_runs/wandb_export/dqc_frozen_qr32_vs_iqn32q128_600k_lenaudit_2026-07-17/`及`_runs/profiles/dqc_frozen_qr32_vs_iqn32q128_600k_lenaudit_2026-07-17/`。

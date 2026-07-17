@@ -992,3 +992,23 @@
   4. crossing不能比QR恶化超过0.10，且末段无发散。
 - 只有140 screen和fresh520都通过，才在P-M3压力seed1进入一次完整1M live闭环；否则停止standard uniform-IQN，不扫cosine数、Ntrain或Nquery碰运气。query-mixture IQN作为有分歧的独立路线保留，不和uniform-IQN同时修改。
 - 既有QR冻结300k纯训练121s。新配对QR预计约2–3min训练、加140评估总约4min；IQN因τ embedding和chunk前向预计训练4–7min、总约6–10min。两条串行总墙钟约10–14min，全程由launch_background.sh持久化，输出只写/vepfs项目盘。
+
+### E72：C-IQN1 300k 初筛与训练长度审计预注册（2026-07-17）
+
+- QR/IQN 正式 300k job 均正常 exit 0，纯训练分别为 `121.88s/125.73s`，W&B run 为 `qrwjysnw/20f7gtvr`。15 批真实 reward、outage、cost、holdout truth 逐点 exact，140 条终评的 reward/outage/mean cost 也 exact 为 `0.86576/0.25714/11.75714`；因此差异没有混入策略或环境随机性。
+- 300k 独立终评中，QR→IQN 的 hard-CDF absolute error 为 `0.14442→0.14777`，mean-cost absolute error 为 `3.15970→3.54291`，crossing 为 `0.04862→0.20079`。三项均未通过预注册门，其中 mean error 恶化 `12.1%`，crossing 绝对增加 `0.15217`。
+- 最后 5 批 prequential CDF absolute error 为 `0.10844→0.11586`，IQN 恶化 `6.8%`；Brier 为 `0.21388→0.21350`，只改善 `0.17%`，远低于 20% 门。post-CDF error 为 `0.04438→0.06117`，IQN 仍差，但逐批差值从 220k 的约 `+0.0250` 缩至 300k 的 `+0.00391`；这留下了“复杂 IQN 只是收敛更慢”的有限可能。
+- 本次不改写 300k 预注册裁决：uniform-IQN 已失败，不能凭延长后偶然好转直接晋级 live 1M。考虑用户提出的短训练 false-negative 风险，以及 post-CDF 相对差距确有收窄，只增加一次独立的**训练长度审计**：同 seed101 从头严格配对重跑 QR/IQN 到 600k，前 300k 应复现实验，后 300k 只回答慢收敛问题；不扫描 Ntrain、Nquery、cosines 或学习率。
+- 600k 审计只有在后 5 批 prequential 指标和独立 140 条评估都达到原门、且 crossing gap 回到 `≤0.10` 时，才允许 fresh520；否则停止 standard uniform-IQN。若 600k 只是两者近似持平，它最多说明 IQN 没有明显坏处，不构成增加复杂度或进入 live 闭环的理由。
+- 按 300k 实测线性外推，两条各约 `252s` 纯训练；两条并行、加 140 条独立评估预计总墙钟 `5～7min`。仍由 `launch_background.sh` 持久化启动，checkpoint、W&B 与结果文件全部写入 `/vepfs-mlp2/c20250510/251204033/` 下，不占 20G 根盘。
+
+### E73：C-IQN1 600k 长度审计——300k 对 critic 偏短，但 uniform-IQN 仍未过门（2026-07-17）
+
+- QR/IQN 600k job 均正常 exit 0，W&B run 为 `8ry7xn6g/7llo7019`；并行纯训练 wall time 为 `417.21s/433.87s`。两条前 300k 的 reward、outage、cost、pre/post CDF/Brier/mean bias 与 crossing 对原 300k history 全部逐值 exact，证明长度审计没有更换初始化或移动原裁决。
+- 600 条校准轨迹中两条真实行为逐批 exact，共有 `167/600` 个超阈值事件。独立 140 条评估也严格配对，truth reward/outage/mean cost 均为 `0.86576/0.25714/11.75714`。
+- 训练长度本身影响巨大：QR 的 CDF/mean-cost absolute error 从 300k 的 `0.14442/3.15970` 降至 600k 的 `0.01071/0.77573`，分别改善 `92.6%/75.4%`；IQN 从 `0.14777/3.54291` 降至 `0.00898/0.62543`，分别改善 `93.9%/82.3%`。因此 300k 足以做初筛，却不足以把冻结 distributional critic 的绝对校准误差当作收敛值。
+- 同预算比较中，600k IQN 的独立 CDF error 比 QR 小约 `16.1%`，mean-cost error 小约 `19.4%`，出现小到中等优势；但均低于原定 `25%` 门。最后 5 批 prequential CDF/Brier 只改善约 `3.0%/0.9%`，post-CDF 约改善 `5.0%`，post-Brier与mean error略差，没有持续扩大优势。
+- IQN 的 monotonicity 仍明显更差：600k 独立 crossing 为 `0.23397`，QR 为 `0.05737`，差 `+0.17660`；最后 5 批差仍为 `+0.15041`。它不是多训练即可消失的早期毛刺。
+- 按预注册规则，不做 fresh520，不启动 uniform-IQN live 1M，也不扫 `Ntrain/Nquery/cosines`。定级为：`IQN 在足量固定策略数据下可能带来约 16%～19% 的校准收益，但当前非单调输出和收益幅度不足以证明值得进入非平稳 actor–PID 闭环`。
+- 最重要的算法含义不只是 IQN 输赢：当前 live B20 每 20 条轨迹就改变一次 policy，而固定 policy 的 critic 需要数百条轨迹才接近校准；更多同批 gradient steps不能制造新的独立 tail trajectory。下一优先验证应增加每个 policy 版本的独立轨迹数或减慢 actor 更新频率，首选固定 1M 总步的 `B20→B40`，而不是继续增加同一批 critic epoch。
+- 正式 history/图/表位于 `_runs/wandb_export/dqc_frozen_qr32_vs_iqn32q128_600k_lenaudit_2026-07-17/` 与 `_runs/profiles/dqc_frozen_qr32_vs_iqn32q128_600k_lenaudit_2026-07-17/`；端点图 `length_audit_endpoint_comparison.png` 为 `2356×748`，PIL 解码验证通过。
