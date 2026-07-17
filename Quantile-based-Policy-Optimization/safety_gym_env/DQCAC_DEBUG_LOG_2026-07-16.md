@@ -1810,3 +1810,20 @@
 - 选择.175而非直接.20，是因为C-H16 fresh outage为.162，距双侧带下界.18约.018；一次减半安全余量是有界校准，保留约.025补偿训练--fresh分布差。历史P-M1也预先记录过.175作为过保守时的路线；这不是从无界网格中挑值。
 - 仍用seed1、B40×25×T1000=1M和持久化脱敏W&B online；预计纯训练约7分钟、内部128为1--2分钟，reward≥.60且outage在.05--.40才做fresh512约3--4分钟。机制门要求实际修正/critic比继续在`1±1e-3`、日志PID target准确为.175、IS ratio和数值健康。
 - 性能门不变：fresh outage点估计进入`[.18,.22]`后，reward至少`.79542`，目标不低于`.81951`；outage更低不加分。若通过，立即扩seed0/2而不是继续在seed1调target。若仍低于.18，才把target=.20作为一条预先记录的最后边界校准；若高于.22，则.175方向过强，停止setpoint插值。若进带但reward仍低于.795，则说明该trajectory residual主要沿既有前沿换安全，下一步转P-M8与batch residual的正交组合或重新设计状态动作credit，不用更多PID小数点掩盖前沿未提升。
+
+### E155：C-H17结果——严格工作带near-miss，但reward显著提高（2026-07-17）
+
+- 正式job `DQCAC_DynamicButton_ch17_batchref_rho1_pidtarget0175_b40_1m_s1`绑定预注册提交`a009936`，持久化后台正常exit0；W&B run为`pmt9uwtz`且finished。纯训练`454.5s`，内部128回合reward/outage为`.9342/.2734`；通过宽screen后，fresh512回合为reward `.91604`、outage `115/512=.22461`。
+- 严格裁决保持预注册口径：outage点估计比工程带上界`.22`高`.00461`，因此不能事后改写为通过，记为`reject_strict_near_miss_high_reward`。但其Wilson95为`[.19059,.26273]`，包含名义目标`.20`；reward95为`[.88075,.95134]`，所以从“约束附近最大化reward”的科学目标看，它是需要跨seed复核的强候选，而不是明显不安全的失败点。
+- 相对C-H8 rho0基线，reward提高`.09654`，Welch95为`[.04524,.14784]`，提升具有统计证据；outage降低`.02539`，Newcombe95为`[-.07735,.02674]`，方向有利但尚不能排除零差异。点估计上C-H17同时提高reward并降低outage，形成Pareto改进；这不等价于已经证明跨seed超过基线。
+- 相对C-H16 target=.15，reward提高`.15938`且95%区间`[.11204,.20672]`，outage提高`.06250`且区间`[.01410,.11063]`。因此`.15→.175`确实把策略从过度保守端显著推向高reward/高risk端，不是评估噪声造成的假移动。
+- 机制门继续通过：25个Actor事件的实际`correction_std/critic_std`都在`[.99999988,1.00000012]`，不存在EMA增益漂移；首epoch IS、PPO数值和全部W&B记录有限。后20% reward/outage/lambda均值为`.8810/.2550/.1815`，PPO clip/KL为`.0995/.00201`。
+- 但setpoint放松重新放大了闭环周期。后20% outage标准差从C-H16的`.03391`升到`.10416`，范围`.125--.400`；batch reference只固定风险残差相对critic的当前批尺度，不能消除PID积分、40条二项观测噪声和Actor滞后共同造成的跨批振荡。
+- fresh critic hard/smooth CDF绝对误差为`.06201/.06481`，相对C-H8改善约35.0%/30.0%；mean-cost error改善15.7%，Brier仅改善2.2%，BSS反而从`-.0587`降到`-.1152`。因此总体阈值校准更近，但条件风险排序仍弱，不能把reward提升归因于critic已经全面准确。
+
+### E156：C-H17 seed0/2稳健性审计预注册（2026-07-17）
+
+- 因seed1严格超过`.22`，按E154停止setpoint小数插值，不再试`.165/.17/.20`来追单seed。扩seed0/2不是把near-miss事后判成通过，而是验证显著reward提升和接近目标的outage是否可复现；seed1仍保留原始严格失败标签。
+- 两个run逐项复用C-H17，仅改随机seed与checkpoint/name/tag；每个仍为B40×25×T1000=1M、C20/A8、batch-reference rho1、PID target=.175、QR32/MC、LSTM512、obs RMS、GAE-PPO和脱敏W&B online。128核、227GiB内存、A100 80GiB当前空闲，两个40-env任务并行预计单run纯训练约8--10分钟、共同墙钟约10--13分钟；若资源竞争使吞吐或数值异常则停止并改串行，不能把并发差异当算法差异。
+- 每个seed训练后先做内部128宽screen，有限且reward≥.60、outage在`.05--.40`才做独立512。报告所有seed原值、Wilson/reward区间、seed均值/标准差和相对C-H8同seed结果；不只汇报最好seed。
+- 严格稳健性报告同时保留两层：逐seed仍按`[.18,.22]`判带内；组层面检查三seed mean outage是否在该带、变异是否小于C-H8/P-M8，并比较mean reward。只有risk接近目标且reward优势不由单一seed驱动，才把C-H17升级为最终候选；否则转向闭环减振或状态动作risk credit，不继续调seed1 setpoint。
