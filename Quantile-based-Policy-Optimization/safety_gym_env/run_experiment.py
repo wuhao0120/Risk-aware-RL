@@ -97,6 +97,7 @@ def base_args(algo, seed, device, env_key):
     a.num_iterations = 300           # 迭代数 (最小 pipeline 用; 全量另调)
     a.updates_per_episode = 10       # 每迭代内层更新次数
     a.actor_updates_per_episode = 1  # 非 PPO actor 每个 rollout 只做一次严格 on-policy 更新
+    a.actor_update_interval = 1      # 每多少个 rollout 合并一次 actor batch；1 精确保持历史路径
     a.init_std = 0.5                 # 策略探索 σ (动作空间 [-1,1])
     a.actor_hidden = [256, 256]      # MLP 策略 (观测 60-76 维)
     a.log_interval = 10

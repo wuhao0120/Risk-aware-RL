@@ -166,6 +166,11 @@ class VecAgentBase(object):
             'last_dual_control_error', 'last_dual_filtered_error',
             'last_pid_episode_scale', 'last_pid_effective_leak', 'last_pid_delta',
             'last_pid_actual_delta', 'last_pid_proportional', 'last_pid_output',
+            'actor_update_events', 'actor_rollouts_since_update',
+            'last_actor_first_epoch_ratio_max_error',
+            'last_actor_update_batch_trajectories',
+            'last_actor_updates_completed', 'last_actor_approx_kl',
+            'last_actor_clip_fraction',
         )
         runtime = {
             name: getattr(self, name)

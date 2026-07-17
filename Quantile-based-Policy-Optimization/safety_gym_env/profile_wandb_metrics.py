@@ -85,6 +85,11 @@ KEY_METRICS: Tuple[str, ...] = (
     "ppo/update_applied",
     "training/actor_updates_completed",
     "training/actor_updates_per_iteration",
+    "training/actor_update_interval",
+    "training/actor_update_due",
+    "training/actor_rollouts_accumulated",
+    "training/actor_batch_trajectories",
+    "training/actor_update_events",
     "training/actor_lr",
     "critic/reward_qr_loss",
     "critic/cost_qr_loss",
@@ -248,6 +253,10 @@ PLOT_PANELS: Tuple[Tuple[str, Tuple[str, ...], bool], ...] = (
         "training/actor_updates_completed",
         "training/actor_updates_per_iteration",
         "ppo/early_stop"), False),
+    ("actor cadence", (
+        "training/actor_update_due",
+        "training/actor_rollouts_accumulated",
+        "training/actor_batch_trajectories"), False),
 )
 
 

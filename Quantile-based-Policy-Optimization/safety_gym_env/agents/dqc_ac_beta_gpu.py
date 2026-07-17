@@ -278,6 +278,20 @@ class DQCACBetaGPU(VecAgentBase):
             0 if self.freeze_policy_updates else max(1, requested_actor_updates))
         if self.actor_updates_per_episode > self.updates_per_episode:
             raise ValueError("actor_updates_per_episode cannot exceed updates_per_episode")
+        # P-M7 默认关闭。interval>1 时 critic/PID 仍逐 rollout 更新，但 actor 权重和
+        # actor 自带 observation RMS 等收满 interval 个同策略 rollout 后才一起更新。
+        # 这与“把同一 rollout 做更多 epoch”不同：新增的是独立轨迹，不是重复标签。
+        self.actor_update_interval = max(
+            1, int(getattr(args, 'actor_update_interval', 1)))
+        self.actor_update_events = 0
+        self.actor_rollouts_since_update = 0
+        # 保留最近一次真正到期的 PPO 事件诊断，使 disabled/offline W&B 的短测试也能
+        # 从 JSON/checkpoint 证明首 epoch 的 π_new/π_old 是否严格从 1 开始。
+        self.last_actor_first_epoch_ratio_max_error = 0.0
+        self.last_actor_update_batch_trajectories = 0.0
+        self.last_actor_updates_completed = 0.0
+        self.last_actor_approx_kl = 0.0
+        self.last_actor_clip_fraction = 0.0
         self.advantage_norm = getattr(args, 'advantage_norm', 'qcpo')
         self.entropy_coef = getattr(args, 'entropy_coef', 0.0)
         self.lambda_max = getattr(args, 'lambda_max', 50.0)
@@ -454,6 +468,35 @@ class DQCACBetaGPU(VecAgentBase):
             if self.cost_s0_aux_coef > 0.0 or self.critic_minibatch_size != 0:
                 raise ValueError(
                     "cost_actor_query_mode='preupdate' currently requires s0_aux=0 and full-batch")
+
+        # 首个 actor-interval 消融只开放已经完整验证的 P-M3 recurrent/GAE-PPO/
+        # MC/raw/online 路径。两个 rollout 的 behavior actor、log-prob 分母和 obs RMS
+        # 必须完全相同，才能把合并 batch 仍称为 on-policy；其它组合先显式拒绝。
+        if self.actor_update_interval > 1 and not self.freeze_policy_updates:
+            if not self.recurrent_policy or self.reward_actor_mode != 'gae_ppo':
+                raise ValueError(
+                    "actor_update_interval>1 currently requires recurrent gae_ppo")
+            if self.cost_target_mode != 'mc' or self.cost_history_mode != 'raw':
+                raise ValueError(
+                    "actor_update_interval>1 currently requires MC/raw cost supervision")
+            if self.cost_actor_query_mode != 'online' or self.cost_s0_aux_coef > 0.0:
+                raise ValueError(
+                    "actor_update_interval>1 currently requires online query and s0_aux=0")
+            # 该校验位于 BaseVecAgent.__init__ 之前，因此 warmup_iters 尚未写入
+            # self；直接按下方正式初始化所用的同一规则从 args 解析，避免初始化
+            # 顺序依赖，同时保持未显式配置时 QCPO advantage 的默认 5 轮语义。
+            raw_warmup = getattr(args, 'warmup_iters', None)
+            configured_warmup = (
+                int(raw_warmup) if raw_warmup is not None
+                else (5 if self.advantage_norm == 'qcpo' else 0))
+            effective_warmup = max(
+                configured_warmup,
+                self.obs_norm_warmup_iters if self.normalize_observation else 0)
+            actor_rollouts = self.num_iterations - effective_warmup
+            if actor_rollouts <= 0 or actor_rollouts % self.actor_update_interval != 0:
+                raise ValueError(
+                    "post-warmup num_iterations must be positive and divisible by "
+                    "actor_update_interval")
 
         # dual 消融：旧 critic_adam 保持可复现；empirical_pid 用真实完成轨迹控制 λ。
         self.dual_update_mode = str(getattr(args, 'dual_update_mode', 'critic_adam')).lower()
@@ -736,7 +779,8 @@ class DQCACBetaGPU(VecAgentBase):
               f"/local{self.cost_quantile_local_count}, "
               f"qr_target={self.quantile_target_reduction}/ref{self.quantile_loss_reference_samples}, "
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
-              f"actor_updates/iter={self.actor_updates_per_episode}, reward_actor={self.reward_actor_mode}, "
+              f"actor_updates/iter={self.actor_updates_per_episode}"
+              f"/interval{self.actor_update_interval}, reward_actor={self.reward_actor_mode}, "
               f"ppo_target_kl={self.ppo_target_kl:g}, "
               f"actor_cost_query={self.cost_actor_query_mode}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}"
@@ -745,6 +789,9 @@ class DQCACBetaGPU(VecAgentBase):
               f"obs_stats_frozen={self.freeze_observation_stats}, "
               f"device={self.device}")
 
+        # interval=1 时该 cache 始终为空，历史路径不增加任何 tensor 拼接或 RNG 调用。
+        # interval>1 时只暂存 actor 所需的 on-policy 字段；critic 仍当轮立即训练。
+        actor_rollout_cache = []
         for it in range(self.num_iterations):
             # ===== 1. 采样 + DQCAC 专属后处理 (cost budget / n-step / d,e) =====
             batch = self._rollout_vec()
@@ -781,6 +828,24 @@ class DQCACBetaGPU(VecAgentBase):
                 self.update_dual(batch)
                 dual_updated = True
 
+            # interval>1 的每条 rollout 都预先抽取 K 组 risk-baseline action。抽样位置
+            # 与历史 actor 首 epoch 使用相同全局 RNG 序列；即使本轮暂不更新 actor，
+            # 也推进相同数量的随机数，使后续环境 action noise 可与 interval=1 配对。
+            actor_update_due = (
+                not self.freeze_policy_updates and not in_warmup)
+            actor_batch = batch
+            if actor_update_due and self.actor_update_interval > 1:
+                self._precompute_actor_baseline_actions(batch)
+                actor_rollout_cache.append(batch)
+                self.actor_rollouts_since_update = len(actor_rollout_cache)
+                actor_update_due = (
+                    len(actor_rollout_cache) == self.actor_update_interval)
+                actor_batch = (
+                    self._merge_actor_rollout_batches(actor_rollout_cache)
+                    if actor_update_due else None)
+            elif actor_update_due:
+                self.actor_rollouts_since_update = 1
+
             # ===== 2. 内层更新 (双 critic + actor) =====
             critic_info, actor_info = {}, {}
             actor_updated = False
@@ -791,7 +856,9 @@ class DQCACBetaGPU(VecAgentBase):
                 """执行一次允许的actor epoch，并统一维护early-stop/scheduler计数。"""
                 nonlocal actor_info, actor_updated
                 nonlocal actor_updates_completed, actor_early_stopped
-                actor_info = self.update_actor(batch)
+                if actor_batch is None:
+                    raise RuntimeError("actor epoch requested without an accumulated batch")
+                actor_info = self.update_actor(actor_batch)
                 # target-KL越界的probe epoch不执行optimizer.step；它和剩余epoch
                 # 都不能推进actor scheduler，但critic更新预算保持不变。
                 update_applied = bool(
@@ -805,6 +872,7 @@ class DQCACBetaGPU(VecAgentBase):
             for update_idx in range(self.updates_per_episode):
                 actor_epoch_allowed = (
                     not self.freeze_policy_updates and not in_warmup
+                    and actor_update_due
                     and update_idx < self.actor_updates_per_episode
                     and not actor_early_stopped)
                 # C-X3只把首个actor epoch提前到任何current-batch QR step之前。
@@ -840,6 +908,32 @@ class DQCACBetaGPU(VecAgentBase):
                 actor_updates_completed)
             actor_info['ppo/early_stop'] = float(actor_early_stopped)
             actor_info['ppo/target_kl'] = self.ppo_target_kl
+            if actor_updated:
+                self.actor_update_events += 1
+            accumulated_rollouts = (
+                len(actor_rollout_cache)
+                if self.actor_update_interval > 1 and not in_warmup
+                else int(actor_update_due))
+            actor_info['training/actor_update_due'] = float(actor_update_due)
+            actor_info['training/actor_rollouts_accumulated'] = float(
+                accumulated_rollouts)
+            actor_info['training/actor_batch_trajectories'] = float(
+                accumulated_rollouts * self.num_envs if actor_update_due else 0)
+            actor_info['training/actor_update_events'] = float(
+                self.actor_update_events)
+            if actor_update_due:
+                # actor_info 在多个 epoch 间会被最新一次覆盖；first_epoch 字段缓存在
+                # actor_batch 中，因此这里仍是更新前 ratio 的自检，而 KL/clip 是末 epoch。
+                self.last_actor_first_epoch_ratio_max_error = float(
+                    actor_info.get('ppo/first_epoch_ratio_max_error', 0.0))
+                self.last_actor_update_batch_trajectories = float(
+                    actor_info['training/actor_batch_trajectories'])
+                self.last_actor_updates_completed = float(
+                    actor_info['training/actor_updates_completed'])
+                self.last_actor_approx_kl = float(
+                    actor_info.get('ppo/approx_kl', 0.0))
+                self.last_actor_clip_fraction = float(
+                    actor_info.get('ppo/clip_fraction', 0.0))
 
             # 旧 critic_adam 路径保留 actor 后更新时序，保证历史实验可复现。
             if (not self.freeze_policy_updates and not in_warmup
@@ -857,7 +951,22 @@ class DQCACBetaGPU(VecAgentBase):
             # 完成后再合并；否则固定 old_logπ 与 current logπ 会使用不同输入变换。
             if (self.recurrent_policy and self.normalize_observation
                     and not self.freeze_observation_stats):
-                self.actor.update_obs_rms(batch['actor_obs'])
+                # warmup 仍逐批建立初始 moments；正式 interval 窗口内则必须冻结 RMS，
+                # 否则即使 actor 参数没 step，第二条 rollout 也不再来自同一 behavior policy。
+                rms_batch = None
+                if in_warmup or self.actor_update_interval == 1:
+                    rms_batch = batch
+                elif actor_update_due:
+                    rms_batch = actor_batch
+                if rms_batch is not None:
+                    self.actor.update_obs_rms(rms_batch['actor_obs'])
+
+            # due rollout 已把全部缓存轨迹用于同一次 PPO batch；在日志写入前保留
+            # accumulated 数值，但立即释放 GPU tensor，避免进入下一 cadence 窗口。
+            if actor_update_due:
+                if self.actor_update_interval > 1:
+                    actor_rollout_cache.clear()
+                self.actor_rollouts_since_update = 0
 
             # ===== 4. 日志 + 调度 =====
             self._log(it, batch, critic_info, actor_info)
@@ -865,6 +974,68 @@ class DQCACBetaGPU(VecAgentBase):
                 self.actor_scheduler.step()                    # 每个有 actor update 的 rollout 推进一步
             if dual_updated and self.dual_update_mode == 'critic_adam':
                 self.lambda_scheduler.step()                   # 严格位于 lambda_optimizer.step() 之后
+
+        if actor_rollout_cache:
+            raise RuntimeError(
+                "training ended with unused actor rollouts; check interval divisibility")
+
+    def _precompute_actor_baseline_actions(self, batch):
+        """
+        为 cadence cache 预抽 K 组 behavior-policy action，保持全局 RNG 消耗配对。
+
+        这些 action 只在真正的 actor epoch 中送入当时最新的 cost critic；提前抽样
+        不读取 critic、不改变梯度。每个元素形状为 [T*B,A]，最终堆成 [K,T*B,A]。
+        """
+        with torch.no_grad():
+            means = batch['actor_mean'].reshape(-1, self.action_dim)
+            log_stds = batch['actor_log_std'].reshape(-1, self.action_dim)
+            batch['_actor_baseline_actions'] = torch.stack([
+                self._sample_from_params(means, log_stds)
+                for _ in range(self.num_action_samples)
+            ], dim=0).detach()
+
+    def _merge_actor_rollout_batches(self, batches):
+        """
+        沿环境维合并多个同策略 recurrent rollout，返回一次严格 on-policy PPO batch。
+
+        rollout 的 flatten 顺序是 time-major (t*B+j)，不能直接在 dim=0 拼接；
+        必须先恢复 [T,B,*]、沿 B 拼接，再重新 flatten。这样 h0/c0、old_logπ、
+        GAE target、实际动作和预抽 baseline action 的 episode 对齐保持不变。
+        """
+        if len(batches) != self.actor_update_interval:
+            raise ValueError("actor rollout cache length does not match configured interval")
+        T, B = self.n, self.num_envs
+        merged = {'_actor_num_envs': B * len(batches)}
+
+        time_major_keys = (
+            'actor_obs', 'prev_action', 'prev_reward', 'h0', 'c0',
+            'actor_mean', 'actor_log_std')
+        for key in time_major_keys:
+            merged[key] = torch.cat([entry[key] for entry in batches], dim=1)
+
+        flat_time_keys = (
+            'states', 'actions', 'budgets', 'steps', 'e', 'old_log_probs',
+            '_reward_advantage_raw', '_reward_advantage',
+            '_reward_value_targets')
+        for key in flat_time_keys:
+            tensors = []
+            for entry in batches:
+                value = entry[key]
+                tensors.append(value.reshape(T, B, *value.shape[1:]))
+            combined = torch.cat(tensors, dim=1)
+            merged[key] = combined.reshape(
+                T * merged['_actor_num_envs'], *combined.shape[2:])
+
+        baseline_actions = [
+            entry['_actor_baseline_actions'].reshape(
+                self.num_action_samples, T, B, self.action_dim)
+            for entry in batches]
+        merged['_actor_baseline_actions'] = torch.cat(
+            baseline_actions, dim=2).reshape(
+                self.num_action_samples,
+                T * merged['_actor_num_envs'],
+                self.action_dim)
+        return merged
 
     # ============================================================ 循环策略 rollout / BPTT 工具 ============================================================
     @staticmethod
@@ -2088,7 +2259,8 @@ class DQCACBetaGPU(VecAgentBase):
         actor epoch 后缓存，防止后续 critic epoch 移动 PPO 的监督目标。
         """
         transform = self._transform_recurrent
-        n, B = self.n, self.num_envs
+        n = self.n
+        B = int(batch.get('_actor_num_envs', self.num_envs))
 
         # [T,B,*] 按每条轨迹切成 seq_len 块；h0/c0 取每块进入前行为状态。
         observations = transform(batch['actor_obs'])
@@ -2126,9 +2298,19 @@ class DQCACBetaGPU(VecAgentBase):
                 behavior_mean = batch['actor_mean'].reshape(n * B, self.action_dim)
                 behavior_log_std = batch['actor_log_std'].reshape(n * B, self.action_dim)
                 baseline_cdfs = []
-                for _sample_idx in range(self.num_action_samples):
-                    baseline_action = self._sample_from_params(
-                        behavior_mean, behavior_log_std)
+                precomputed_actions = batch.get('_actor_baseline_actions')
+                if precomputed_actions is not None:
+                    expected_shape = (
+                        self.num_action_samples, n * B, self.action_dim)
+                    if tuple(precomputed_actions.shape) != expected_shape:
+                        raise ValueError(
+                            "precomputed actor baseline action shape mismatch: "
+                            f"{tuple(precomputed_actions.shape)} != {expected_shape}")
+                for sample_idx in range(self.num_action_samples):
+                    baseline_action = (
+                        precomputed_actions[sample_idx]
+                        if precomputed_actions is not None else
+                        self._sample_from_params(behavior_mean, behavior_log_std))
                     baseline_cdfs.append(
                         self._cost_actor_query_probability(
                             cost_inputs, baseline_action, budgets,
@@ -2962,6 +3144,7 @@ class DQCACBetaGPU(VecAgentBase):
             'training/learning_steps': self.learning_steps,
             'training/actor_lr': float(self.actor_scheduler.get_last_lr()[0]),
             'training/actor_updates_per_iteration': self.actor_updates_per_episode,
+            'training/actor_update_interval': self.actor_update_interval,
         }
         # pre 是本轮训练前的新样本泛化，post 是同一批被重复更新后的拟合；
         # 两者键完全对齐，profile 可直接计算 post-pre 而不混入动作/RNG差异。
@@ -3270,6 +3453,16 @@ class DQCACBetaGPU(VecAgentBase):
             'quantile_target_reduction': self.quantile_target_reduction,
             'quantile_loss_reference_samples': self.quantile_loss_reference_samples,
             'actor_updates_per_episode': self.actor_updates_per_episode,
+            'actor_update_interval': self.actor_update_interval,
+            'actor_update_events': self.actor_update_events,
+            'actor_first_epoch_ratio_max_error': (
+                self.last_actor_first_epoch_ratio_max_error),
+            'actor_update_batch_trajectories': (
+                self.last_actor_update_batch_trajectories),
+            'actor_updates_completed_last_event': (
+                self.last_actor_updates_completed),
+            'actor_last_approx_kl': self.last_actor_approx_kl,
+            'actor_last_clip_fraction': self.last_actor_clip_fraction,
             'ppo_target_kl': self.ppo_target_kl,
             'freeze_policy_updates': self.freeze_policy_updates,
             'freeze_observation_stats': self.freeze_observation_stats,

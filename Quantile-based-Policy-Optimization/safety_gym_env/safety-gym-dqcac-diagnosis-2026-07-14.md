@@ -1549,3 +1549,15 @@ N64出现了一个值得记录但不能选择性放大的结果：独立hard-CDF
 对“训练是否太短”的直白结论是：旧100k确实太短，不能宣布N64/local永久无效；本次600k足以完成固定成熟策略下的表示筛选，但不是论文最终算法预算。继续同一个初始化到1.2M的先验收益很低，因为没有同方向收敛趋势。若将来要专门检验初始化偶然性，应跑多个critic初始化的600k复验，而不是只延长同一seed；该路线保留为论文消融，不占当前主线。
 
 因此两条都不做fresh520或live 1M，也不扫描N96/N128和局部窗口。下一步优先把critic获取独立数据的速度与policy更新速度解耦：critic每批B20更新，但actor/PID每两批才改变一次，直接测试“每个policy版本只有20条轨迹”是否是闭环振荡来源。完整CSV和六面板图保存在'_runs/profiles/dqc_frozen_qr32_n64_local_600k_lenaudit_2026-07-17/'，图为3000×1500并已解码验证。
+
+### 13.70 P-M7：降低Actor更新频率，但不丢掉第一批on-policy数据（2026-07-17）
+
+当前最值得验证的不是“再给同一批20条轨迹多做几次梯度”，而是让同一个policy版本真正看到更多独立轨迹。冻结实验已经显示cost critic从300k到600k仍能大幅改善，而live P-M3每20条轨迹就移动Actor。P-M7因此保留每批20次critic更新和每批经验PID，只把Actor事件改为每两批一次；两批共40条轨迹全部进入同一次PPO，不采用简单skip-and-drop。
+
+这仍是严格的on-policy PPO。两批采样时Actor权重和Actor自己的observation RMS完全冻结，每条动作同时保存采样时的old log-prob；更新时每个epoch重新计算current log-prob，importance ratio用current/old并clip。无需在每次更新后覆盖old probability，那会把分母改成上一epoch并破坏PPO相对同一behavior policy的信赖域。实现还预抽并缓存每批K组baseline action，使cadence不因辅助动作采样改变后续环境动作噪声。
+
+工程证据已经覆盖三个层级。默认interval1相对旧提交的六个module和lambda逐tensor完全相同。小型interval2快照证明两个rollout之间Actor的16项state完全不动、Critic照常更新，到期后Actor才变化且事件数为1。全尺寸B40合并smoke在LSTM512、T1000、QR32和8个PPO epoch下22.1秒完成，首epochratio误差只有1.14e-5，末epoch KL 0.00537，显存约2.8GB，没有形状、NaN或OOM问题。短跑在这里只验证实现，不用于判断性能。
+
+P-M7必须在压力seed1完整跑1M，因为它只有25次Actor事件，100k/300k的更新次数更少，早期落后很可能只是学习时间轴变化。1M后先看内置screen，再以fresh520相对P-M3的0.8622 reward和0.3058 outage裁决；正式门为outage不高于0.22且至少降低0.08、reward不低于0.75，并要求末200k没有更强闭环振荡。通过后扩两个seed，接近门且仍在改善才延2M；论文最终比较仍是5M、多seed、统一独立评估。
+
+若P-M7失败，结论只针对“Critic/PID每B20、Actor每B40”这一时序，不能外推为所有低频更新都无效。PID同步到B40、skip-and-drop、多个critic初始化、interval4以及B40与cadence组合都记录为独立路线；它们改变的机制不同，应作为轻量机制验证或消融分别预注册，不能事后叠加成无法归因的组合。
