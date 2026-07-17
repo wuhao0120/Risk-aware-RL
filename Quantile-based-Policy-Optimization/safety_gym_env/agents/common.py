@@ -182,6 +182,92 @@ class ImplicitQuantileCritic(nn.Module):
         return self.quantile_head(joint_feature).squeeze(-1)         # [B,N]
 
 
+class ExceedanceProbabilityCritic(nn.Module):
+    """
+    直接查询点 critic：估计 P(C_remaining >= budget | state, action, budget)。
+
+    QR/IQN 先学习整条 quantile function，再在给定 budget 处计数/积分；本网络只学习
+    DQCAC actor 真正使用的 Bernoulli 条件概率。budget 是显式条件变量，因此同一个
+    (state, action) 可以查询不同剩余安全预算，而不需要为每个阈值重训输出头。
+    """
+
+    def __init__(self, state_dim, action_dim, hidden=None, budget_scale=1.0):
+        """
+        Args:
+            state_dim: cost critic 已预处理的状态/step-feature 维度。
+            action_dim: 连续动作维度。
+            hidden: MLP 隐藏层宽度；None 时使用 [256, 256]。
+            budget_scale: 固定正尺度，网络实际接收 budget / budget_scale。
+
+        Returns:
+            forward 返回未过 sigmoid 的 [B] logits；训练用 BCEWithLogitsLoss，
+            查询方显式 sigmoid 得到概率，避免训练时重复 sigmoid 降低数值稳定性。
+        """
+        super().__init__()
+        hidden = [256, 256] if hidden is None else list(hidden)
+        if not hidden:
+            raise ValueError("direct CDF hidden must contain at least one layer")
+        if float(budget_scale) <= 0.0:
+            raise ValueError("direct CDF budget_scale must be positive")
+
+        # budget_scale 是模型语义的一部分，注册为buffer后可随checkpoint/device迁移。
+        self.register_buffer(
+            "budget_scale", torch.tensor(float(budget_scale), dtype=torch.float32))
+        dims = [int(state_dim) + int(action_dim) + 1] + hidden
+        layers = []
+        for input_dim, output_dim in zip(dims[:-1], dims[1:]):
+            layers.append(nn.Linear(input_dim, output_dim))
+            layers.append(nn.ReLU())
+        layers.append(nn.Linear(dims[-1], 1))
+        self.net = nn.Sequential(*layers)
+
+        # 隐藏层与QR critic统一用正交初始化；末层小gain令初始logit接近0，避免
+        # 随机大logit把首批BCE推入饱和区。bias=0对应中性先验p=0.5。
+        linear_layers = [
+            module for module in self.modules() if isinstance(module, nn.Linear)]
+        for module in linear_layers:
+            nn.init.orthogonal_(module.weight, gain=1.0)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
+        nn.init.orthogonal_(linear_layers[-1].weight, gain=0.01)
+
+    def forward(self, state, action, budget):
+        """
+        Args:
+            state: [B,state_dim]。
+            action: [B,action_dim]。
+            budget: 标量、[B] 或 [B,1]。
+
+        Returns:
+            [B] Bernoulli logits，对应每行查询点的超阈概率。
+        """
+        if state.ndim != 2 or action.ndim != 2:
+            raise ValueError("direct CDF state/action must both be rank-2 tensors")
+        if state.shape[0] != action.shape[0]:
+            raise ValueError("direct CDF state/action batch sizes must match")
+
+        if torch.is_tensor(budget):
+            budget_values = budget.to(device=state.device, dtype=state.dtype)
+            if budget_values.ndim == 0:
+                budget_values = budget_values.expand(state.shape[0]).unsqueeze(1)
+            elif budget_values.ndim == 1:
+                budget_values = budget_values.unsqueeze(1)
+            elif budget_values.ndim != 2 or budget_values.shape[1] != 1:
+                raise ValueError("direct CDF budget must be scalar, [B], or [B,1]")
+            if budget_values.shape[0] not in {1, state.shape[0]}:
+                raise ValueError("direct CDF budget batch must be 1 or match state")
+            if budget_values.shape[0] == 1 and state.shape[0] != 1:
+                budget_values = budget_values.expand(state.shape[0], 1)
+        else:
+            budget_values = torch.full(
+                (state.shape[0], 1), float(budget),
+                dtype=state.dtype, device=state.device)
+
+        scaled_budget = budget_values / self.budget_scale.to(dtype=state.dtype)
+        inputs = torch.cat([state, action, scaled_budget], dim=-1)
+        return self.net(inputs).squeeze(-1)
+
+
 class ScalarValueCritic(nn.Module):
     """
     状态价值网络 V(s)，专供 DQCAC 的 reward GAE/PPO 可选主干使用。

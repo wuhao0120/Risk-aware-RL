@@ -23,21 +23,31 @@ import torch
 def _cost_critic_initial_stats(agent, S0, A0, d):
     """
     用 agent 的【cost 分布式 critic】在 eval 批 (s0,a0) 上估计 P(C≥d)/E[C]/std(C)。
-    仅当 agent 有 .cost_critic 和 .num_quantiles (DQCAC) 时计算；否则四项均为 None。
-    数值上 P(C≥d)=P(Z≤q), 与 empirical_prob 同口径可比。
+    仅当 agent 有 .cost_critic 和 .num_quantiles (DQCAC) 时计算；否则均为 None。
+    数值上 P(C≥d)=P(Z≤q), 与 empirical_prob 同口径可比。direct模式的主CDF
+    来自Bernoulli head，同时返回相同(s0,a0)上的QR hard-CDF作内部对照。
     """
     if not (hasattr(agent, 'cost_critic') and hasattr(agent, 'num_quantiles')):
-        return None, None, None, None
+        return None, None, None, None, None, None, None
     with torch.no_grad():
         # episodic 配方下 critic 带 step 特征 → 用 agent._aug 做 s0(step=0) 增广
         S0_in = agent._aug(S0, 0) if hasattr(agent, '_aug') else S0
         psi = agent.cost_critic(S0_in, A0)                    # [N, N_q] cost 回报分位数
         if hasattr(agent, '_cost_tail_probability'):
             # query-mixture QR 需要 quadrature 权重；IQN 的 default grid 是 uniform。
-            cdf = float(agent._cost_tail_probability(
-                psi, d, mode='hard').mean().item())
+            qr_probability = agent._cost_tail_probability(
+                psi, d, mode='hard')
         else:
-            cdf = float((psi >= d).float().mean(dim=1).mean().item())
+            qr_probability = (psi >= d).float().mean(dim=1)
+        qr_cdf = float(qr_probability.mean().item())
+        if (getattr(agent, 'cost_cdf_estimator', 'quantile') == 'direct'
+                and hasattr(agent, '_direct_cost_tail_probability')):
+            selected_probability = agent._direct_cost_tail_probability(
+                S0_in, A0, d)
+            cdf = float(selected_probability.mean().item())
+        else:
+            selected_probability = qr_probability
+            cdf = qr_cdf
         if hasattr(agent, '_cost_quantile_moments'):
             means, stds = agent._cost_quantile_moments(psi)
             pmean = float(means.mean().item())
@@ -48,7 +58,13 @@ def _cost_critic_initial_stats(agent, S0, A0, d):
         crossing = float(
             0.0 if psi.shape[-1] < 2 else
             (psi[:, 1:] < psi[:, :-1]).float().mean().item())
-    return cdf, pmean, pstd, crossing
+    direct_enabled = (
+        getattr(agent, 'cost_cdf_estimator', 'quantile') == 'direct')
+    return (
+        cdf, pmean, pstd, crossing,
+        qr_cdf if direct_enabled else None,
+        selected_probability.detach().cpu().numpy(),
+        qr_probability.detach().cpu().numpy() if direct_enabled else None)
 
 
 def evaluate_policy_vec(agent, vec_env, num_episodes, gamma, cost_gamma, omega, cost_limit):
@@ -112,9 +128,20 @@ def evaluate_policy_vec(agent, vec_env, num_episodes, gamma, cost_gamma, omega, 
     # cost critic 校准 (仅 DQCAC); 数值 = P(Z≤q|s0)
     S0 = torch.cat(S0_all, dim=0)
     A0 = torch.cat(A0_all, dim=0)
-    cdf, pmean, pstd, crossing = _cost_critic_initial_stats(
+    (cdf, pmean, pstd, crossing, qr_cdf,
+     selected_probabilities, qr_probabilities) = _cost_critic_initial_stats(
         agent, S0, A0, d)
     result['cost_cdf_initial'] = cdf
+    if selected_probabilities is not None:
+        observed_outage = (Zc >= d).astype(np.float64)
+        result['cost_cdf_brier_initial'] = float(np.mean(
+            (selected_probabilities.astype(np.float64)
+             - observed_outage) ** 2))
+    if qr_cdf is not None:
+        result['cost_cdf_qr_initial'] = qr_cdf
+        result['cost_cdf_qr_brier_initial'] = float(np.mean(
+            (qr_probabilities.astype(np.float64)
+             - observed_outage) ** 2))
     result['pred_cost_mean'] = pmean
     result['pred_cost_std'] = pstd
     result['cost_quantile_crossing_fraction'] = crossing

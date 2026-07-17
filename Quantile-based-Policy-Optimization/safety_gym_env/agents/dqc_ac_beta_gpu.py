@@ -33,13 +33,15 @@ from collections import deque
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 
 from utils import RecurrentActorValue, RecurrentCostEncoder, RunningMeanStd
 from .vec_base import VecAgentBase
-from .common import (DistributionalCritic, ImplicitQuantileCritic,
-                     ScalarValueCritic, lr_lambda, indicator_ge)
+from .common import (DistributionalCritic, ExceedanceProbabilityCritic,
+                     ImplicitQuantileCritic, ScalarValueCritic, lr_lambda,
+                     indicator_ge)
 
 
 def _build_cost_quantile_grid(num_quantiles, mode, query_tau, half_width,
@@ -130,6 +132,31 @@ class DQCACBetaGPU(VecAgentBase):
                self.cost_iqn_query_quantiles,
                self.cost_iqn_cosines) <= 0:
             raise ValueError("all IQN sample/count parameters must be positive")
+
+        # C-DCF1 把 actor 查询来源与分布表示解耦。quantile 完全复现历史：
+        # QR/IQN -> threshold count/integration；direct 则额外训练 Bernoulli head，
+        # 直接估计 P(C_remaining >= budget | s,a,budget)。QR 仍保留作mean/分位诊断。
+        self.cost_cdf_estimator = str(
+            getattr(args, 'cost_cdf_estimator', 'quantile')).lower()
+        if self.cost_cdf_estimator not in {'quantile', 'direct'}:
+            raise ValueError("cost_cdf_estimator must be 'quantile' or 'direct'")
+        self.cost_direct_cdf_lr = float(
+            getattr(args, 'cost_direct_cdf_lr',
+                    getattr(args, 'critic_lr', 1e-3)))
+        self.cost_direct_cdf_grad_clip = float(
+            getattr(args, 'cost_direct_cdf_grad_clip', 10.0))
+        raw_direct_budget_scale = getattr(
+            args, 'cost_direct_cdf_budget_scale', None)
+        self.cost_direct_cdf_budget_scale = (
+            max(abs(float(self.cost_limit)), 1.0)
+            if raw_direct_budget_scale is None
+            else float(raw_direct_budget_scale))
+        if self.cost_direct_cdf_lr <= 0.0:
+            raise ValueError("cost_direct_cdf_lr must be positive")
+        if self.cost_direct_cdf_grad_clip < 0.0:
+            raise ValueError("cost_direct_cdf_grad_clip must be non-negative")
+        if self.cost_direct_cdf_budget_scale <= 0.0:
+            raise ValueError("cost_direct_cdf_budget_scale must be positive")
 
         # C-Q4 只改变 cost critic 的 τ grid；reward critic 始终保留 uniform midpoint。
         # query_mixture 默认中心为 τ*=1-alpha，即上尾机会约束的决策边界。
@@ -342,6 +369,25 @@ class DQCACBetaGPU(VecAgentBase):
                 raise ValueError("cost_s0_aux_coef>0 currently requires cost_target_mode='mc'")
             if self.cost_history_mode != 'raw':
                 raise ValueError("cost_s0_aux_coef>0 currently requires cost_history_mode='raw'")
+
+        # C-DCF1 首轮只在P-M3已经验证的QR/raw/MC/online链路隔离比较查询表示。
+        # 这些限制不是永久API边界；它们防止首次实验同时混入IQN、history encoder、
+        # current-batch时序或recent-s0 replay，使CDF收益能够被唯一归因。
+        if self.cost_cdf_estimator == 'direct':
+            if self.cost_distribution_model != 'qr':
+                raise ValueError(
+                    "direct cost CDF currently requires cost_distribution_model='qr'")
+            if self.cost_quantile_grid_mode != 'uniform':
+                raise ValueError(
+                    "direct cost CDF currently requires uniform QR diagnostics")
+            if self.cost_target_mode != 'mc' or self.cost_history_mode != 'raw':
+                raise ValueError(
+                    "direct cost CDF currently requires MC/raw cost supervision")
+            if self.cost_actor_query_mode != 'online':
+                raise ValueError(
+                    "direct cost CDF currently requires cost_actor_query_mode='online'")
+            if self.cost_s0_aux_coef > 0.0:
+                raise ValueError("direct cost CDF currently requires cost_s0_aux_coef=0")
 
         # C-IQN1 首轮只替换 P-M3 已验证的 raw/MC cost critic。固定策略校准门先
         # 判断连续 τ 表示是否改善泛化；在通过前不把 n-step target、cost-LSTM、
@@ -570,6 +616,32 @@ class DQCACBetaGPU(VecAgentBase):
             self.reward_value_optimizer = Adam(
                 self.reward_value.parameters(), self.reward_value_lr, eps=1e-5)
 
+        # direct CDF 是完全独立的Bernoulli critic/optimizer。只在显式开启时构造；
+        # 默认None不消费RNG、不改变旧optimizer参数组，支持历史QR逐位回归。
+        self.cost_exceedance_critic = None
+        self.cost_exceedance_optimizer = None
+        if self.cost_cdf_estimator == 'direct':
+            # 多一个网络通常会推进全局torch RNG，继而改变首批Gaussian action noise。
+            # 保存并恢复host/CUDA状态，使候选和QR baseline的policy/environment轨迹
+            # 在相同seed下仍可common-random-number严格配对。
+            host_rng_state = torch.get_rng_state()
+            direct_device = torch.device(self.device)
+            cuda_rng_state = (
+                torch.cuda.get_rng_state(direct_device)
+                if direct_device.type == 'cuda' and torch.cuda.is_available()
+                else None)
+            try:
+                self.cost_exceedance_critic = ExceedanceProbabilityCritic(
+                    cost_cdim, self.action_dim, list(hidden),
+                    budget_scale=self.cost_direct_cdf_budget_scale).to(self.device)
+            finally:
+                torch.set_rng_state(host_rng_state)
+                if cuda_rng_state is not None:
+                    torch.cuda.set_rng_state(cuda_rng_state, direct_device)
+            self.cost_exceedance_optimizer = Adam(
+                self.cost_exceedance_critic.parameters(),
+                self.cost_direct_cdf_lr, eps=1e-5)
+
         # -------------------- 拉格朗日乘子 λ --------------------
         self.lambda_dual = torch.tensor([0.0], dtype=torch.float32,
                                         device=self.device, requires_grad=True)
@@ -581,8 +653,10 @@ class DQCACBetaGPU(VecAgentBase):
         # -------------------- 运行时统计 (诊断量) --------------------
         self.learning_steps = 0
         self.last_dual_prob = 0.0                             # dual 用的 cost-critic P(C≥d)
-        self.last_cdf_initial = 0.0                           # hard cost-CDF，供真实校准
-        self.last_cdf_smooth_initial = 0.0                    # sigmoid CDF，仅作 surrogate 诊断
+        self.last_cdf_initial = 0.0                           # actor实际使用的cost-CDF
+        self.last_cdf_smooth_initial = 0.0                    # quantile平滑或direct同值
+        self.last_qr_cdf_initial = 0.0                        # 始终保留QR hard-CDF作对照
+        self.last_qr_cdf_smooth_initial = 0.0                 # 始终保留QR sigmoid-CDF
         self.last_pred_cost_mean = 0.0                        # cost-critic 估 E[C|s0]
         self.last_pred_cost_std = 0.0                         # cost-critic 估 std(C|s0)
         self.last_cost_quantile_crossing_fraction = 0.0       # 相邻 τ 输出违反单调性的比例
@@ -627,7 +701,10 @@ class DQCACBetaGPU(VecAgentBase):
               f"/floor{self.cost_critic_weight_floor:g}, "
               f"s0_aux={self.cost_s0_aux_coef:g}"
               f"/replay{self.cost_s0_replay_batches}, "
-              f"cost_cdf={self.cost_cdf_mode}/T{self.cost_cdf_temperature:g}, "
+              f"cost_cdf={self.cost_cdf_estimator}/{self.cost_cdf_mode}"
+              f"/T{self.cost_cdf_temperature:g}"
+              f"/lr{self.cost_direct_cdf_lr:g}"
+              f"/bscale{self.cost_direct_cdf_budget_scale:g}, "
               f"cost_grid={self.cost_quantile_grid_mode}/{self.cost_quantile_prediction_weighting}"
               f"/local{self.cost_quantile_local_count}, "
               f"qr_target={self.quantile_target_reduction}/ref{self.quantile_loss_reference_samples}, "
@@ -1147,15 +1224,19 @@ class DQCACBetaGPU(VecAgentBase):
         else:
             # online/target实验的holdout历史定义始终评估online critic，保持可比。
             quantiles = self.cost_critic(initial_inputs, initial_actions)
-        predicted_probability = self._cost_tail_probability(
+        qr_probability = self._cost_tail_probability(
             quantiles, float(self.cost_limit), mode='hard')
+        predicted_probability = (
+            self._direct_cost_tail_probability(
+                initial_inputs, initial_actions, float(self.cost_limit))
+            if self.cost_cdf_estimator == 'direct' else qr_probability)
         observed_event = (
             batch['disc_cost'] >= float(self.cost_limit)).to(torch.float32)
         predicted_mean, _predicted_std = self._cost_quantile_moments(quantiles)
 
         cdf_bias = predicted_probability.mean() - observed_event.mean()
         cost_mean_bias = predicted_mean.mean() - batch['disc_cost'].mean()
-        return {
+        metrics = {
             'cdf': float(predicted_probability.mean().item()),
             'truth': float(observed_event.mean().item()),
             'cdf_bias': float(cdf_bias.item()),
@@ -1168,6 +1249,18 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_mean_bias': float(cost_mean_bias.item()),
             'samples': float(sample_count),
         }
+        if self.cost_cdf_estimator == 'direct':
+            # 现有键始终代表驱动actor的selected estimator；qr_*在完全相同的
+            # 新轨迹/实际a0上给出内部对照，不需要另跑一个环境样本。
+            qr_bias = qr_probability.mean() - observed_event.mean()
+            metrics.update({
+                'qr_cdf': float(qr_probability.mean().item()),
+                'qr_cdf_bias': float(qr_bias.item()),
+                'qr_cdf_abs_error': float(qr_bias.abs().item()),
+                'qr_brier': float(
+                    (qr_probability - observed_event).pow(2).mean().item()),
+            })
+        return metrics
 
     @torch.no_grad()
     def _append_cost_s0_replay(self, batch):
@@ -1498,6 +1591,13 @@ class DQCACBetaGPU(VecAgentBase):
         if self.critic_grad_clip and self.critic_grad_clip > 0:
             nn.utils.clip_grad_norm_(joint_parameters, self.critic_grad_clip)
         self.critic_optimizer.step()
+
+        # Bernoulli查询head使用独立optimizer/clip；默认关闭时不执行forward/backward，
+        # 因而不会改变QR/reward joint optimizer的参数、梯度或Adam时间轴。
+        direct_cdf_info = {}
+        if self.cost_exceedance_critic is not None:
+            direct_cdf_info = self._update_direct_cost_cdf(
+                batch, cost_state_inputs, cost_sample_weights)
         if recurrent_cost:
             # actor risk 与 rollout 日志必须使用 optimizer.step 后的当前 encoder。
             self._refresh_cost_history_features(batch)
@@ -1562,7 +1662,113 @@ class DQCACBetaGPU(VecAgentBase):
                 'critic/cost_crossfit_fold1_fraction': crossfit_fold1_fraction,
             })
         critic_info.update(s0_aux_info)
+        critic_info.update(direct_cdf_info)
         return critic_info
+
+    def _update_direct_cost_cdf(
+            self, batch, cost_state_inputs, cost_sample_weights=None):
+        """
+        用MC remaining-cost二元事件更新直接查询点概率critic。
+
+        对每个transition，当前budget满足递推 b[t+1]=(b[t]-c[t])/gamma_c，
+        因此标签 I{MC_cost_to_go[t] >= b[t]} 与该轨迹从初始状态是否超限等价。
+        虽然同一trajectory的Bernoulli outcome相同，(state, action, budget, step)
+        条件输入随时间变化；使用全部transition正是为了覆盖actor实际查询的区域。
+
+        该函数与QR共享时间权重和可选transition chunk边界，但只共享输入数据，不
+        共享参数或optimizer。每次调用始终只有一个Adam step，chunking不会放大学习率。
+        """
+        if self.cost_exceedance_critic is None:
+            return {}
+        if 'mc_cost' not in batch:
+            raise RuntimeError("direct cost CDF requires per-transition mc_cost labels")
+        if cost_state_inputs is None:
+            raise RuntimeError("direct cost CDF requires materialized raw cost inputs")
+
+        actions = batch['actions']
+        budgets = batch['budgets']
+        labels = (
+            batch['mc_cost'] >= budgets).to(dtype=torch.float32).detach()
+        total_size = int(labels.numel())
+        chunk_size = self.critic_minibatch_size
+        use_chunks = 0 < chunk_size < total_size
+
+        # 每个chunk的mean乘chunk_size/total_size，等价于完整batch mean BCE。
+        # BCEWithLogitsLoss避免先sigmoid再log在极端logit处产生数值下溢。
+        self.cost_exceedance_optimizer.zero_grad(set_to_none=True)
+        loss_value = 0.0
+        probability_sum = torch.zeros((), device=self.device)
+        brier_sum = torch.zeros((), device=self.device)
+        weighted_brier_sum = torch.zeros((), device=self.device)
+        for begin in range(0, total_size, chunk_size if use_chunks else total_size):
+            finish = min(
+                begin + (chunk_size if use_chunks else total_size), total_size)
+            logits = self.cost_exceedance_critic(
+                cost_state_inputs[begin:finish],
+                actions[begin:finish],
+                budgets[begin:finish])
+            label_chunk = labels[begin:finish]
+            element_loss = F.binary_cross_entropy_with_logits(
+                logits, label_chunk, reduction='none')
+            weight_chunk = (
+                None if cost_sample_weights is None
+                else cost_sample_weights[begin:finish])
+            chunk_loss = (
+                element_loss.mean() if weight_chunk is None
+                else (element_loss * weight_chunk).mean())
+            objective_weight = float(finish - begin) / float(total_size)
+            (objective_weight * chunk_loss).backward()
+            loss_value += objective_weight * float(chunk_loss.detach().item())
+
+            # 校准诊断使用optimizer.step前的pre-update预测，与上面的BCE严格同版本。
+            with torch.no_grad():
+                probability = torch.sigmoid(logits.detach())
+                squared_error = (probability - label_chunk).pow(2)
+                probability_sum += probability.sum()
+                brier_sum += squared_error.sum()
+                weighted_brier_sum += (
+                    squared_error.sum() if weight_chunk is None
+                    else (squared_error * weight_chunk).sum())
+
+        direct_parameters = list(self.cost_exceedance_critic.parameters())
+        squared_grad_norm = torch.zeros(
+            (), dtype=torch.float32, device=self.device)
+        for parameter in direct_parameters:
+            if parameter.grad is not None:
+                squared_grad_norm += (
+                    parameter.grad.detach().float().pow(2).sum())
+        direct_grad_norm = squared_grad_norm.sqrt()
+        if self.cost_direct_cdf_grad_clip > 0.0:
+            nn.utils.clip_grad_norm_(
+                direct_parameters, self.cost_direct_cdf_grad_clip)
+        self.cost_exceedance_optimizer.step()
+
+        # 理论上每条trajectory的T个标签完全相同；非零说明budget或MC回报的
+        # 时间索引/折扣定义接错，比只看最终BCE更能发现静默监督bug。
+        label_matrix = labels.reshape(self.n, self.num_envs)
+        label_inconsistency = (
+            label_matrix != label_matrix[0].unsqueeze(0)).float().mean()
+        return {
+            'critic/cost_direct_cdf_enabled': 1.0,
+            'critic/cost_direct_cdf_loss': loss_value,
+            'critic/cost_direct_cdf_brier': float(
+                (brier_sum / total_size).item()),
+            'critic/cost_direct_cdf_weighted_brier': float(
+                (weighted_brier_sum / total_size).item()),
+            'critic/cost_direct_cdf_probability_mean': float(
+                (probability_sum / total_size).item()),
+            'critic/cost_direct_cdf_truth_mean': float(labels.mean().item()),
+            'critic/cost_direct_cdf_bias': float(
+                (probability_sum / total_size - labels.mean()).item()),
+            'critic/cost_direct_cdf_grad_norm': float(
+                direct_grad_norm.item()),
+            'critic/cost_direct_cdf_grad_clip_fraction': float(
+                direct_grad_norm.item() > self.cost_direct_cdf_grad_clip
+                if self.cost_direct_cdf_grad_clip > 0.0 else 0.0),
+            'critic/cost_direct_cdf_chunked_update': float(use_chunks),
+            'critic/cost_direct_cdf_label_inconsistency_fraction': float(
+                label_inconsistency.item()),
+        }
 
     def _sample_cost_iqn_taus(self, batch_size):
         """
@@ -1835,9 +2041,9 @@ class DQCACBetaGPU(VecAgentBase):
                 cost_inputs = self._cost_inputs(
                     states, steps, batch.get('cost_feature'))
                 query_folds = batch.get('_cost_crossfit_fold')
-                psi_c = self._cost_actor_query_quantiles(
-                    cost_inputs, batch['actions'], label_folds=query_folds)
-                psi_cdf = self._cost_tail_probability(psi_c, budgets)
+                psi_cdf = self._cost_actor_query_probability(
+                    cost_inputs, batch['actions'], budgets,
+                    label_folds=query_folds)
                 # target模式额外查询同刻online网络只作诊断，不采样、不参与梯度；
                 # online默认直接返回0，保证历史路径不增加任何critic forward。
                 batch['_risk_query_target_online_abs_mean'] = (
@@ -1850,10 +2056,10 @@ class DQCACBetaGPU(VecAgentBase):
                 for _sample_idx in range(self.num_action_samples):
                     baseline_action = self._sample_from_params(
                         behavior_mean, behavior_log_std)
-                    baseline_psi = self._cost_actor_query_quantiles(
-                        cost_inputs, baseline_action, label_folds=query_folds)
                     baseline_cdfs.append(
-                        self._cost_tail_probability(baseline_psi, budgets))
+                        self._cost_actor_query_probability(
+                            cost_inputs, baseline_action, budgets,
+                            label_folds=query_folds))
                 baseline_cdf = torch.stack(baseline_cdfs, dim=0).mean(dim=0)
                 raw_adv_c = psi_cdf - baseline_cdf
 
@@ -1982,9 +2188,8 @@ class DQCACBetaGPU(VecAgentBase):
             if '_risk_weight' not in batch:
                 cost_inputs = self._aug(s, steps)
                 query_folds = batch.get('_cost_crossfit_fold')
-                psi_c = self._cost_actor_query_quantiles(
-                    cost_inputs, a, label_folds=query_folds)           # [T·B,N]
-                psi_cdf = self._cost_tail_probability(psi_c, b)
+                psi_cdf = self._cost_actor_query_probability(
+                    cost_inputs, a, b, label_folds=query_folds)
                 batch['_risk_query_target_online_abs_mean'] = (
                     self._cost_actor_query_disagreement(
                         cost_inputs, a, b, psi_cdf).detach())
@@ -2159,10 +2364,15 @@ class DQCACBetaGPU(VecAgentBase):
                 cost_feature0 = self._initial_cost_history_feature(
                     s0, actor_feature0)
                 cost_input0 = self._cost_inputs(s0, 0, cost_feature0)
-                psi0 = self.cost_critic(cost_input0, a0)       # [B,N]
-                p = float(
-                    self._cost_tail_probability(
-                        psi0, self.cost_limit, mode='hard').mean().item())
+                if self.cost_cdf_estimator == 'direct':
+                    direct_probability = self._direct_cost_tail_probability(
+                        cost_input0, a0, self.cost_limit)
+                    p = float(direct_probability.mean().item())
+                else:
+                    psi0 = self.cost_critic(cost_input0, a0)   # [B,N]
+                    p = float(
+                        self._cost_tail_probability(
+                            psi0, self.cost_limit, mode='hard').mean().item())
             self.last_dual_prob = p
             self.last_dual_prob_gap = p - self.q_alpha
             # critic_adam 不是 empirical PID，继续严格优化真实 alpha，不应用 safety setpoint。
@@ -2247,6 +2457,36 @@ class DQCACBetaGPU(VecAgentBase):
         weights = self.cost_cdf_weights.to(
             device=quantiles.device, dtype=quantiles.dtype)
         return (tail_values * weights).sum(dim=-1)
+
+    def _direct_cost_tail_probability(self, inputs, actions, budgets):
+        """
+        查询直接Bernoulli critic并把logit映射到[0,1]上尾概率。
+
+        此接口不detach，使单元测试可以检查head梯度；正式actor、dual和评估调用都在
+        no_grad上下文中，DQCAC仍使用score-function policy gradient，不会错误地
+        通过critic对action做确定性策略梯度。
+        """
+        if self.cost_exceedance_critic is None:
+            raise RuntimeError("direct cost CDF critic is not initialized")
+        logits = self.cost_exceedance_critic(inputs, actions, budgets)
+        return torch.sigmoid(logits)
+
+    def _cost_actor_query_probability(
+            self, inputs, actions, budgets, mode=None, label_folds=None):
+        """
+        返回真正驱动actor的P(C_remaining>=budget|s,a,budget)。
+
+        quantile默认路径保持原调用顺序：先按online/target/crossfit路由quantiles，
+        再用hard/sigmoid积分。direct路径直接输出概率，mode对它没有数值意义；
+        保留参数只是让日志/评估可共用接口。
+        """
+        if self.cost_cdf_estimator == 'direct':
+            return self._direct_cost_tail_probability(
+                inputs, actions, budgets)
+        quantiles = self._cost_actor_query_quantiles(
+            inputs, actions, label_folds=label_folds)
+        return self._cost_tail_probability(
+            quantiles, budgets, mode=mode)
 
     def _cost_quantile_moments(self, quantiles):
         """
@@ -2426,9 +2666,8 @@ class DQCACBetaGPU(VecAgentBase):
                 a = self._sample_actions(states)
             if need_reward:
                 q_list.append(self.reward_critic(s_aug, a).mean(dim=1))          # reward 均值
-            cost_quantiles = self._cost_actor_query_quantiles(
-                cost_aug, a, label_folds=cost_query_folds)
-            c_list.append(self._cost_tail_probability(cost_quantiles, budgets))
+            c_list.append(self._cost_actor_query_probability(
+                cost_aug, a, budgets, label_folds=cost_query_folds))
         reward_baseline = torch.stack(q_list, dim=0).mean(dim=0) if need_reward else None
         cost_baseline = torch.stack(c_list, dim=0).mean(dim=0)
         return reward_baseline, cost_baseline
@@ -2465,9 +2704,8 @@ class DQCACBetaGPU(VecAgentBase):
             cost_features = batch.get('cost_feature')
             cost_inputs = self._cost_inputs(s, steps, cost_features)
             query_folds = batch.get('_cost_crossfit_fold')
-            cost_quantiles = self._cost_actor_query_quantiles(
-                cost_inputs, a, label_folds=query_folds)
-            psi_cdf = self._cost_tail_probability(cost_quantiles, b)
+            psi_cdf = self._cost_actor_query_probability(
+                cost_inputs, a, b, label_folds=query_folds)
             policy_mean = (
                 batch['actor_mean'].reshape(-1, self.action_dim)
                 if self.recurrent_policy else None)
@@ -2519,12 +2757,25 @@ class DQCACBetaGPU(VecAgentBase):
                     (primary_cdf - peer_cdf).abs().mean().item())
             else:
                 psi = self.cost_critic(cost_input0, a0)       # [B,N] 历史exact路径
-            self.last_cdf_initial = float(
-                self._cost_tail_probability(
-                    psi, self.cost_limit, mode='hard').mean().item())
-            self.last_cdf_smooth_initial = float(
-                self._cost_tail_probability(
-                    psi, self.cost_limit, mode='sigmoid').mean().item())
+            qr_hard_probability = self._cost_tail_probability(
+                psi, self.cost_limit, mode='hard')
+            qr_smooth_probability = self._cost_tail_probability(
+                psi, self.cost_limit, mode='sigmoid')
+            self.last_qr_cdf_initial = float(
+                qr_hard_probability.mean().item())
+            self.last_qr_cdf_smooth_initial = float(
+                qr_smooth_probability.mean().item())
+            if self.cost_cdf_estimator == 'direct':
+                selected_probability = self._direct_cost_tail_probability(
+                    cost_input0, a0, self.cost_limit)
+                self.last_cdf_initial = float(
+                    selected_probability.mean().item())
+                # direct head已经输出连续概率，不存在hard/sigmoid两个表示。
+                self.last_cdf_smooth_initial = self.last_cdf_initial
+            else:
+                self.last_cdf_initial = self.last_qr_cdf_initial
+                self.last_cdf_smooth_initial = (
+                    self.last_qr_cdf_smooth_initial)
             pred_mean, pred_std = self._cost_quantile_moments(psi)
             self.last_pred_cost_mean = float(pred_mean.mean().item())
             self.last_pred_cost_std = float(pred_std.mean().item())
@@ -2592,6 +2843,8 @@ class DQCACBetaGPU(VecAgentBase):
             'debug/cost_cdf_is_sigmoid': float(
                 self.cost_cdf_mode == 'sigmoid'),
             'debug/cost_cdf_temperature': self.cost_cdf_temperature,
+            'debug/cost_cdf_estimator_is_direct': float(
+                self.cost_cdf_estimator == 'direct'),
             'debug/cost_distribution_is_iqn': float(
                 self.cost_distribution_model == 'iqn'),
             'debug/cost_iqn_train_quantiles': float(
@@ -2623,6 +2876,17 @@ class DQCACBetaGPU(VecAgentBase):
                 for metric_name, metric_value in metrics.items():
                     extra[
                         f'critic/s0_holdout_{phase}_{metric_name}'] = metric_value
+        if self.cost_cdf_estimator == 'direct':
+            # selected CDF继续占用历史主键；QR诊断键使profile能在同一run内量化
+            # “直接监督”相对“完整分布再反演”的增益。
+            extra.update({
+                'constraint/qr_cdf_estimate_initial': (
+                    self.last_qr_cdf_initial),
+                'constraint/qr_cdf_estimate_smooth_initial': (
+                    self.last_qr_cdf_smooth_initial),
+                'constraint/qr_cdf_calibration_error': abs(
+                    self.last_qr_cdf_initial - empirical_prob),
+            })
         extra.update(critic_info)
         extra.update(actor_info)
         if self.cost_actor_query_mode == 'crossfit':
@@ -2709,6 +2973,9 @@ class DQCACBetaGPU(VecAgentBase):
                 s0, actor_feature0)
             cost_input0 = self._cost_inputs(s0, 0, cost_feature0)
             crossfit_eval = None
+            qr_cdf_eval = None
+            selected_probability_eval = None
+            qr_probability_eval = None
             if self.cost_actor_query_mode == 'crossfit':
                 # 新评估状态没有训练fold身份，因此用两个独立估计的等权ensemble。
                 # CDF先各自查询再平均，不能先平均quantiles后count，否则二者不等价。
@@ -2722,8 +2989,10 @@ class DQCACBetaGPU(VecAgentBase):
                     psi_primary, float(cost_limit), mode='sigmoid')
                 smooth_peer = self._cost_tail_probability(
                     psi_peer, float(cost_limit), mode='sigmoid')
+                selected_probability_eval = 0.5 * (
+                    hard_primary + hard_peer)
                 cost_cdf_initial = float(
-                    (0.5 * (hard_primary + hard_peer)).mean().item())
+                    selected_probability_eval.mean().item())
                 cost_cdf_smooth_initial = float(
                     (0.5 * (smooth_primary + smooth_peer)).mean().item())
 
@@ -2755,12 +3024,29 @@ class DQCACBetaGPU(VecAgentBase):
             else:
                 # 单critic分支逐式保留历史运算顺序，支持默认checkpoint exact回归。
                 psi0 = self.cost_critic(cost_input0, a0)
-                cost_cdf_initial = float(
-                    self._cost_tail_probability(
-                        psi0, float(cost_limit), mode='hard').mean().item())
-                cost_cdf_smooth_initial = float(
-                    self._cost_tail_probability(
-                        psi0, float(cost_limit), mode='sigmoid').mean().item())
+                qr_hard = self._cost_tail_probability(
+                    psi0, float(cost_limit), mode='hard')
+                qr_smooth = self._cost_tail_probability(
+                    psi0, float(cost_limit), mode='sigmoid')
+                if self.cost_cdf_estimator == 'direct':
+                    direct_probability = self._direct_cost_tail_probability(
+                        cost_input0, a0, float(cost_limit))
+                    selected_probability_eval = direct_probability
+                    qr_probability_eval = qr_hard
+                    cost_cdf_initial = float(
+                        direct_probability.mean().item())
+                    cost_cdf_smooth_initial = cost_cdf_initial
+                    qr_cdf_eval = {
+                        'cost_cdf_qr_initial': float(
+                            qr_hard.mean().item()),
+                        'cost_cdf_qr_smooth_initial': float(
+                            qr_smooth.mean().item()),
+                    }
+                else:
+                    selected_probability_eval = qr_hard
+                    cost_cdf_initial = float(qr_hard.mean().item())
+                    cost_cdf_smooth_initial = float(
+                        qr_smooth.mean().item())
                 pred_mean0, pred_std0 = self._cost_quantile_moments(psi0)
                 pred_cost_mean = float(pred_mean0.mean().item())
                 pred_cost_std = float(pred_std0.mean().item())
@@ -2775,6 +3061,11 @@ class DQCACBetaGPU(VecAgentBase):
         threshold = -float(cost_limit)
         empirical = float(np.mean(transformed <= threshold))
         quantile = float(np.percentile(transformed, omega * 100))
+        observed_outage = (cost_np >= float(cost_limit)).astype(np.float64)
+        selected_probability_np = (
+            selected_probability_eval.detach().cpu().numpy().astype(np.float64))
+        selected_brier = float(np.mean(
+            (selected_probability_np - observed_outage) ** 2))
         result = {
             'mean': float(reward_np.mean()),
             'reward_std': float(reward_np.std()),
@@ -2789,6 +3080,7 @@ class DQCACBetaGPU(VecAgentBase):
             'num_episodes': int(reward_np.shape[0]),
             'cost_cdf_initial': cost_cdf_initial,
             'cost_cdf_smooth_initial': cost_cdf_smooth_initial,
+            'cost_cdf_brier_initial': selected_brier,
             'pred_cost_mean': pred_cost_mean,
             'pred_cost_std': pred_cost_std,
             'cost_quantile_crossing_fraction': (
@@ -2796,6 +3088,12 @@ class DQCACBetaGPU(VecAgentBase):
         }
         if crossfit_eval is not None:
             result.update(crossfit_eval)
+        if qr_cdf_eval is not None:
+            result.update(qr_cdf_eval)
+            qr_probability_np = (
+                qr_probability_eval.detach().cpu().numpy().astype(np.float64))
+            result['cost_cdf_qr_brier_initial'] = float(np.mean(
+                (qr_probability_np - observed_outage) ** 2))
         return result
 
     # ============================================================ 总结接口 ============================================================
@@ -2832,6 +3130,12 @@ class DQCACBetaGPU(VecAgentBase):
             's0_holdout_post': dict(self.last_s0_holdout_post),
             'cost_cdf_mode': self.cost_cdf_mode,
             'cost_cdf_temperature': self.cost_cdf_temperature,
+            'cost_cdf_estimator': self.cost_cdf_estimator,
+            'cost_direct_cdf_lr': self.cost_direct_cdf_lr,
+            'cost_direct_cdf_grad_clip': self.cost_direct_cdf_grad_clip,
+            'cost_direct_cdf_budget_scale': (
+                self.cost_direct_cdf_budget_scale),
+            'qr_cdf_estimate_initial': self.last_qr_cdf_initial,
             'cost_distribution_model': self.cost_distribution_model,
             'cost_iqn_train_quantiles': self.cost_iqn_train_quantiles,
             'cost_iqn_query_quantiles': self.cost_iqn_query_quantiles,

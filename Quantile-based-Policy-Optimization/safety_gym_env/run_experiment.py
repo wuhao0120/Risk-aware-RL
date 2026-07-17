@@ -207,6 +207,12 @@ def base_args(algo, seed, device, env_key):
         # hard 校准/经验 outage/QR critic 均保留，便于无歧义消融。
         a.cost_cdf_mode = 'hard'
         a.cost_cdf_temperature = 1.0
+        # quantile保持历史阈值积分；direct显式增加Bernoulli查询head，并保留QR诊断。
+        # 独立lr/clip确保direct梯度不会改变reward/QR joint optimizer。
+        a.cost_cdf_estimator = 'quantile'
+        a.cost_direct_cdf_lr = 1e-3
+        a.cost_direct_cdf_grad_clip = 10.0
+        a.cost_direct_cdf_budget_scale = None
         # C-Q4 cost-only τ grid；uniform 默认完全复现历史。query_mixture 围绕
         # τ*=1-alpha 加密，CDF/target 用 importance weight，prediction loss
         # 可选择 query-focused（局部优化）或 importance（全局 W1 保持）。
@@ -522,6 +528,16 @@ def main():
     if res['cost_cdf_initial'] is not None:                    # DQCAC: cost-critic 校准
         print(f"[cost-critic calibration] P(Z<=q): critic={res['cost_cdf_initial']:.3f} "
               f"truth={emp:.3f} bias={res['cost_cdf_initial']-emp:+.3f}")
+    if res.get('cost_cdf_brier_initial') is not None:
+        print(
+            f"[cost-critic proper score] selected Brier="
+            f"{res['cost_cdf_brier_initial']:.4f}")
+    if res.get('cost_cdf_qr_initial') is not None:
+        # direct模式的主键是Bernoulli head；QR同样本对照单独打印，禁止混为一个CDF。
+        print(
+            f"[QR internal control] P(Z<=q): qr={res['cost_cdf_qr_initial']:.3f} "
+            f"truth={emp:.3f} bias={res['cost_cdf_qr_initial']-emp:+.3f} "
+            f"Brier={res['cost_cdf_qr_brier_initial']:.4f}")
     if res.get('cost_cdf_crossfit_peer_abs_mean') is not None:
         # crossfit的主/peer/ensemble必须一起打印；只报ensemble会掩盖模型不确定性。
         print(
@@ -552,6 +568,17 @@ def main():
             eval_log['eval/cost_cdf_initial'] = res['cost_cdf_initial']
         if res.get('cost_cdf_smooth_initial') is not None:
             eval_log['eval/cost_cdf_smooth_initial'] = res['cost_cdf_smooth_initial']
+        if res.get('cost_cdf_brier_initial') is not None:
+            eval_log['eval/cost_cdf_brier_initial'] = (
+                res['cost_cdf_brier_initial'])
+        if res.get('cost_cdf_qr_initial') is not None:
+            eval_log['eval/cost_cdf_qr_initial'] = res['cost_cdf_qr_initial']
+        if res.get('cost_cdf_qr_brier_initial') is not None:
+            eval_log['eval/cost_cdf_qr_brier_initial'] = (
+                res['cost_cdf_qr_brier_initial'])
+        if res.get('cost_cdf_qr_smooth_initial') is not None:
+            eval_log['eval/cost_cdf_qr_smooth_initial'] = (
+                res['cost_cdf_qr_smooth_initial'])
         if res.get('pred_cost_mean') is not None:
             eval_log['eval/pred_cost_mean'] = res['pred_cost_mean']
         if res.get('pred_cost_std') is not None:
