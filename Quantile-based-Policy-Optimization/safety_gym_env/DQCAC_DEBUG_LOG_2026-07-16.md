@@ -1348,3 +1348,26 @@
 - 主门不因观察到C20失败而放宽：末5批pre-CDF error至少改善20%或Brier至少改善10%，另一项不得恶化10%，mean bias≤1；独立hard或smooth Brier至少改善10%且AUC至少比raw提高.03，或Brier改善20%且AUC下降不超过.02，同时mean error≤.90、crossing≤.10。只有通过才做fresh520/live。
 - 机制辅助门：相对C-H1W C20，独立Brier至少改善20%，并保留至少一半AUC增益（hard AUC≥`.55495`）；pre与独立方向必须一致。只改善同批post、只降低最后一步grad或只改善总体CDF均值均不算成功。
 - 这不是actor的off-policy修正实验：policy完全冻结；critic对固定监督标签重复拟合无需importance ratio，改变C20→C5是在控制sample reuse与泛化。预计纯训练1.5--2.5分钟、140评估约1分钟，总墙钟3--5分钟；仍用持久化后台和脱敏W&B online。失败后不扫C2/C10，转向跨rollout replay/held-out validation或增加独立trajectory数。
+
+### E107：C-H2U5结果——减少update消除了AUC信号，却没有解决高梯度（2026-07-17）
+
+- 正式job正常`exit 0`，W&B run为`ocpqyr9x`；纯训练`243.5s`，只比C20的`281.35s`快13.45%，说明主要耗时在trajectory/recurrent编码与特征刷新，不在额外15个QR step。远端117个config键和3个文件通过隐私审计。
+- 16个behavior/truth字段与raw/C20逐值exact，最大差0。末5批pre-CDF/Brier为C5=`.10750/.23932`，raw=`.10656/.23253`，分别恶化0.88%/2.92%；aggregate mean bias为`-2.60855`。post-CDF/Brier=`.09031/.22743`，也比raw恶化140.83%/13.58%。
+- 全程/末5批真实5-update裁剪率为98.67%/100%；末5批cost grad first/mean/last=`47.21/43.15/35.84`，5次update后仍远高于clip=10。QR loss last/first=`.9647`，即只下降3.53%。C5不是稳定正则化，而是让大recurrent模型长期处于裁剪后的欠拟合状态。
+- 独立hard/smooth Brier为`.20986/.20904`，虽比C20改善26.7%/21.1%，却比raw恶化3.47%/3.62%；hard/smooth AUC从C20的`.590/.589`跌到`.393/.385`，低于随机。CDF absolute error`.02679`是raw的2.5倍，mean error`1.53895`，crossing`.13733`。辅助门的Brier部分通过，但“保留一半AUC增益”彻底失败。
+- 裁决：不做fresh520/live，不扫C2/C10。强更新是cost-LSTM学到history排序所必需，但B20+C20又把概率尺度和单调性拟合坏；下一步应提高每个optimizer step的独立轨迹数，而不是继续在同一B20上找epoch甜点。
+
+### E108：C-H3B40独立cost-LSTM、B40+C20冻结600k预注册（2026-07-17）
+
+- 候选将`num_envs=20→40`、`num_iterations=30→15`，总环境步仍严格600k；保留cost-LSTM、C20、MC、time-weight=.995、QR32、LR和冻结policy。每个样本仍被学习20次，但每次梯度看到40条而非20条独立轨迹；总transition-epoch相同，Adam step数从600降到300，位于C5的150与原C20的600之间。
+- B40改变env stream分组，训练history不要求逐行exact；固定策略的独立140条reward/outage必须与既有对照exact。B40只有15批，末段用最后3批（120条轨迹）与B20末5批（100条）比较，避免直接拿5×40扩大统计窗口。
+- 主门保持：末3批pre-CDF error至少比raw末5批改善20%或Brier改善10%，另一项不恶化10%，mean bias≤1；独立Brier至少比raw改善10%且AUC提高≥.03，或Brier改善20%且AUC不明显下降，同时mean error≤.90、crossing≤.10。
+- 机制门相对C20：独立Brier至少改善20%、hard AUC≥`.55495`、pre与独立方向一致；新增head/encoder分支梯度和真实20-update裁剪率用于判断大batch是否降低encoder噪声。只有主门通过才fresh520/live。
+- 实测B20任务仅占约1.3GB/80GB A100显存，chunk2500继续限制QR峰值，B40硬件余量充足。预计纯训练3.5--5分钟、独立评估约1分钟，总墙钟5--7分钟，持久化后台与脱敏W&B online。
+- 若B40只过机制门、且AUC/Brier方向一致但单一mean/crossing门略失，可把B80作为另行预注册消融；若AUC未达`.55495`或Brier相对C20未改善20%，停止batch scaling，转encoder专用低LR/正则或跨rollout held-out validation，不事后启动B80。
+
+### E109：cost head/history encoder梯度拆分及零影响回归（2026-07-17）
+
+- 新增当前update及rollout内first/mean/max/last两组裁剪前范数：206,112参数cost quantile head与2,393,600参数history encoder。总cost/joint范数、旧末次clip和真实全update clip保持原义；新增计算只读取已有`.grad`，不参与clip或optimizer。
+- 使用同一policy、seed304、B2、2批×3次update的cost-LSTM任务做补丁前后持久化回归，两个final checkpoint全部tensor逐元素相同，差异数0；除checkpoint目录外非tensor状态相同，独立4条评估语义字段相同，两个job均`exit 0`。
+- 因此B40可以安全回答高梯度主要来自head还是encoder。若encoder占主导，后续优先独立encoder LR/正则；若head占主导，优先修正QR尺度/输出结构。不能继续用合并norm猜测。

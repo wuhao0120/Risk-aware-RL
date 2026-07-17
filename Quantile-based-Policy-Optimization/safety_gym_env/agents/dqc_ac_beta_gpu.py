@@ -1021,6 +1021,10 @@ class DQCACBetaGPU(VecAgentBase):
                     critic_info.update(self.update_reward_value(batch))
                 critic_update_diagnostics.append({
                     'cost_grad_norm': float(critic_info['critic/cost_grad_norm']),
+                    'cost_head_grad_norm': float(
+                        critic_info['critic/cost_head_grad_norm']),
+                    'cost_history_grad_norm': float(
+                        critic_info['critic/cost_history_grad_norm']),
                     'joint_grad_norm': float(critic_info['critic/joint_grad_norm']),
                     'reward_grad_norm': float(critic_info['critic/reward_grad_norm']),
                     'grad_clipped': float(critic_info['critic/grad_clip_fraction']),
@@ -1041,10 +1045,13 @@ class DQCACBetaGPU(VecAgentBase):
                         [item[key] for item in critic_update_diagnostics],
                         dtype=np.float64)
                     for key in ('cost_grad_norm', 'joint_grad_norm',
-                                'reward_grad_norm', 'grad_clipped',
+                                'reward_grad_norm', 'cost_head_grad_norm',
+                                'cost_history_grad_norm', 'grad_clipped',
                                 'cost_qr_loss')
                 }
                 cost_grad = diagnostic_sequences['cost_grad_norm']
+                cost_head_grad = diagnostic_sequences['cost_head_grad_norm']
+                cost_history_grad = diagnostic_sequences['cost_history_grad_norm']
                 joint_grad = diagnostic_sequences['joint_grad_norm']
                 reward_grad = diagnostic_sequences['reward_grad_norm']
                 cost_loss = diagnostic_sequences['cost_qr_loss']
@@ -1056,6 +1063,20 @@ class DQCACBetaGPU(VecAgentBase):
                     'critic/cost_grad_norm_mean': float(cost_grad.mean()),
                     'critic/cost_grad_norm_max': float(cost_grad.max()),
                     'critic/cost_grad_norm_last': float(cost_grad[-1]),
+                    'critic/cost_head_grad_norm_first': float(cost_head_grad[0]),
+                    'critic/cost_head_grad_norm_mean': float(
+                        cost_head_grad.mean()),
+                    'critic/cost_head_grad_norm_max': float(
+                        cost_head_grad.max()),
+                    'critic/cost_head_grad_norm_last': float(cost_head_grad[-1]),
+                    'critic/cost_history_grad_norm_first': float(
+                        cost_history_grad[0]),
+                    'critic/cost_history_grad_norm_mean': float(
+                        cost_history_grad.mean()),
+                    'critic/cost_history_grad_norm_max': float(
+                        cost_history_grad.max()),
+                    'critic/cost_history_grad_norm_last': float(
+                        cost_history_grad[-1]),
                     'critic/joint_grad_norm_first': float(joint_grad[0]),
                     'critic/joint_grad_norm_mean': float(joint_grad.mean()),
                     'critic/joint_grad_norm_max': float(joint_grad.max()),
@@ -1954,16 +1975,17 @@ class DQCACBetaGPU(VecAgentBase):
                 # recent-s0 图很小，只在全部 transition chunk 释放后反传一次。
                 (cost_aux_scale * s0_aux_loss).backward()
 
-        # 分开记录两个 critic 的裁剪前梯度范数，诊断 MC 大 target 是否让
-        # joint clip 长期由 cost 分支主导。C-H1 的 cost norm 包含 encoder，
-        # 才能识别究竟是 quantile head 还是历史表示导致 joint clip。
+        # 分开记录两个critic及cost head/history encoder的裁剪前梯度范数，
+        # 诊断joint clip究竟由reward、quantile head还是循环表示主导。
         reward_parameters = list(self.reward_critic.parameters())
-        cost_parameters = list(self.cost_critic.parameters())
+        cost_head_parameters = list(self.cost_critic.parameters())
         if self.cost_crossfit_critic is not None:
             # peer 参数也参与同一次joint norm/clip；否则日志会低报真实optimizer输入。
-            cost_parameters += list(self.cost_crossfit_critic.parameters())
+            cost_head_parameters += list(self.cost_crossfit_critic.parameters())
+        cost_history_parameters = []
         if self.cost_history_encoder is not None:
-            cost_parameters += list(self.cost_history_encoder.parameters())
+            cost_history_parameters = list(self.cost_history_encoder.parameters())
+        cost_parameters = cost_head_parameters + cost_history_parameters
 
         def gradient_norm(parameters):
             squared_norm = torch.zeros((), dtype=torch.float32, device=self.device)
@@ -1973,6 +1995,8 @@ class DQCACBetaGPU(VecAgentBase):
             return squared_norm.sqrt()
 
         reward_grad_norm = gradient_norm(reward_parameters)
+        cost_head_grad_norm = gradient_norm(cost_head_parameters)
+        cost_history_grad_norm = gradient_norm(cost_history_parameters)
         cost_grad_norm = gradient_norm(cost_parameters)
         joint_parameters = reward_parameters + cost_parameters
         joint_grad_norm = gradient_norm(joint_parameters)
@@ -2029,6 +2053,9 @@ class DQCACBetaGPU(VecAgentBase):
                 0.0 if cost_prediction_taus is None
                 else cost_prediction_taus.max().item()),
             'critic/reward_grad_norm': float(reward_grad_norm.item()),
+            'critic/cost_head_grad_norm': float(cost_head_grad_norm.item()),
+            'critic/cost_history_grad_norm': float(
+                cost_history_grad_norm.item()),
             'critic/cost_grad_norm': float(cost_grad_norm.item()),
             'critic/joint_grad_norm': float(joint_grad_norm.item()),
             'critic/grad_clip_fraction': float(

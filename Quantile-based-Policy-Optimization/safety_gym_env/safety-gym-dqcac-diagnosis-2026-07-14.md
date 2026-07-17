@@ -1745,3 +1745,15 @@ C-H0.5W与raw/C-H1W的30批行为truth严格一致。它把可训练cost路径�
 ### 13.91 下一步只减cost-LSTM重复更新，不混入其他变量（2026-07-17）
 
 共享actor feature失败不等于history无用：只有独立cost-LSTM把AUC从约0.52提高到0.59。更精确的假设是，cost专用encoder必要，但B20上20次更新使概率尺度和quantile单调性过拟合。C-H2U5保持完整600k数据、网络、LR和时间权重不变，只把每批critic update从20降到5；它不是actor off-policy实验，也不需要importance ratio。只有prequential与独立Brier/AUC同时通过才进入live，否则转向跨rollout replay或增加num_envs，不继续扫描C2/C10。
+
+### 13.92 C5证明强更新既是问题，也是history排序信号的来源（2026-07-17）
+
+C5的独立Brier比C20改善约27%，但AUC从0.590降到0.393，说明它只是把过强的条件预测收缩回接近常数，并没有得到更好的risk critic。末5批5/5更新全部clip，梯度first/mean/last约47.2/43.2/35.8，loss只降3.5%；因此它不是“更稳”，而是明显欠拟合。训练耗时只降低13.5%，也说明减epoch不是有效工程加速手段。
+
+### 13.93 B40同时增加每步独立样本并保留每样本20次学习（2026-07-17）
+
+下一条固定总600k，把B20×30改为B40×15并保留C20。这样每个梯度的独立trajectory翻倍、每个样本仍有足够学习次数，总transition计算量相同而Adam step减半。它比扫描C10更直接回答用户提出的num_envs问题，也没有replay在live policy下的off-policy evaluation偏差。B20运行仅用约1.3GB/80GB显存，B40工程上安全；只有独立Brier/AUC联合通过才进入live。
+
+### 13.94 梯度已拆成quantile head与history encoder两部分（2026-07-17）
+
+旧cost norm把206k参数head与2.39M参数encoder合在一起，不能决定应该调哪一部分。现已增加两支current及first/mean/max/last范数；补丁前后短回归的全部checkpoint tensor与评估语义逐项相同。这是纯诊断，不改变clip、Adam或RNG。B40结果将据此决定后续是encoder专用低LR，还是head/QR目标问题。
