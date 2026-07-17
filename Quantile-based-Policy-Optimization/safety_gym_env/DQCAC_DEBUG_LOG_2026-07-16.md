@@ -1647,3 +1647,17 @@
 - 启用检查点随后由独立持久化eval-only任务成功重建并加载`cost_weibull_head`，4回合验证exit0。短测的零cost/outage只反映T32任务过短，不能用于性能判断，也不作为“outage越低越好”的证据。
 - 下一步先做固定成熟policy、同seed、同600k监督预算的coef0/1配对机制验证；预计每条约4--6分钟，先于任何live 1M。门槛为全程有限、late clamp不高于10%、head梯度非零，并要求末5批prequential Brier至少改善10%或AUC增加至少.02，另一项不得恶化超过10%。未通过则停止Weibull live闭环；通过后才在C-H8 seed2上跑1M。
 - live候选的fresh512主规则已修正为：outage点估计在[.18,.22]才进入reward比较；低于.18判为过度保守，高于.22判为风险过大。进入工作带后要求mean reward至少不低于C-H8的.74496并争取明显提高，同时报告Wilson区间、BSS/AUC、CDF/mean误差和crossing。不会因Weibull把outage压得更低就宣布提升。
+
+
+### E138：C-H12固定策略600k配对结果——Weibull拟合健康但未改善QR泛化（2026-07-17）
+
+- 正式实现/记录绑定提交`867bb65/daa68be`。control与candidate都冻结同一个成熟MLP+LSTM策略及observation RMS，使用rollout seed312、B40×15=600k、T1000、C20、actor-feature、MC、risk-discount、mean-anchor=.5、QR32和full-batch critic；唯一变量是`cost_weibull_tail_coef=0/1`。两条均由`launch_background.sh`持久化、W&B online运行并exit0。
+- 配对因果性成立。15个记录点的reward、reward quantile、真实outage、mean cost、prequential truth及truth cost mean逐值完全相同，所有最大绝对差均为0。control/candidate纯训练耗时243.9/247.5秒，Weibull只增加1.48%墙钟。
+- Weibull机制确实工作且数值稳定。candidate全程/末5批tail loss均值为.74473/.08363，末点.08620；末5批head grad norm均值2.186，非零。tail clamp全程均值仅2.17e-5、末5批严格0；alpha末5批均值3.9908，接近4的上界，beta均值1.415。没有NaN/Inf，说明失败不是非法log、clamp主导、梯度消失或代码空操作。
+- 但下一rollout proper score没有改善。末5批pre-Brier control→candidate为.205674→.206123，恶化.22%；pre-CDF absolute error .069688→.073750，恶化5.83%；pre mean-cost bias绝对值1.0245→1.2715，恶化24.11%。末5批post-Brier也从.184263升至.186299，恶化1.11%。全程pre-Brier同样恶化约.96%。
+- 独立128条使用完全相同的policy/eval随机流，truth均为reward=.869919、outage=.25、Q20 cost=17.6、mean cost=11.211。hard CDF只从.165039变为.165283，absolute error仅改善.000244；hard Brier .196060→.195183，改善.45%，远低于10%门；AUC .577311→.569987，下降.007324。BSS从-4.57%变为-4.10%，仍低于常数基率预测。smooth Brier改善.44%，smooth AUC下降.00293，结论一致。
+- shape方面只有crossing从.18473降到.16759，改善9.28%；predicted mean从8.0303降到8.0011，相对真实11.211反而略差。它与transition replay等结果一致：quantile形状更规整不等于查询点概率或action排序更准。
+- 严格裁决为`mechanism_fail_no_live_1m`：不进入C-H8 live seed2、不扫描Weibull coef/tail proportion/alpha上界，也不因低训练开销而追加1.2M。source loss是对detach QR尾部的自蒸馏；当前证据表明它能拟合自己的tail，却没有增加真实标签信息或未见状态的条件风险分辨率。
+- 更贴近reference的“把Weibull梯度写入共享actor history”保留为次级分歧路线，但不优先：完整共享QR和adapter共享监督已经一致损害reward，而本轮又证明tail自蒸馏没有先改善QR概率。若未来测试，必须单独记录PPO/value与Weibull在共享参数上的梯度冲突，不能把它和non-crossing结构同时加入。
+- 两条W&B run为control `k3pbid7r`、candidate `bdqi1v4s`，各15行、138个公开config键、293个summary键；隐私审计无敏感键和绝对路径值，只同步3个标准文件。完整导出/profile位于`_runs/wandb_export|profiles/dqc_ch12_weibull_frozen_pair_600k_s312_2026-07-17`，含history、CSV/JSON/Markdown和1.4MB overview图。
+- 下一优先路线转向尚未验证且直接对应现有失败模式的non-crossing quantile结构。此前uniform-IQN在600k固定策略下使CDF/mean error改善约16.1%/19.4%，但crossing恶化到.234；NQ-Net式单调头可能保留连续tau/局部分辨率收益并消除伪crossing。先审计同仓库NQ-Net源码与损失，再做默认关闭、固定策略600k机制门；不与Weibull、PID或shared actor梯度混合。

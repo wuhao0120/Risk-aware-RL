@@ -1972,3 +1972,14 @@ DQCAC首版因此保持actor使用原quantile CDF，只把Weibull作为action-co
 工程验证已经通过。默认关闭前后60个checkpoint tensor逐位相同；启用192步smoke中loss和head梯度非零、11个尾点无clamp、514个新增参数及全检查点有限，PPO ratio误差只有5.66e-6；独立eval-only也能重建加载头。192步的outage为0没有性能含义，因为T32几乎没有cost事件。
 
 下一步不直接花费完整闭环预算，而是冻结同一个成熟policy，用相同随机种子成对训练coef0/1 cost critic约600k监督步。只有prequential Brier至少改善10%或AUC提高0.02、且late clamp不超过10%时，才进入C-H8 seed2 live 1M。最终选择仍遵守双侧约束：fresh512 outage在[0.18,0.22]内后最大化mean reward；outage低于0.18属于未使用风险预算，不是自动胜出。内部PID target=.15暂时固定，待表示稳定后另做setpoint校准。
+
+
+### 13.118 Weibull尾部自蒸馏降低shape噪声，但没有提供新的风险信息（2026-07-17）
+
+固定成熟policy的coef0/1实验把策略非平稳性完全拿掉了。两条run的15批真实reward、cost、outage和prequential标签逐值相同，因而任何critic差异都来自Weibull辅助。候选的loss从早期高值稳定降到末5批约0.084，clamp为0且head梯度持续非零，证明实现和优化都正常。
+
+结果仍没有通过机制门。末5批pre-Brier从0.20567轻微恶化到0.20612，pre-CDF error从0.06969升到0.07375，mean bias绝对值增加24%。独立128条hard Brier只改善0.45%，AUC反而下降0.0073；crossing改善9.3%却没有转化为proper score。最合理解释是QCPO_refs的Weibull loss只解释detach后的QR尾部，属于低维自蒸馏。它能让输出形状更容易描述，却没有引入新的真实cost标签，所以无法修复QR在未见状态动作上的系统误差。
+
+因此不运行live 1M，也不扫描coef、tail比例或alpha上界。把相同Weibull loss直接写进共享actor LSTM更贴近reference，但风险更高：此前共享QR和adapter都把策略推向低reward端，而本轮未证明tail信号本身更准。该路线作为独立消融保留，只有在共享梯度诊断和non-crossing主线之后才考虑。
+
+下一步选择non-crossing quantile不是随意换模型。600k uniform-IQN已经给出中等CDF/mean改善，但crossing从QR约0.057恶化到0.234；固定N64/local grid也因分位输出非单调和proper score不足失败。NQ-Net式单调结构直接约束这个已观测瓶颈，且仓库已有可审计实现。首轮仍只改变cost distribution head，固定策略、真实MC监督、B40和双侧outage目标都不变；过固定策略proper-score门后才允许进入live闭环。
