@@ -1607,3 +1607,19 @@ P-M8完整1M后，末200k outage标准差相对P-M7下降30.8%，lambda标准差
 raw Brier从0.20203降到0.15848不能直接写成21.6%的条件风险能力提升，因为策略改变后outage基率也从0.25385降到0.19808。用各自样本基率的最优常数预测作基线，P-M7/P-M8的Brier Skill Score约为-6.66%和+0.23%。因此P-M8已经消除了“比常数风险率还差”的明显失配，但逐状态分辨率仍弱；后续要把BSS、分箱reliability/resolution与总体CDF误差并列报告，不能只报raw Brier。这个补充不事后改动E87预注册门，只限制对结果的解释强度。
 
 因此P-M8不是“reward最高”的配置，而是目前第一个在统一大样本评估上达到可接受reward并通过风险门的DQCAC候选。所有预注册门均通过，正确动作是冻结参数扩seed0/2，而不是在成功seed上继续微调。多seed要求至少2/3 seed outage≤0.22、三seed平均outage≤0.22且平均reward≥0.75，并以seed为统计单位报告方差。通过后才进入5M、QCPO/QCPO_refs统一预算比较；失败则根据跨seed模式决定是否调整Kp/Ki或加入post-update guard。
+
+### 13.75 P-M8多种子结论：有用的时序修正，不是稳健的最终配置（2026-07-17）
+
+P-M8的seed0/1/2都完整训练1M，并用完全相同的fresh520协议评估。三个seed的reward分别为0.89591、0.87025和0.81434，均值0.86017、seed标准差0.04171；outage分别为170/520=0.32692、103/520=0.19808和117/520=0.22500，均值0.25、seed标准差0.06796。只有seed1通过0.22门，既不满足至少2/3 seed通过，也不满足平均outage不高于0.22。P-M8因此不能凭seed1的漂亮结果进入5M或宣称超过QCPO_refs。
+
+这个失败不是“训练根本没学起来”。三个seed reward都高于0.75，PPO首epoch ratio误差稳定在约1e-5，PID和Actor严格每40条轨迹同频更新25次。真正的问题是闭环落在不同的reward-risk平衡点：末200k seed0的reward/outage/lambda为0.929/0.335/0.373，seed1为0.801/0.195/0.186，seed2为0.662/0.180/0.195。seed0已经有更大的lambda和归一化risk signal，却仍选择高风险动作，说明仅看scalar penalty大小不够，条件risk advantage的方向与泛化精度才是限制。
+
+fresh评估进一步支持这一点。三个seed的hard-CDF都低于真实outage，误差为0.07885、0.01436和0.04062；mean-cost低估约1.40～1.56。Brier Skill相对各自climatology为-3.44%、+0.23%和-5.43%，没有稳定的逐状态分辨能力。raw Brier不能跨不同outage基率直接比较；以后必须同时报BSS、总体校准误差和mean-cost误差。
+
+最后一次更新也不是seed0失败的主因。140回合pre/post outage在seed0为0.3571→0.2786、seed1为0.2500→0.2357、seed2为0.1857→0.1929，最大变化0.07857且最差seed的更新方向更安全。故post-update guard暂不优先。更合理的下一步是单变量提高controller安全余量，同时保留“若scalar lambda无效，就转向保守条件风险估计”的备选解释。
+
+### 13.76 下一步P-M9与在线日志边界（2026-07-17）
+
+P-M9只将经验PID target从0.15降到0.10，名义chance constraint仍是0.20；改变的是工程安全余量0.05→0.10。先在最差seed0完整跑1M，其余网络、PPO、GAE、IS ratio、B20合并、QR32和PID增益全部不动。正式fresh520要求reward至少0.75、outage不高于0.22且比seed0基线至少下降0.08。通过才扩seed1/2；失败就停止固定target扫描，转向Wilson-UCB PID、自适应校准margin或更保守的action-risk估计。这个顺序能回答“lambda作用量不够”与“risk方向本身不准”哪一个更接近主要矛盾。
+
+训练继续使用持久化后台和在线W&B，但只上传指标与公开实验语义。提交18b28ca过滤绝对路径、checkpoint位置和疑似凭据字段，并关闭机器信息、system stats、Git、源码、job与requirements上传；本地checkpoint和轨迹不上传。seed0/2既有离线history已经以脱敏run完整回放，远端均为50行并到1M。此前联网问题不是W&B存储满，而是执行层默认权限；部分seed2 run只到120k，明确排除。P-M9预计训练6.5～8分钟，含评估总计12～14分钟。

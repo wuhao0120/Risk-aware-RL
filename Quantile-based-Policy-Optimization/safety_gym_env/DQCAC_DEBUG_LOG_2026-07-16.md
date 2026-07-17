@@ -1192,3 +1192,20 @@
 - E87的九项预注册门全部通过，所以不在seed1继续扫Kp/Ki或跑2M，直接扩seed0/2各1M并对所有成功训练的final checkpoint做fresh520，避免只评估好seed。两条可并行：每条纯训练约6.5–8分钟，并行墙钟预计8–10分钟；两组520并行预计再4–6分钟，A100 80GB和128 CPU可承载40个训练env或80个评估env。
 - 多seed晋级标准预先固定：至少2/3 seed的fresh520 outage≤0.22，三seed平均outage≤0.22且平均reward≥0.75；报告seed作为统计单位的mean±SD以及pooled episode比例，但不以pooled 1560条代替seed方差。若通过，P-M8成为当前DQCAC主候选，随后进入与校准QCPO/QCPO_refs相同5M预算；若失败，先按seed轨迹判断是Kp过强、critic反弹还是初始化敏感，再选择单变量路线。
 - 完整history/profile在`_runs/wandb_export/dqc_pm7_vs_pm8_pid_cadence_seed1_1m_2026-07-17/`与`_runs/profiles/dqc_pm7_vs_pm8_pid_cadence_seed1_1m_2026-07-17/`；后者含`phase_comparison.csv`、`fresh520_comparison.csv`、置信区间/门控JSON及比较图。P-M8 fresh520原始JSON为`_runs/DQCAC_DynamicButton_pm8_actorint2_pidint2_1m_s1_final_eval520_s1.json`。
+
+### E89：P-M8三种子裁决——seed1改善不稳定，暂不进入5M（2026-07-17）
+
+- seed0/2与seed1完全同配置完成1M，各有50个history点、25次PID事件和25次Actor事件，最终env step均为1,000,000且exit 0。seed0/2并行纯训练分别为702.73s/724.13s；seed1单独运行是391.7s，差异主要来自两个B20多进程作业同时竞争CPU，墙钟仍约12分钟而不是串行约24分钟。原始离线run为jhm20t8t/bodb903c，完整50行历史已脱敏回放到在线W&B nk6q2qjn/mjs4s7l7；seed1在线run为yxarpian。
+- 统一fresh520为：seed0 reward=0.89591,outage=170/520=0.32692；seed1 0.87025,103/520=0.19808；seed2 0.81434,117/520=0.22500。三seed reward为0.86017±0.04171（seed SD），outage为0.25000±0.06796；只1/3 seed满足≤0.22，平均outage也高于0.22，故预注册多seed门失败。1560回合合并比例为390/1560=0.25、Wilson 95%区间[0.22914,0.27208]，但主裁决仍以seed而不是把全部回合伪装成独立算法重复。
+- 三个critic都低估fresh风险。seed0/1/2 hard-CDF分别为0.24808/0.18371/0.18438，对truth的误差为0.07885/0.01436/0.04062；predicted-mean cost误差为1.5165/1.5578/1.3984。raw Brier为0.22761/0.15848/0.18384，但相对各自经验基率常数预测的Brier Skill为-3.44%/+0.23%/-5.43%。因此seed1的低raw Brier主要含有低outage基率效应，逐状态风险排序仍没有稳定超过climatology。
+- 末200k揭示跨seed分叉：seed0的reward/outage/lambda=0.929/0.335/0.373，seed1为0.801/0.195/0.186，seed2为0.662/0.180/0.195。seed0并非risk penalty数值消失：其risk coefficient、归一化risk advantage和KL都更大，仍学到高reward高风险策略；更像是action-conditioned risk方向/校准不足，而不是简单把lambda乘大即可保证正确方向。
+- 对三个rollout_step001000000.pt做同一140回合pre/post诊断：seed0 outage 0.3571→0.2786，seed1 0.2500→0.2357，seed2 0.1857→0.1929。最大绝对变化0.07857，未达到预注册0.08 fresh触发线，而且最差seed0的最后一次更新反而更安全。因此不把post-update guard列为下一优先；seed0问题是持续的末段高风险和critic tail低估，不是单次终点跳变。
+- 裁决：P-M8证明“PID与Actor同频、40条trajectory后再响应”是有效稳定性组件，但seed1结论不能复现为稳健主算法；不按当前参数进入5M或QCPO_refs最终比较。正式CSV/JSON/图在_runs/wandb_export/dqc_pm8_pid_cadence_multiseed_1m_2026-07-17/和_runs/profiles/dqc_pm8_pid_cadence_multiseed_1m_2026-07-17/，含三seed曲线、fresh520图和pre/post图，所有PNG已解码验证。
+
+### E90：W&B在线脱敏与P-M9固定安全余量预注册（2026-07-17）
+
+- 此前seed0/2切离线不是W&B容量或账号故障，而是执行层对第三方上传的默认拦截；用户已经明确授权训练指标在线监控。在线验证显示两条clean replay均finished、各50行、max env step 1M，配置无私密键和绝对路径。最初被中止的seed2部分在线run huxmufc8只到约120k，标记为无效工程运行，不进入任何算法比较。
+- 提交18b28ca增加wandb_public_config()：过滤wandb_dir/checkpoint_dir/calibration_source_checkpoint、任何绝对路径和名称含token/secret/password/credential/api_key的字段；同时关闭machine metadata、system stats、Git、源码、job和requirements上传。该改动只影响外部日志元数据，不参与前向、RNG或optimizer；离线privacy smoke、路径/token断言、语法和diff检查均通过。可复用的export_wandb_offline.py能从完成的本地.wandb流恢复完整config/summary/history，并拒绝默认读取无ExitRecord的活跃run。
+- P-M9只把P-M8的pid_target_prob=0.15→0.10，其它网络、seed0、B20、Actor/PID interval2、QR32、20 critic updates、8 PPO epochs、Kp=1、Ki=.1、window50、1M步和评估协议全部冻结。它不是把论文约束alpha改成0.10，而是把controller安全余量由0.05增到0.10，检验较早维持更大lambda能否抵消seed0约0.079的tail风险低估与闭环滞后。
+- 只先跑压力seed0完整1M；除NaN/OOM/确定性错误外不以100k/300k早停，因为P-M7/P-M8已证明闭环方向可在后半段改变。内置140 screen为reward≥0.60,outage≤0.40，只用于发现灾难性退化；通过后fresh520正式门为reward≥0.75,outage≤0.22且相对P-M8 seed0的0.32692至少下降0.08，CDF/mean/Brier不得出现新的明显发散。过门才原参数扩seed1/2，失败则停止固定target下调，不扫0.08/0.12/0.13追端点。
+- 单条独占训练预计6.5～8min，内置140约1min，条件fresh520约4～5min，总墙钟12～14min。使用launch_background.sh持久化后台与脱敏在线W&B，checkpoint/log全部留在/vepfs。若路线存在分歧，保留为独立消融：Wilson-UCB/置信上界PID让margin随样本量变化；按独立校准误差自适应target；降低Kp/Ki或anti-windup；以及增强action-risk排序的ensemble/保守查询。它们不与P-M9混合，以保留因果归因。
