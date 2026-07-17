@@ -1410,3 +1410,10 @@
 - 主门不移动：末5批prequential CDF error或Brier相对raw至少改善20%/10%之一，另一项不得恶化10%，聚合mean bias绝对值≤1；独立hard或smooth Brier相对raw至少改善10%且对应AUC提高≥.03，或Brier改善20%且AUC下降≤.02，同时mean-cost error≤.90、crossing≤.10。机制门相对C-H1W要求Brier改善≥20%、保留至少一半AUC增益即hard AUC≥.55495、mean error≤.90且pre/独立方向一致。
 - 只有主门通过才做fresh520并考虑live；若只改善mean却丢失AUC，说明anchor把critic收缩为总体均值，不能驱动action选择；若AUC保留但Brier/mean仍不过门，说明QCPO_refs的稳定性还依赖非负输出、Weibull或共享多任务表示。失败后不立即扫描anchor系数，下一候选分别是softplus/exp非负输出、Weibull tail或小型共享多任务backbone，保持单变量。
 - 既有同配置无anchor纯训练281.4秒；新项只做quantile mean和标量MSE，预计纯训练4.5--5.5分钟、140评估约1分钟，总墙钟6--7分钟。正式任务只用`launch_background.sh`持久化，W&B online名称/group/tags只含公开算法语义，路径与敏感配置继续过滤。
+
+### E114：cost单位换算审计、错误尺度主动早停与C-H4M修订（2026-07-17）
+
+- E113只对齐了pairwise归约，却漏掉QCPO_refs在`process_returns`开头执行的`cost /= cost_scale`，其正式`cost_scale=10`。reference的QR在大残差区随cost线性缩放，mean MSE则二次缩放；DQCAC保持raw-cost QR时，要匹配reference的mean/QR相对权重，有效系数应为`coef×N_target×target_scale/cost_scale`，不是只乘N。QR32、coef=.5、S=10的正确scale为1.6。
+- 第一条正式run `tk2m896n`按旧scale16运行到16批/320k时被中途审计识别为失真：末5批mean-anchor原始loss均值49.59，乘16后约793.37，而QR均值75.93，anchor约强10.45倍；20/20次update裁剪率为100%，crossing约0.275。13个behavior/truth控制字段与C-H1W前16批仍逐值exact，说明不是轨迹漂移。该run随即向训练子进程发送SIGTERM，launcher记录exit143；它被标记为无效尺度工程run，不进入模型比较，也不补剩余280k。
+- 新增`cost_mean_anchor_cost_scale`，默认10且必须为正；W&B/summary显式记录configured coefficient、cost unit scale和effective scale。默认关闭的修正前后回归仍有60个tensor leaves逐位exact、eval差异0、共享summary差异0；唯一新summary键是cost scale。corrected enabled smoke得到coef=.5/S=10/effective=1.6，40个cost/history tensor非零变化且全部有限。
+- C-H4M的其他预注册条件与门槛不变，但正式单变量现在明确定义为`cost_mean_anchor_coef=.5,cost_mean_anchor_cost_scale=10`。这不是事后调参：10来自QCPO_refs源代码的固定单位换算，1.6由归约和单位解析推导，不由320k效果选择。重跑仍从头使用seed101和同一成熟冻结policy，不能从失真run续训。

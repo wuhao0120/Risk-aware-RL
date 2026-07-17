@@ -100,6 +100,7 @@ KEY_METRICS: Tuple[str, ...] = (
     "critic/cost_qr_loss",
     "critic/cost_mean_anchor_enabled",
     "critic/cost_mean_anchor_coef",
+    "critic/cost_mean_anchor_cost_scale",
     "critic/cost_mean_anchor_scale",
     "critic/cost_mean_anchor_loss",
     "critic/cost_mean_anchor_scaled_loss",

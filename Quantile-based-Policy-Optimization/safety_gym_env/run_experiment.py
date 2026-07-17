@@ -204,6 +204,7 @@ def base_args(algo, seed, device, env_key):
         # QCPO_refs cost mean MSE 默认关闭；显式0.5时按本实现QR target-sum
         # 尺度自动换算相对权重，不需要随N手动重调。
         a.cost_mean_anchor_coef = 0.0
+        a.cost_mean_anchor_cost_scale = 10.0              # QCPO_refs cost /= 10
         # cost history 消融：raw=历史 Markov critic；actor_feature=C-H0.5 共享并
         # detach policy feature；cost_lstm=C-H1 独立同输入 MLP+LSTM（当前要求 MC）。
         a.cost_history_mode = 'raw'

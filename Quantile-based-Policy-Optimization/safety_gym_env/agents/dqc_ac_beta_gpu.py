@@ -331,12 +331,18 @@ class DQCACBetaGPU(VecAgentBase):
         # 与 reference 的 cost_value_loss_coeff 同义；默认0保证历史路径逐式不变。
         self.cost_mean_anchor_coef = float(
             getattr(args, 'cost_mean_anchor_coef', 0.0))
+        # QCPO_refs 先把cost除以10再计算MSE；raw-cost DQCAC必须显式补偿
+        # 这个单位差，否则二次MSE相对线性QR会被额外放大一个cost_scale。
+        self.cost_mean_anchor_cost_scale = float(
+            getattr(args, 'cost_mean_anchor_cost_scale', 10.0))
         self.cost_s0_replay_batches = int(
             getattr(args, 'cost_s0_replay_batches', 4))
         if self.cost_s0_aux_coef < 0.0:
             raise ValueError("cost_s0_aux_coef must be non-negative")
         if self.cost_mean_anchor_coef < 0.0:
             raise ValueError("cost_mean_anchor_coef must be non-negative")
+        if self.cost_mean_anchor_cost_scale <= 0.0:
+            raise ValueError("cost_mean_anchor_cost_scale must be positive")
         if self.cost_s0_replay_batches <= 0:
             raise ValueError("cost_s0_replay_batches must be positive")
         # step feature 默认跟随 episodic: 有限期界下剩余 cost 分布依赖剩余步数 (已验证配方)
@@ -865,7 +871,8 @@ class DQCACBetaGPU(VecAgentBase):
               f"/floor{self.cost_critic_weight_floor:g}, "
               f"s0_aux={self.cost_s0_aux_coef:g}"
               f"/replay{self.cost_s0_replay_batches}, "
-              f"cost_mean_anchor={self.cost_mean_anchor_coef:g}, "
+              f"cost_mean_anchor={self.cost_mean_anchor_coef:g}"
+              f"/scale{self.cost_mean_anchor_cost_scale:g}, "
               f"cost_cdf={self.cost_cdf_estimator}/{self.cost_cdf_mode}"
               f"/T{self.cost_cdf_temperature:g}"
               f"/lr{self.cost_direct_cdf_lr:g}"
@@ -1764,14 +1771,16 @@ class DQCACBetaGPU(VecAgentBase):
         '''
         把 QCPO_refs 的 mean-cost 系数换算到本实现 QR 的 target-sum 尺度。
 
-        reference 对 pairwise QR 的全部维度取 mean；本实现默认在 N_target 维
-        求和。故有效系数是 configured_coef*N_target*target_scale。N=32、
-        legacy_sum、coef=.5 时得到16，使 mean/QR 的相对权重与 reference 相同。
+        reference 对 pairwise QR 的全部维度取 mean，且cost先除以S=10；
+        本实现QR在N_target维求和并使用raw cost。大残差区QR随cost线性缩放、
+        MSE则二次缩放，故有效系数为coef*N_target*target_scale/S。N=32、
+        legacy_sum、coef=.5、S=10时得到1.6，保持mean/QR相对权重。
         '''
         return (
             self.cost_mean_anchor_coef
             * float(num_target_samples)
-            * self._quantile_target_scale(num_target_samples))
+            * self._quantile_target_scale(num_target_samples)
+            / self.cost_mean_anchor_cost_scale)
 
     def _cost_mean_anchor_loss(
             self, prediction, targets, sample_weights=None):
@@ -2147,6 +2156,8 @@ class DQCACBetaGPU(VecAgentBase):
             'critic/cost_mean_anchor_enabled': float(
                 self.cost_mean_anchor_coef > 0.0),
             'critic/cost_mean_anchor_coef': self.cost_mean_anchor_coef,
+            'critic/cost_mean_anchor_cost_scale': (
+                self.cost_mean_anchor_cost_scale),
             'critic/cost_mean_anchor_scale': float(cost_mean_anchor_scale),
             'critic/cost_mean_anchor_loss': cost_mean_loss_value,
             'critic/cost_mean_anchor_scaled_loss': float(
@@ -3813,6 +3824,7 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_s0_aux_coef': self.cost_s0_aux_coef,
             'cost_s0_replay_batches': self.cost_s0_replay_batches,
             'cost_mean_anchor_coef': self.cost_mean_anchor_coef,
+            'cost_mean_anchor_cost_scale': self.cost_mean_anchor_cost_scale,
             'cost_mean_anchor_scale': self._cost_mean_anchor_scale(
                 self.num_quantiles),
             's0_holdout_pre': dict(self.last_s0_holdout_pre),

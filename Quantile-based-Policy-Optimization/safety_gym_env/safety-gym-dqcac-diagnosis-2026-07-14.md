@@ -1787,3 +1787,11 @@ QCPO_refs不是只做quantile regression。它额外用`0.5 × 0.5(mean(c_dist)-
 新参数默认关闭。默认0的改动前后持久化回归中，60个checkpoint tensor、所有评估字段和共享summary逐项完全一致；enabled smoke得到预期scale16，cost head/history encoder发生有限非零更新。mean loss在recurrent、full、chunk和crossfit路径都使用与QR相同的transition权重；解析full/chunk梯度最大差为0。因而后续差异可以归因于mean anchor，而不是RNG、网络初始化、chunk边界或日志副作用。
 
 正式冻结实验只在C-H1W的B20/C20、600k、seed101配置上打开`cost_mean_anchor_coef=.5`。它必须同时保留history的AUC排序信号并修复Brier/mean/crossing；只把总体mean拉准、却让AUC回到0.5附近不算成功。通过后才做520条和live闭环；失败则不扫系数，而将非负cost输出、Weibull tail和共享多任务history作为彼此独立的下一条消融。
+
+### 13.98 QCPO_refs的cost除以10不能在mean-MSE移植时遗漏（2026-07-17）
+
+第一次实现正确处理了DQCAC QR对target维求和的问题，却遗漏了更隐蔽的物理单位差异：QCPO_refs训练前执行`cost /= 10`，DQCAC的QR使用原始cost。QR的大残差损失近似随误差线性增长，MSE随误差平方增长；因此只把reference的0.5系数乘N，会把mean项相对QR额外放大10倍。正确换算是`0.5×32/10=1.6`。
+
+这个错误不是等到600k后用坏结果解释出来的。在线run到320k时，anchor缩放后约793、QR约76且全部update撞clip，正好符合理论上的10倍失真；行为truth仍与基线逐值相同。实验立即停止并标为无效工程run，不把它用于算法结论，也不浪费剩余预算。
+
+修正后参数同时记录source cost scale与effective scale。default-off的60个checkpoint tensor、eval和共享summary再次完全一致；enabled smoke确认effective scale为1.6且梯度真正改变cost网络。正式C-H4M将从头重跑，除源代码规定的cost-unit补偿外不改变任何预注册配置或通过门。
