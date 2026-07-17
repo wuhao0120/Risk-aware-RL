@@ -558,7 +558,10 @@ class QCPOGPU(VecAgentBase):
         if not self.recurrent_policy:
             raise RuntimeError("evaluate_vec is only needed for mlp_lstm QCPO")
 
-        rounds = max(1, int(np.ceil(num_episodes / vec_env.B)))
+        episode_count = int(num_episodes)
+        if episode_count <= 0:
+            raise ValueError("num_episodes must be a positive integer")
+        rounds = int(np.ceil(episode_count / vec_env.B))
         rewards_all, costs_all, undisc_costs_all = [], [], []
         with torch.no_grad():
             for _ in range(rounds):
@@ -592,9 +595,10 @@ class QCPOGPU(VecAgentBase):
                 costs_all.append(cost_return)
                 undisc_costs_all.append(undisc_cost)
 
-        reward_np = torch.cat(rewards_all).cpu().numpy().astype(np.float64)
-        cost_np = torch.cat(costs_all).cpu().numpy().astype(np.float64)
-        undisc_np = torch.cat(undisc_costs_all).cpu().numpy().astype(np.float64)
+        # 保留完整episode动力学，只截断ceil(B)带来的尾部样本，保证精确评估数量。
+        reward_np = torch.cat(rewards_all)[:episode_count].cpu().numpy().astype(np.float64)
+        cost_np = torch.cat(costs_all)[:episode_count].cpu().numpy().astype(np.float64)
+        undisc_np = torch.cat(undisc_costs_all)[:episode_count].cpu().numpy().astype(np.float64)
         transformed = -cost_np
         q = -float(cost_limit)
         empirical = float(np.mean(transformed <= q))

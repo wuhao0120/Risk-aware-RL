@@ -322,7 +322,10 @@ def calibrate(args, num_episodes=64):
                        device=args.device, ref_env=env, seed=args.seed + 100,
                        backend=getattr(args, 'vec_backend', 'mp'))
     B, n = vec.B, vec.n
-    rounds = max(1, int(np.ceil(num_episodes / B)))
+    episode_count = int(num_episodes)
+    if episode_count <= 0:
+        raise ValueError("num_episodes must be a positive integer")
+    rounds = int(np.ceil(episode_count / B))
     Rs, Cs, Cus = [], [], []
     t0 = time.time()
     with torch.no_grad():
@@ -340,7 +343,10 @@ def calibrate(args, num_episodes=64):
                 Cu += c
             Rs.append(R); Cs.append(C); Cus.append(Cu)
     dt = time.time() - t0
-    R = torch.cat(Rs).cpu().numpy(); C = torch.cat(Cs).cpu().numpy(); Cu = torch.cat(Cus).cpu().numpy()
+    # 校准也严格使用请求数量，避免改变num_envs时统计样本数静默变化。
+    R = torch.cat(Rs)[:episode_count].cpu().numpy()
+    C = torch.cat(Cs)[:episode_count].cpu().numpy()
+    Cu = torch.cat(Cus)[:episode_count].cpu().numpy()
 
     print(f"\n===== CALIB {args.env_id} (random policy, E={R.shape[0]}) =====")
     print(f"timing: {dt:.1f}s, {dt/rounds:.2f}s/(B={B},T={n}), {B*n*rounds/dt:.0f} env-steps/s")

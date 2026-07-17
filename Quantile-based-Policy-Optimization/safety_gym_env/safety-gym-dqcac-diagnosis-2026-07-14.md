@@ -1769,3 +1769,13 @@ B40也没有比B20/C20 cost-LSTM更好：独立Brier再恶化1.3%，AUC下降0.2
 因此按预注册门停止B80和更长冻结训练。已有三点已经覆盖更新强度/样本量两轴：B20/C20能学到部分排序但严重失准，B20/C5欠拟合并反向排序，B40/C20仍反向排序。继续插值扫描C10或扩大B80的信息增益很低。下一步应改变尚未验证的机制：分离reward/cost optimizer与clip以消除live训练中的梯度耦合；用真正跨rollout的held-out信号约束cost critic；或使用受cost辅助监督的小型共享history表示。它们必须逐项验证，避免同时改动后无法归因。
 
 本轮还暴露了向量评估口径：B40下请求140条会按4个batch实际得到160条。所有正式网络比较已经改用同checkpoint、B20、严格140条重评；后续应从代码上截断到精确num_eval，并回归保证B20/B40评估语义一致。统一CSV、裁决JSON和图保存在_runs/profiles/dqc_frozen_history_modes_600k_2026-07-17/。
+
+### 13.96 评估取整已修复，联合critic clip不是当前reward主干瓶颈（2026-07-17）
+
+B40暴露了一个工程口径错误：请求140条时，向量评估器实际跑4×40=160条并全部纳入统计。现在所有MLP/recurrent/QCPO_refs路径都保留完整向量episode动力学，但只聚合前E条；DQCAC的s0动作与逐状态风险概率也同步截断，保证Brier/AUC标签一一对应。B20的30个eval字段修复前后逐项完全相同，B40已严格返回140条，因此这不是通过改变既有整除评估结果来“修漂亮数字”。
+
+对optimizer的进一步审计也推翻了一个过早假设。当前DQCAC主线是共享recurrent actor/reward-V加GAE/PPO；reward value loss与policy loss在actor网络上联合backward，使用actor optimizer。另一个distributional reward critic虽与cost critic共用optimizer和clip，却不参与recurrent GAE或PPO权重。因此cost梯度再大，也不会通过这条joint clip直接缩放当前actor/value参数。拆分critic optimizer可能改善旧distributional分支，但不能解释当前risk-gradient泛化，不应占用下一条1M预算。
+
+QCPO_refs真正多出的cost稳定项更值得验证。它在共享history feature上同时优化policy、reward-V、cost quantile、cost mean MSE和Weibull tail，并用exp保证cost输出非负。DQCAC cost-LSTM当前只有独立大encoder与QR-MC监督；它能得到约0.59 AUC，却伴随严重Brier、mean与crossing错误。现有充分统计还表明，即使在同一140条上做乐观单调仿射校准，Brier Skill上界也仅约0.6%，所以全局概率缩放不是解。
+
+下一实验先只借用QCPO_refs的mean-cost MSE锚定，默认关闭并保持旧checkpoint/默认训练逐tensor等价。它不会一次混入exp、Weibull或共享backbone；若能保留AUC并改善mean/Brier，才说明复合cost objective值得继续。若失败，再分别考虑非负输出、tail loss或小型受多任务约束的共享表示。

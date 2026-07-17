@@ -411,7 +411,10 @@ class QCPORefGPU(VecAgentBase):
         import math
         B, n, H = vec_env.B, vec_env.n, self.lstm_size
         dev = self.device
-        rounds = max(1, math.ceil(num_episodes / B))
+        episode_count = int(num_episodes)
+        if episode_count <= 0:
+            raise ValueError("num_episodes must be a positive integer")
+        rounds = math.ceil(episode_count / B)
         R_all, Zc_all, Cu_all, cdf0_all = [], [], [], []
 
         with torch.no_grad():
@@ -440,9 +443,10 @@ class QCPORefGPU(VecAgentBase):
                     h, c = rnn.h, rnn.c
                 R_all.append(R); Zc_all.append(Zc); Cu_all.append(Cu)
 
-        R = torch.cat(R_all).cpu().numpy().astype(np.float64)
-        Zc = torch.cat(Zc_all).cpu().numpy().astype(np.float64)
-        Cu = torch.cat(Cu_all).cpu().numpy().astype(np.float64)
+        # 只截断向上取整产生的尾部episode；每条保留轨迹仍是完整horizon。
+        R = torch.cat(R_all)[:episode_count].cpu().numpy().astype(np.float64)
+        Zc = torch.cat(Zc_all)[:episode_count].cpu().numpy().astype(np.float64)
+        Cu = torch.cat(Cu_all)[:episode_count].cpu().numpy().astype(np.float64)
         d = float(cost_limit)
         Z = -Zc                                               # 下尾口径: Z=-C, q=-d
         q = -d
@@ -459,7 +463,8 @@ class QCPORefGPU(VecAgentBase):
             'outage_prob': emp,                               # 兼容旧键 (=empirical_prob)
             'cost_quantile': float(np.percentile(Zc, (1.0 - omega) * 100)),
             'num_episodes': int(R.shape[0]),
-            'cost_cdf_initial': float(torch.cat(cdf0_all).mean().item()),
+            'cost_cdf_initial': float(
+                torch.cat(cdf0_all)[:episode_count].mean().item()),
             'pred_cost_mean': None, 'pred_cost_std': None,
         }
 

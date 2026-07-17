@@ -3420,7 +3420,10 @@ class DQCACBetaGPU(VecAgentBase):
         if not self.recurrent_policy:
             raise RuntimeError("evaluate_vec is only needed for mlp_lstm DQCAC")
 
-        rounds = max(1, int(np.ceil(num_episodes / vec_env.B)))
+        episode_count = int(num_episodes)
+        if episode_count <= 0:
+            raise ValueError("num_episodes must be a positive integer")
+        rounds = int(np.ceil(episode_count / vec_env.B))
         rewards_all, costs_all, undisc_costs_all = [], [], []
         initial_states, initial_actions, initial_features = [], [], []
         with torch.no_grad():
@@ -3460,9 +3463,10 @@ class DQCACBetaGPU(VecAgentBase):
                 undisc_costs_all.append(undisc_cost)
 
             # cost critic 校准使用同一评估批真实 s0 与循环策略零历史下的 a0。
-            s0 = torch.cat(initial_states, dim=0)
-            a0 = torch.cat(initial_actions, dim=0)
-            actor_feature0 = torch.cat(initial_features, dim=0)
+            # critic概率和真实outage必须使用完全相同的前E条轨迹。
+            s0 = torch.cat(initial_states, dim=0)[:episode_count]
+            a0 = torch.cat(initial_actions, dim=0)[:episode_count]
+            actor_feature0 = torch.cat(initial_features, dim=0)[:episode_count]
             cost_feature0 = self._initial_cost_history_feature(
                 s0, actor_feature0)
             cost_input0 = self._cost_inputs(s0, 0, cost_feature0)
@@ -3559,9 +3563,10 @@ class DQCACBetaGPU(VecAgentBase):
                     0.0 if psi0.shape[-1] < 2 else
                     (psi0[:, 1:] < psi0[:, :-1]).float().mean().item())
 
-        reward_np = torch.cat(rewards_all).cpu().numpy().astype(np.float64)
-        cost_np = torch.cat(costs_all).cpu().numpy().astype(np.float64)
-        undisc_np = torch.cat(undisc_costs_all).cpu().numpy().astype(np.float64)
+        # 最后一轮环境完整运行，统计仅保留请求的episode_count条。
+        reward_np = torch.cat(rewards_all)[:episode_count].cpu().numpy().astype(np.float64)
+        cost_np = torch.cat(costs_all)[:episode_count].cpu().numpy().astype(np.float64)
+        undisc_np = torch.cat(undisc_costs_all)[:episode_count].cpu().numpy().astype(np.float64)
         transformed = -cost_np
         threshold = -float(cost_limit)
         empirical = float(np.mean(transformed <= threshold))

@@ -97,7 +97,10 @@ def evaluate_policy_vec(agent, vec_env, num_episodes, gamma, cost_gamma, omega, 
         dict: 下尾主键 + cost debug 兼容键, 见模块 docstring
     """
     B, n = vec_env.B, vec_env.n
-    rounds = max(1, math.ceil(num_episodes / B))
+    episode_count = int(num_episodes)
+    if episode_count <= 0:
+        raise ValueError("num_episodes must be a positive integer")
+    rounds = math.ceil(episode_count / B)
     R_all, Zc_all, Cu_all, S0_all, A0_all = [], [], [], [], []
 
     with torch.no_grad():
@@ -117,9 +120,10 @@ def evaluate_policy_vec(agent, vec_env, num_episodes, gamma, cost_gamma, omega, 
                 Cu += c
             R_all.append(R); Zc_all.append(Zc); Cu_all.append(Cu)
 
-    R = torch.cat(R_all).cpu().numpy().astype(np.float64)
-    Zc = torch.cat(Zc_all).cpu().numpy().astype(np.float64)
-    Cu = torch.cat(Cu_all).cpu().numpy().astype(np.float64)
+    # 最后一轮仍由全部B个环境完整运行；这里只丢弃向上取整产生的尾部episode。
+    R = torch.cat(R_all)[:episode_count].cpu().numpy().astype(np.float64)
+    Zc = torch.cat(Zc_all)[:episode_count].cpu().numpy().astype(np.float64)
+    Cu = torch.cat(Cu_all)[:episode_count].cpu().numpy().astype(np.float64)
     d = float(cost_limit)
     Z = -Zc                                                   # Z = -C
     q = -d
@@ -140,8 +144,9 @@ def evaluate_policy_vec(agent, vec_env, num_episodes, gamma, cost_gamma, omega, 
         'num_episodes': int(R.shape[0]),
     }
     # cost critic 校准 (仅 DQCAC); 数值 = P(Z≤q|s0)
-    S0 = torch.cat(S0_all, dim=0)
-    A0 = torch.cat(A0_all, dim=0)
+    # critic预测必须与截断后的真实标签一一对应，避免Brier/AUC混入额外轨迹。
+    S0 = torch.cat(S0_all, dim=0)[:episode_count]
+    A0 = torch.cat(A0_all, dim=0)[:episode_count]
     (cdf, pmean, pstd, crossing, qr_cdf,
      selected_probabilities, qr_probabilities, online_cdf,
      online_probabilities) = _cost_critic_initial_stats(

@@ -1390,3 +1390,13 @@
 - 下一条最高价值工程/算法假设不是继续扩大网络，而是解除reward critic与cost critic的共同optimizer/共同global clip。当前cost-LSTM的大梯度会通过联合clip缩放reward critic；在冻结policy筛选中这不会改变行为，却会在live训练里直接损害reward value/GAE和actor更新。应先做纯等价回归，再做单变量“reward/cost独立optimizer与独立clip”机制实验。
 - 该改动本身不能保证解决冻结cost校准，所以同时保留两条可区分路线：一是跨rollout held-out/early-stop或小型replay，直接抑制同批记忆；二是共享actor backbone但增加cost辅助监督/小adapter，使history既含cost信号又不新增2.39M自由参数。两条不能与optimizer拆分混跑，分别作为消融。
 - 评估器还需修复“向量环境按batch向上取整episode数”的口径问题：未来应只聚合前num_eval条，确保B20/B40/B80都严格评估同样数量。该工程修复先做随机流/指标回归，不能让此次160条结果反向参与模型选择。
+
+### E112：精确评估回合数修复与optimizer作用链纠正（2026-07-17）
+
+- 根因已确认：统一MLP评估、QCPO recurrent、DQCAC recurrent、QCPO_refs以及随机calibration都用ceil(num_eval/num_envs)运行完整向量批，却直接聚合全部样本。B40请求140会得到160；DQCAC还把额外s0/a0一起送进cost critic，所以CDF、Brier、AUC和mean也会改变，不只是显示的episode数错误。
+- 五条路径现在先校验num_episodes为正，仍让最后一个向量批的每条episode跑满horizon，再统一只保留前E条reward/cost/初始状态/预测概率。这样不提前终止任何环境，不改变被保留轨迹的随机流，同时使num_envs不再静默改变评估样本量。
+- 两个持久化eval-only回归均exit 0。B20/E140整除回归的30个eval字段与修复前JSON逐项exact，差异数0；B40/E140现在严格返回140条，其中47条outage，证明非整除截断生效。语法、diff-check和PNG/JSON输出均正常。
+- 此修复同时纠正上一条对“拆分reward/cost optimizer”的优先级判断。当前主配置mlp_lstm+gae_ppo的reward-V是actor内部共享value head，GAE由rollout保存的actor_value构造，policy/value由actor_optimizer一次联合更新。critic_optimizer中的reward_critic只服务旧distributional actor路径和诊断；cost gradient的joint clip不会直接缩放当前reward-V或PPO actor。
+- 因此不为当前主线实现或运行“独立reward/cost optimizer”1M实验。它对旧distributional模式可能有意义，但没有解释当前recurrent GAE/PPO性能的作用链。保留这一分歧路线作为旧模式消融，不把审计前的假设升级成算法结论。
+- 重新审计QCPO_refs后，最直接而尚未移植的稳定组件是：共享policy/reward/cost history backbone、非负c_dist=exp(linear)、cost quantile loss之外的mean-cost MSE锚定（系数0.5），以及Weibull tail loss。下一项先单变量加入默认关闭的mean anchor；它直接针对cost-LSTM“有少量AUC信号但均值/概率尺度失准”，比拆optimizer或事后温度校准更有作用链证据。
+- 用现有140条充分统计计算的同样本乐观单调仿射校准上界显示，B20/C20 cost-LSTM即使事后最优缩放，Brier Skill也只有约+0.62%；raw约+0.15%。所以当前问题不只是一个全局temperature/bias，不能靠Platt式校准替代表示与训练目标改进。
