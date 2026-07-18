@@ -1877,3 +1877,12 @@
 - retention guard不改变这个裁决。它只用上一rollout smooth-Brier选择/回滚cost critic和Adam，不更新PID setpoint、lambda或reward actor；既有guard结果`.579/.141`是低reward过度保守。它保持默认关闭，只作遗忘诊断，不能以更低outage作为成功指标。
 - 完整证据位于`_runs/profiles/dqc_ch18_batchrho1_target0175_b40_2m_multiseed_2026-07-18/`，包括逐seed/聚合CSV、统计JSON和1M--2M比较图；W&B完整history在对应`_runs/wandb_export/`目录。正式裁决为`reject_5m_risk_hit_rate_failed_but_keep_2m_budget`：保留2M作为后续live候选的最低正式性能预算，但先修风险信用或闭环，不盲目延长。
 
+### E162：C-H19 late-checkpoint相位审计预注册——先判断终点分叉能否用验证集选模消除（2026-07-18）
+
+- 本实验不重新训练、不改变任何权重，只复用C-H18三seed已经保存的pre-update rollout checkpoint。候选固定为1.4M、1.6M、1.8M、2.0M和2.0M final-post-update五个时点；1.0M及更早已经由C-H17/C-H18证明reward欠训练，不纳入“成熟策略”选择，避免用低reward安全点伪装成功。
+- 每个候选先在共同但未参与训练的256条validation episodes上评估，三个训练seed都使用相同环境/动作随机流`eval seed=10000`，W&B disabled。候选集在查看validation前固定，不能看到结果后加入1.2M或删除不漂亮时点。三seed共15次eval-only任务，使用`launch_background.sh`持久化；按单512评估约3.7分钟估算，单256约1.9分钟，三条并发一波预计2.5--4分钟，五波总墙钟约13--20分钟。
+- 每个训练seed独立采用相同词典序规则：先筛validation outage点估计位于`[.17,.23]`的候选，再在可行候选中选择mean reward最高者；若无可行候选，只选择`|outage-.20|`最小者并标记validation失败，reward仅用于等距决胜。validation用稍宽带吸收256条二项噪声，最终成功门仍是独立test的严格`[.18,.22]`。
+- 选模后使用完全不同的`eval seed=20000`做512条fresh test。若选中项不是final-post，则同一test流同时复评final-post作paired工程对照；test不再改选择。最终必须报告每seed选中step/phase、validation reward/outage、fresh test reward/outage、相对final的变化、三seedmean±SD及命中数。
+- 这项路线只在“选中checkpoint的fresh test至少2/3进`[.18,.22]`、mean outage进带且mean reward不低于C-H18 final的1.0399”时晋级为可复用checkpoint-selection trick。outage低于.18不算通过；如果validation选模不能跨seed复现，则证明周期不可由低成本终点选择可靠修复，下一步才投入trajectory estimator/闭环算法改动。
+- checkpoint选择不能使用test、原final fresh512或训练seed特有的漂亮rollout；validation与test输出分别落到带有公开语义的JSON/log目录，不创建一次性脚本。评估只写vepfs现有`_runs`，预计新增日志/JSON远小于100MB；原checkpoint目录约6.7GB，不复制权重。
+
