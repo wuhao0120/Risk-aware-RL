@@ -1895,3 +1895,24 @@
 - 晋级规则保持E162：selected test至少2/3 seed进带、seed mean outage进带、mean reward不低于C-H18原final的1.03991，且不能靠任一seed低于.18抵消另一seed高于.22。若失败，停止checkpoint-selection主线；图表仍作为“终点相位真实但不足以稳定控制”的消融证据，下一正式训练转B80独立trajectory batch或正交闭环改动。
 - validation候选CSV、冻结selection CSV/JSON和PNG位于`_runs/profiles/dqc_ch19_phaseaudit_ch18_2m_multiseed_2026-07-18/`。selection JSON在test启动前生成，记录validation/test seed、episode数、宽带/严格带、checkpoint绝对来源及选择原因；没有创建一次性脚本。
 
+### E164：C-H19独立test——validation checkpoint选择把策略推向更高reward、更高risk（2026-07-18）
+
+- 三条selected与两条final control均由持久化eval-only正常exit0，test固定eval seed20000、每项严格512 episodes、W&B disabled。selected逐seed reward/outage为`1.26171/133÷512=.25977`、`1.08327/145÷512=.28320`、`.88551/117÷512=.22852`；严格`[.18,.22]`为0/3通过。
+- selected三seed reward为`1.07683±.18818`，outage为`.25716±.02744`；合并事件`395/1536=.25716`，Wilson95为`[.23593,.27961]`，整个区间都高于.22。虽然reward高于C-H18原final均值1.0399，但风险明显超支，正式裁决是`strict_fail_stop_checkpoint_selection`。
+- 同一test流的final-post control为seed0/1/2 `1.11710/.22070, .98955/.23242, .88551/.22852`；三seedmean reward/outage为`.99738±.11599/.22721±.00597`，合并`349/1536`、Wilson95 `[.20695,.24884]`，同样0/3严格进带。seed0只高上界.00070也仍按预注册失败，不能移动门。
+- validation选择的pre相对final在seed0/1的test中分别把reward提高`+.14461/+.09372`，同时把outage提高`+.03906/+.05078`；seed2不变。三seed平均selected-final为reward `+.07944`、outage `+.02995`，seed-level t95因n=3均跨0。它沿高reward--高risk方向移动，没有提高约束前沿。
+- 更关键的是风险排序不泛化：validation上seed0/1 pre比final的outage低`.0195/.0234`，独立test却分别高`.0391/.0508`，两seed都翻转。256条validation不足以从高度相关的late checkpoint中稳定识别约.02--.05的真实风险差，继续加checkpoint密度或换validation seed属于过拟合选模，不再尝试。
+- 本轮证明终点相位真实但不是可复用解法。final-post共同test的outage SD只有.006却系统集中在.227附近；与其对每seed挑不同终点，不如在训练中降低每次风险观测和trajectory residual的方差，并重新校准闭环工作点。
+- 完整validation/test候选、冻结selection、逐seed/聚合CSV、统计JSON和两张PNG均位于`_runs/profiles/dqc_ch19_phaseaudit_ch18_2m_multiseed_2026-07-18/`；`test_checkpoint_selection_audit.png`已解码验证。没有保留临时脚本。
+
+
+### E165：C-H20 B80固定暴露量预注册——每次风险更新的独立trajectory翻倍（2026-07-18）
+
+- C-H20严格复用C-H18 batch-rho1/target=.175主线，只做“trajectory batch scaling”：`B40×50→B80×25`，总环境步仍2M。critic exposure为`50×40×C20=25×80×C20=40000` trajectory-epochs，actor exposure为`50×40×A8=25×80×A8=16000`，所以不是给B80额外训练样本或epoch；差异是每个梯度/PID事件独立trajectory翻倍、optimizer/controller事件减半。
+- PID窗口必须`50→100`作为batch scaling的定义性配套，而非独立window调参。B40/W50成熟时每次40条新样本替换80%窗口并保留10条旧样本；B80/W100同样替换80%并保留20条旧样本，均为1.25个batch。若B80仍用W50，deque会丢掉当前80条中的前30条且不保留旧批，既不公平也不是有效使用B80。Ki/Kp、leak、deadband、delta max、reference episodes和target全部不变；episode scaling保证常值误差下每条trajectory累计控制增益一致。
+- 在outage=.20附近，单事件二项标准误从`sqrt(.16/40)=.0632`降至`sqrt(.16/80)=.0447`，理论下降29.3%。current-batch RMS residual也从80条完整on-policy标签估计，仍要求实际correction/critic std ratio为`1±1e-3`。QR32、MC、mean anchor、LSTM512、GAE-PPO、obs RMS、所有LR与PID target .175均冻结。
+- 先跑一次B80×T1000完整event工程smoke，覆盖C20/A8、PID、PPO ratio、checkpoint重建与有限性；预计训练30--60秒、16回合评估约1分钟，峰值显存远低于80GB。smoke只裁决OOM/shape/ratio/NaN，不作性能结论。
+- 正式首轮选择C-H18风险压力seed1：B80×25×T1000=2M，从头训练、W&B online脱敏、`launch_background.sh`持久化，预计纯训练11--16分钟、内部128约1--2分钟、共同eval seed20000 fresh512约4分钟，总计约17--22分钟。C-H18 seed1同test参考为reward/outage `.98955/.23242`。
+- 由于C-H18已证明1M会误杀慢热策略，B80正式run不按前300k/1M reward早停；只有NaN/Inf/OOM、ratio断言或确定工程错误才停止。性能晋级要求fresh512 outage进入`[.18,.22]`，reward至少.94且目标不低于参考.98955；低于.18且reward下降判过度保守，高于.22判风险不足。通过才原样扩seed0/2，不扫描B60/B100/B120或同时改target/rho。
+- 若B80只降低训练raw outage抖动却fresh仍失败，说明剩余主因是policy响应/条件risk credit而非独立标签数；下一步转明确的控制器/actor时钟或风险估计器改动。若reward/outage同时改善，则B80作为工程组件晋级，最终仍需三seed2M和统一5M QCPO_refs比较。
+

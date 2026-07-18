@@ -2162,3 +2162,11 @@ C-H18与C-H17 seed2的前1M checkpoint和history逐位相同，新增后1M把fre
 
 下一算法实验必须直接处理风险梯度估计，而不是继续扫描PID小数点或追求更低outage。一个候选是把action-conditioned critic estimator与完整trajectory score-function estimator做明确的控制变量/凸组合，并用leave-one-out empirical baseline消除同批自相关；不能简单把全批outage均值当新残差再加到critic advantage，因为那会重复计算风险梯度、改变有效增益。任何实现都必须默认关闭、保持原路径逐位不变，并先用解析梯度/时间主序/PPO冻结回归证明无偏目标和概率分母正确，再投入2M live预算。
 
+### 13.139 late-checkpoint选模不能替代稳定的风险闭环（2026-07-18）
+
+C-H19用独立validation预先选checkpoint，再用新test随机流检验，避免了直接在test上挑终点。结果比只看final更差：selected三seedoutage为0.260/0.283/0.229，0/3进入[0.18,0.22]，平均0.257；final control则为0.221/0.232/0.229，平均0.227。selected多出的约0.079 mean reward伴随约0.030 outage增加，仍是沿原前沿换风险。
+
+失败原因不是选模规则写反。validation中seed0/1的pre确实比final更安全，独立test却同时发生风险排序反转。late checkpoint高度相关、风险差只有几个百分点，而256条Bernoulli validation的标准误约0.025；此时选择最接近0.20者会放大赢家诅咒。增加checkpoint数量只会增加选择偏差，除非投入远大于训练的validation预算，研究性价比很低。
+
+因此retention/checkpoint guard只能避免某次明显退化，不能作为outage setpoint控制器。下一步转B80固定暴露量：每个risk/PID事件从40增到80条独立trajectory，同时把事件数减半保持2M样本和trajectory-epoch exposure不变。窗口按batch同比50到100只是保持80%替换率，不能误写成另一次window平滑调参。目标仍是outage约0.20后最大化reward，不以更低为优。
+
