@@ -481,6 +481,10 @@ def main():
         if is_eval_only:
             args.checkpoint_dir = None
             args.checkpoint_interval = 0
+            # optimizer trajectory minibatch只改变训练循环，不属于网络结构。
+            # 评估可把num_envs改成任意并行度，不能被训练时mini-B整除约束阻断。
+            if hasattr(args, 'optimizer_minibatch_trajectories'):
+                args.optimizer_minibatch_trajectories = 0
             previous_name = str(getattr(args, 'wandb_name', cli.algo))
             args.wandb_name = f"{previous_name}_eval_{cli.tag}"
 
