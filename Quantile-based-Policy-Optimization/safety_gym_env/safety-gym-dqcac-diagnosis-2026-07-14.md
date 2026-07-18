@@ -2227,3 +2227,16 @@ C-H22否定了“只恢复Adam step数就能恢复B40 reward”，因此下一�
 LOO的必要性可被精确验证。若baseline包含自身标签，有限B梯度期望会乘`1-1/B`；在B=3、Bernoulli policy p=.3的全部8种联合结果上，真实与LOO梯度都是.21，自包含全批baseline只有.14。默认关闭的四checkpoint逐位回归、time-major解析门、启用smoke和B1/B2 eval重载均通过，当前风险只剩算法效果而非接线错误。
 
 这不是保证成功的trick。若critic的`p_hat`已是优良条件baseline，LOO全局经验率可能反而增加方差；当前采用它的理由是fresh AUC/BSS长期接近随机、且文档已明确要求检验同批自相关。正式2M只看真实双侧工作带和reward，不会因为估计器理论更干净就放宽性能门。
+
+
+### 13.146 C-H23结论：LOO修复有限batch偏差，却丢掉条件风险信用（2026-07-18）
+
+C-H23的工程和数学链路都正确：leave-one-out baseline不含本轨迹标签，解析枚举保持真实policy-gradient期望；默认关闭逐位回归、time-major广播、checkpoint重载、PPO behavior probability和50个正式事件全部通过。因此结果失败不能归因于“LOO写错了”或又出现off-policy分母错误。
+
+失败是算法性的。固定512条新轨迹上，C-H18 critic-baseline为reward/outage 0.9896/0.2324，LOO为1.0063/0.3203。reward差的95%区间跨0，outage却显著增加0.0879，差值95%区间[0.0331,0.1420]。LOO在训练后段把batch outage均值从0.3075降到0.2600，但终点fresh风险反而更高，说明它改变了闭环相位而没有获得可泛化的更优策略。
+
+根因可由信号统计直接看到。C-H18后段action-conditioned critic advantage标准差仅约0.00388，trajectory二元项约0.378，两者相关约0.003；LOO分支相关更接近0。全局LOO baseline能去掉同批自包含偏差，却不区分state、history或action。batch-rho把它缩小后仍只是高方差全轨迹方向；它不能替代一个有排序能力的条件risk critic，也不能靠更精确的全局outage均值产生时序credit。
+
+这使下一步优先级发生变化。继续调LOO系数、PID target或窗口只会在现有前沿上换工作点；risk-cache重新查询也只是用同一个近随机排序critic刷新数值。更有价值的结构路线是把QCPO_refs尚未迁移的核心cost-credit链路单独拿出来：共享recurrent feature上的state-value cost distribution、quantile TD/GAE advantage，以及可选的Weibull density-ratio修正。当前DQCAC仍保留action-conditioned distributional Q；首个最小版本可以只增加state-value cost distribution作为低方差baseline/辅助advantage，不删除Q critic，再做Q-only、V-only、Q+V三路消融。
+
+路线分歧保留如下：①最小改动是训练state-value quantile head并替代K=4动作采样baseline，检验baseline sampling与Q-V一致性；②完整迁移是按QCPO_refs的sorted quantile TD residual做cost-GAE，再用同一个rollout behavior ratio做PPO clip；③若两者都不能提高条件排序，再记录score-weighted actor-gradient cosine和方差最优组合，而不是只看advantage相关。IQN、局部quantile加密、更多N和scalar PID继续保留为消融，但已有证据表明它们解决的是表示分辨率或工作点，不是当前缺失的条件风险信用。

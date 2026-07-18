@@ -2009,3 +2009,16 @@
 - 机制门要求50个Actor/PID事件、1000/400 critic/actor step完成，首ratio`<1e-3`，correction/critic标准差比保持`1±1e-3`，LOO baseline mean等于该behavior batch outage mean且全部有限。baseline在episode维的std理论上约为label std/(B-1)，只作索引/自排除诊断，不作为性能门。
 - 正式fresh512先要求outage点估计进入双侧`[.18,.22]`，再要求reward至少`.94`，目标不低于C-H18同test的`.98955`。outage低于.18且reward下降仍是过度保守；高于.22是风险预算超支；进带但reward低于.94说明只移动旧前沿。通过才原样扩seed0/2，不针对seed1扫描rho或PID小数。
 - 若LOO失败，不把它与含自身全批baseline混淆：后者已有解析有限B偏差，不能作为补救。下一分歧路线保留为①B40中对risk cache做有限次数重新查询并监控目标漂移；②直接让Actor/PID使用更频繁的新on-policy rollout而减少单批epoch；③对trajectory与critic梯度做显式余弦/方差最优组合。三条分别验证，不与本次LOO混跑。
+
+
+### E175：C-H23正式结果——LOO数学去偏成立，但显著恶化真实outage（2026-07-18）
+
+- 正式job与fresh512均由持久化后台正常exit0；W&B run `wq2076gf` finished。纯训练`811.0s`，50个Actor/PID事件、1000/400 critic/actor optimizer step全部完成，无NaN/Inf/OOM。首epoch ratio误差约`2e-5`，末KL/clip为`.00237/.11805`；LOO baseline逐批均值严格等于batch outage、correction/critic标准差比约1，机制门全部通过。
+- C-H23与C-H18在lambda首次响应前逐位一致；200k checkpoint的43个module leaves及rollout指标差异数0。故性能差异来自LOO风险基线，而不是RNG、reward actor、初始化或环境轨迹被意外改变。
+- 后20%训练中，C-H18→C-H23 reward由`1.15470→1.00019`，outage由`.3075→.2600`，lambda由`.4614→.2247`。LOO在训练batch上表现得更安全，但reward下降且闭环仍在`.15--.45`间振荡；它没有产生稳定贴近.20的单调收敛。
+- 内置128为reward/outage `1.1158/.3281`。固定eval seed20000的fresh512为`1.006335/164÷512=.320313`，reward95 `[.96361,1.04906]`、outage Wilson95 `[.28136,.36194]`，明显高于双侧工作带`[.18,.22]`。
+- 同一test流C-H18为`.989551/119÷512=.232422`。LOO-control reward差`+.01678`的Welch95为`[-.04554,+.07911]`，不能确认收益；outage差`+.08789`的Newcombe95为`[+.03313,+.14196]`，是统计显著恶化。因此正式裁决为`reject_no_seed_expansion_outage_significantly_worse`，节省seed0/2约40分钟。
+- fresh hard/smooth CDF约`.35193/.35418`而truth `.32031`，Brier由C-H18的`.18120`恶化到`.22300`，mean-cost error由`.0665`增到`.6893`。LOO不训练critic，差异来自被不同风险梯度引导到的新状态分布；不能把critic误差变化误写为LOO监督本身。
+- 更关键的机制量：C-H18后段`std(Acritic)≈.00388`、`std(trajectory label)≈.3783`，两者相关约`.0031`；LOO后对应相关约`.00024`。全局LOO基线去掉有限B自包含偏差，却没有保留state/action条件credit；batch-rho只把高方差残差缩到微小critic尺度，不能创造条件排序。
+- 完整W&B对齐曲线在`_runs/profiles/dqc_ch18_vs_ch23_loo_2m_s1_2026-07-18/`；fresh512 CSV/JSON/PNG在`_runs/profiles/dqc_ch18_b40_vs_ch23_loo_2m_s1_test512_e20000_2026-07-18/`。分析脚本已补充LOO与optimizer-minibatch指标，提交`5c70940`；未创建一次性脚本。
+- 下一主线不继续扫描LOO rho或PID小数点。结构性候选优先级为：①迁移QCPO_refs的recurrent state-value cost distribution与quantile-GAE cost advantage，同时保留DQCAC action-conditioned Q作为可消融分支；②若先做较小改动，则加入state-dependent cost-value baseline替代K动作Monte-Carlo baseline；③最后才做score-weighted梯度余弦/方差最优混合。risk-cache重查询只改变同一批内的critic预测，不足以修复当前近零条件相关，降为机制消融。
