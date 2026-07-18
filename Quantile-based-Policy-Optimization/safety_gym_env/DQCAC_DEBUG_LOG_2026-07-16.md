@@ -1988,3 +1988,24 @@
 - fresh critic仍不能提供可靠条件risk credit：hard/smooth CDF为`.16309/.16715`而truth为`.19531`，hard Brier/AUC/BSS为`.16478/.5241/-4.85%`，mean-cost误差`.31715`。相对B40虽Brier下降9.1%，BSS反而下降3.28个百分点且AUC接近随机；较低总体Brier主要受较低outage基率影响，不能当作critic变好。
 - eval-only最初因checkpoint恢复训练时mini-B40、而评估`num_envs=40`触发“mini必须小于full batch”校验。修复`be8b3ab`在eval-only加载后把纯训练参数`optimizer_minibatch_trajectories`重置为0，不改变网络或checkpoint权重；B2烟雾测试和正式B40并行fresh512均exit0。训练checkpoint中保存的16次actor更新诊断仍被保留。
 - 四run完整训练profile与对齐图位于`_runs/profiles/dqc_ch18_b40_ch20_b80_ch21_lr2_ch22_optmb40_2m_s1_2026-07-18/`；C-H18/C-H22和C-H20/C-H22的CSV、统计JSON、PNG位于对应`_runs/profiles/dqc_ch18_b40_vs_ch22_.../`及`dqc_ch20_b80_vs_ch22_.../`目录，PNG均已做文件格式验证。正式裁决为`reject_no_seed_expansion_constraint_hit_but_reward_failed`，节省约40--50分钟无效多seed计算。
+
+
+### E173：C-H23 leave-one-out trajectory empirical baseline实现与工程门（2026-07-18）
+
+- C-H18/C-H22的batch-rho1修正使用`residual=I_outage-p_hat(s,a)`；它没有实现此前文档预留的leave-one-out经验基线。新参数`cost_actor_mc_baseline_mode`默认`critic`逐式保留旧定义，显式`leave_one_out`时，对第j条trajectory构造`b_-j=sum_{k!=j} I_k/(B-1)`和`A_LOO=I_j-b_-j`，再令修正分量为`A_LOO-A_critic`。因此raw eta=1严格满足`A_critic+correction=A_LOO`，不会把完整trajectory估计器直接叠到critic估计器上重复计算风险梯度。
+- 自排除不是形式细节。若用含自身标签的全批均值`bar I`作baseline，baseline与本轨迹score相关，有限B期望梯度会缩小为`(1-1/B)`。三条Bernoulli轨迹、policy probability .3的全部`2^3`情况精确枚举中，真实/LOO梯度期望均为`.21`，含自身全批基线只得到`.14`。其它轨迹在固定behavior policy下与第j条环境/动作噪声独立，所以`b_-j`是合法的trajectory-level control variate。
+- LOO episode基线先在[B]上计算，再以`[T,B]` time-major广播到`[T*B]`；actor cadence合并batch时使用实际`_actor_num_envs`，不能按构造Agent时的单rollout B切错。样本数校验也放在实际actor batch：这允许`num_envs=1, actor_interval=2`形成两条有效轨迹，并允许任意并行度eval-only；真正B=1且触发LOO训练时才给出明确错误。
+- LOO同时兼容raw和rms-balanced。正式候选继续使用batch-reference rho1；scale由当前behavior batch的`std(A_critic)/std(A_LOO-A_critic)`冻结，使实际correction/critic标准差比仍精确为1。新增W&B键报告baseline mean/std及LOO开关；checkpoint config和training summary保存模式，PPO old log-prob、GAE、outage标签与risk cache仍在behavior rollout首次actor查询时冻结。
+- 解析张量门使用B3/T2、labels`[1,0,0]`，LOO基线严格为`[0,.5,.5,0,.5,.5]`；改变第0条自身标签不改变其baseline，time-major对齐、raw端点恒等式和batch-rho比1全部通过。另做上述精确期望枚举，LOO无有限B自包含偏差。
+- 默认关闭回归复用seed503、B4/T32、3 rollout、C3/A2的已有gold。新run纯训练`21.4s`、exit0；四个checkpoint逐个比较，43个module leaves、1个lambda tensor、31--36个runtime leaves、5/177个公共metrics全部mismatch0，独立eval30个公共字段也mismatch0。唯一新增final metric是新模式字段，不改变任何旧权重、RNG、PID或评估。
+- 启用smoke使用seed506、B4/T32、C3/A2、强制阈值-1产生全1事件标签，持久化训练`20.9s`、exit0；43个module leaves全部有限，LOO模式从checkpoint summary恢复，首ratio误差`7.82e-5`，末KL/clip`2.09e-5/0`，每事件2个actor step完成。B2和B1两个eval-only checkpoint重载均exit0，证明训练基线模式不会错误锁死评估并行度。
+- 改动只涉及`agents/dqc_ac_beta_gpu.py`和`run_experiment.py`，没有创建一次性脚本；解析检查使用命令行内联代码，回归/smoke/eval全部由`launch_background.sh`持久化。LOO减少的是经验baseline自相关，不保证一定降低`I-p_hat`方差或提升前沿，正式性能必须由2M独立评估裁决。
+
+### E174：C-H23 seed1 2M LOO正式性能预注册（2026-07-18）
+
+- C-H23逐项复用C-H18 seed1：B40×50×T1000=2M、C20/A8、theta LR`3e-4`、critic LR`1e-3`、QR32/MC、actor-feature、mean anchor、sigmoid T1、batch-reference rho1、PID target`.175`/window50、LSTM512、obs RMS与GAE-PPO全部冻结。唯一算法差异是`cost_actor_mc_baseline_mode: critic→leave_one_out`；optimizer minibatch保持0，不混入失败的B80路线。
+- 选择seed1是因为同测试流C-H18为reward/outage`.98955/.23242`，具有高reward但风险略超支，能直接检验LOO去偏是否把风险推入目标带而保住收益。C-H18三seed已证明1M可能误杀慢热策略，所以除NaN/Inf/OOM、ratio错误或确定工程故障外跑满2M，不以100--1000k表现提前停止。
+- 依据同配置C-H18纯训练`790.5s`，LOO只增加O(B)标量运算；预计纯训练13--16分钟，W&B初始化与内置128约2--5分钟，fresh512约4分钟，总计约19--25分钟。训练使用脱敏W&B online和`launch_background.sh`，checkpoint/log全部写vepfs，不占root大盘。
+- 机制门要求50个Actor/PID事件、1000/400 critic/actor step完成，首ratio`<1e-3`，correction/critic标准差比保持`1±1e-3`，LOO baseline mean等于该behavior batch outage mean且全部有限。baseline在episode维的std理论上约为label std/(B-1)，只作索引/自排除诊断，不作为性能门。
+- 正式fresh512先要求outage点估计进入双侧`[.18,.22]`，再要求reward至少`.94`，目标不低于C-H18同test的`.98955`。outage低于.18且reward下降仍是过度保守；高于.22是风险预算超支；进带但reward低于.94说明只移动旧前沿。通过才原样扩seed0/2，不针对seed1扫描rho或PID小数。
+- 若LOO失败，不把它与含自身全批baseline混淆：后者已有解析有限B偏差，不能作为补救。下一分歧路线保留为①B40中对risk cache做有限次数重新查询并监控目标漂移；②直接让Actor/PID使用更频繁的新on-policy rollout而减少单批epoch；③对trajectory与critic梯度做显式余弦/方差最优组合。三条分别验证，不与本次LOO混跑。

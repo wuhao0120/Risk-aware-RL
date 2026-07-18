@@ -2216,3 +2216,14 @@ C-H21说明把actor学习率翻倍只能恢复PPO KL，不能恢复稳定前沿�
 - 关键未对齐的时钟仍是rollout/控制器事件：B40有50次新on-policy数据、risk cache刷新和PID更新，B80只有25次。C-H22在同一个B80 risk cache上连续做16个actor step；importance ratio虽然正确地始终相对原behavior policy，并由clip控制，但条件风险权重本身不会随这些子步刷新。训练中outage与lambda仍呈明显相位循环。
 - 这区分了两个概念：PPO的off-policy修正已正确，分母应一直是采样策略概率，不能每个子步改存当前策略概率；当前问题更像risk target/控制信号陈旧，而不是漏做importance ratio。后续若继续该方向，应优先测试“Actor小步与risk重新查询/控制器时钟解耦”，而不是继续放大LR、增加第三个minibatch或单纯扩大num_envs。
 - 因为用户目标是outage约等于.20后最大化reward，C-H22虽比C-H20更接近约束，也不能晋级：reward显著下降。下一正式候选应同时预注册双侧outage带与reward门，避免把更安全但更低收益误记为改善。
+
+
+### 13.145 C-H23用LOO基线修正trajectory估计器的有限batch自相关（2026-07-18）
+
+C-H22否定了“只恢复Adam step数就能恢复B40 reward”，因此下一项回到B40最佳主线并直接修改风险梯度估计。现有batch-rho1用`I-p_hat(s,a)`校正action-conditioned critic；它能降低跨seed风险方差，但完整trajectory标签和同批critic仍高度耦合。C-H23不改变PPO、PID、网络或batch，只把真实trajectory估计器的状态无关经验baseline改成其它B-1条轨迹的outage均值。
+
+正确组合不是`Acritic+A_LOO`。实现先定义`A_LOO=I_j-mean_{k!=j}I_k`，再用`A_LOO-Acritic`作为修正，所以raw系数1端点正好是LOO estimator；batch-rho1则把这个去偏修正配平到critic优势的RMS后再收缩组合。PPO仍始终用采样时behavior probability作分母，每个epoch重算当前策略分子；LOO不要求、也不允许把更新后probability存成新分母。
+
+LOO的必要性可被精确验证。若baseline包含自身标签，有限B梯度期望会乘`1-1/B`；在B=3、Bernoulli policy p=.3的全部8种联合结果上，真实与LOO梯度都是.21，自包含全批baseline只有.14。默认关闭的四checkpoint逐位回归、time-major解析门、启用smoke和B1/B2 eval重载均通过，当前风险只剩算法效果而非接线错误。
+
+这不是保证成功的trick。若critic的`p_hat`已是优良条件baseline，LOO全局经验率可能反而增加方差；当前采用它的理由是fresh AUC/BSS长期接近随机、且文档已明确要求检验同批自相关。正式2M只看真实双侧工作带和reward，不会因为估计器理论更干净就放宽性能门。

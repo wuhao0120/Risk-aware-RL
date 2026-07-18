@@ -194,6 +194,9 @@ def base_args(algo, seed, device, env_key):
         # reference=ema逐位保留已有实验；batch令每个behavior批的实际RMS比等于rho。
         a.cost_actor_mc_correction_coef = 0.0
         a.cost_actor_mc_correction_mode = 'raw'
+        # critic保留I-p_hat历史residual；leave_one_out使用其它轨迹的经验
+        # outage均值作基线，避免把本轨迹标签同时放进自身control variate。
+        a.cost_actor_mc_baseline_mode = 'critic'
         a.cost_actor_mc_balance_reference = 'ema'
         a.cost_actor_mc_balance_std_floor = 1e-4
         a.cost_actor_mc_balance_ratio_max = 1.0

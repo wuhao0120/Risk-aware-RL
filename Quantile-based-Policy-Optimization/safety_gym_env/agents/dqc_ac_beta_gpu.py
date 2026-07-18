@@ -303,6 +303,13 @@ class DQCACBetaGPU(VecAgentBase):
         if self.cost_actor_mc_correction_mode not in {'raw', 'rms_balanced'}:
             raise ValueError(
                 "cost_actor_mc_correction_mode must be 'raw' or 'rms_balanced'")
+        # 默认critic逐式保留I-p_hat residual。leave_one_out构造独立轨迹
+        # empirical baseline；每条轨迹的基线严格排除自身outage标签。
+        self.cost_actor_mc_baseline_mode = str(getattr(
+            args, 'cost_actor_mc_baseline_mode', 'critic')).lower()
+        if self.cost_actor_mc_baseline_mode not in {'critic', 'leave_one_out'}:
+            raise ValueError(
+                "cost_actor_mc_baseline_mode must be 'critic' or 'leave_one_out'")
         # ema是C-H14/C-H15的历史低通参考；batch使用当前冻结behavior batch，
         # 在没有floor/max触发时使std(rho*s*residual)/std(critic)精确等于rho。
         self.cost_actor_mc_balance_reference = str(getattr(
@@ -336,6 +343,10 @@ class DQCACBetaGPU(VecAgentBase):
             raise ValueError(
                 "trajectory MC actor correction requires episodic=True because "
                 "disc_cost must represent a complete trajectory")
+        if self.cost_actor_mc_baseline_mode == 'leave_one_out':
+            if self.cost_actor_mc_correction_coef <= 0.0:
+                raise ValueError(
+                    "leave-one-out MC baseline requires a positive correction coefficient")
         # nstep 是历史默认；mc 用完整 finite-horizon cost return 直接监督每个 quantile。
         # 后者只作为传播偏差消融，不会把 reward actor 或 reward critic 偷换成 MC。
         self.cost_target_mode = str(getattr(args, 'cost_target_mode', 'nstep')).lower()
@@ -1425,6 +1436,7 @@ class DQCACBetaGPU(VecAgentBase):
               f"actor_cost_query={self.cost_actor_query_mode}"
               f"/mcfix{self.cost_actor_mc_correction_coef:g}"
               f":{self.cost_actor_mc_correction_mode}"
+              f"/base{self.cost_actor_mc_baseline_mode}"
               f"/ref{self.cost_actor_mc_balance_reference}, "
               f"arch={self.policy_arch}, dual={self.dual_update_mode}/{self.dual_pid_signal}"
               f"/interval{self.pid_update_interval}"
@@ -2236,6 +2248,7 @@ class DQCACBetaGPU(VecAgentBase):
         batch['_risk_mc_correction_raw'] = (
             risk_components['correction'].detach())
         batch['_risk_mc_outage_label'] = risk_components['label'].detach()
+        batch['_risk_mc_baseline_raw'] = risk_components['baseline'].detach()
         batch['_risk_critic_mc_correlation'] = (
             risk_components['critic_mc_correlation'].detach())
         batch['_risk_mc_balance_scale'] = (
@@ -4510,10 +4523,17 @@ class DQCACBetaGPU(VecAgentBase):
         """
         构造critic/trajectory-MC风险优势及其收缩组合，输出形状均为[T*B]。
 
-        公共分量:
+        critic baseline模式的公共分量:
             A_critic = p_hat(s,a) - V_hat(s)
             residual = I_outage - p_hat(s,a)
             A_MC = A_critic + residual = I_outage - V_hat(s)
+
+        leave_one_out模式先用其它B-1条独立轨迹构造:
+            b_-j = mean_{k!=j} I_outage,k
+            A_LOO = I_outage,j - b_-j
+            residual_LOO = A_LOO - A_critic
+        因b_-j不含第j条轨迹，其与该轨迹score独立；raw eta=1端点严格退化
+        为A_LOO，而不是把含自身标签的全批均值用作baseline造成有限B偏差。
 
         raw模式逐式保留历史定义A=A_critic+eta*residual；eta=1是无偏但高方差
         的trajectory score-function信号。rms_balanced模式改用
@@ -4553,11 +4573,30 @@ class DQCACBetaGPU(VecAgentBase):
         outage_label = outage_by_episode.unsqueeze(0).expand(
             self.n, actor_envs).reshape(expected_transitions)
 
-        # 三个分量使用同一个state-only Monte-Carlo action baseline。critic与MC
-        # 的差恰为真实Bernoulli residual；所有统计都在调用方no_grad作用域内。
+        # critic分量使用state-only Monte-Carlo action baseline。历史MC分量也使用
+        # 同一baseline，因此两者差恰为I-p_hat；默认分支不能增加额外张量运算。
         critic_advantage = psi_cdf - baseline_cdf
-        mc_advantage = outage_label - baseline_cdf
-        mc_residual = outage_label - psi_cdf
+        if self.cost_actor_mc_baseline_mode == 'critic':
+            mc_baseline = baseline_cdf
+            mc_advantage = outage_label - mc_baseline
+            mc_residual = outage_label - psi_cdf
+        else:
+            # actor interval可把多个B=1 rollout合并成有效B>1，因此在实际actor
+            # batch上校验，而不是用构造Agent时的num_envs误拦截eval或合并训练。
+            if actor_envs <= 1:
+                raise ValueError(
+                    "leave-one-out MC baseline requires at least two actor trajectories")
+            # [B] LOO基线先沿episode维计算，再按time-major广播为[T*B]。
+            # 不能直接使用全批mean：其中1/B来自自身标签，会让baseline与本轨迹
+            # score相关并把期望梯度缩小为(1-1/B)。B>=2已在初始化阶段验证。
+            leave_one_out_by_episode = (
+                outage_by_episode.sum() - outage_by_episode) / (actor_envs - 1)
+            mc_baseline = leave_one_out_by_episode.unsqueeze(0).expand(
+                self.n, actor_envs).reshape(expected_transitions)
+            mc_advantage = outage_label - mc_baseline
+            # 用两个完整估计器之差作去偏修正，避免把A_LOO直接叠到A_critic上
+            # 重复计算约束梯度；raw eta=1时A_critic+(A_LOO-A_critic)=A_LOO。
+            mc_residual = mc_advantage - critic_advantage
         critic_batch_mean = float(critic_advantage.mean().item())
         critic_batch_var = float(
             critic_advantage.var(unbiased=False).item())
@@ -4645,6 +4684,7 @@ class DQCACBetaGPU(VecAgentBase):
             'residual': mc_residual,
             'correction': applied_correction,
             'label': outage_label,
+            'baseline': mc_baseline,
             'critic_mc_correlation': critic_mc_correlation,
             'balance_scale': psi_cdf.new_tensor(balance_scale),
             'critic_scale_reference': psi_cdf.new_tensor(
@@ -4786,6 +4826,8 @@ class DQCACBetaGPU(VecAgentBase):
                     risk_components['correction'].detach())
                 batch['_risk_mc_outage_label'] = (
                     risk_components['label'].detach())
+                batch['_risk_mc_baseline_raw'] = (
+                    risk_components['baseline'].detach())
                 batch['_risk_critic_mc_correlation'] = (
                     risk_components['critic_mc_correlation'].detach())
                 batch['_risk_mc_balance_scale'] = (
@@ -4974,6 +5016,12 @@ class DQCACBetaGPU(VecAgentBase):
                 batch['_risk_critic_mc_correlation'].item()),
             'advantage/risk_mc_outage_label_mean': float(
                 batch['_risk_mc_outage_label'].mean().item()),
+            'advantage/risk_mc_baseline_mean': float(
+                batch['_risk_mc_baseline_raw'].mean().item()),
+            'advantage/risk_mc_baseline_std': float(
+                batch['_risk_mc_baseline_raw'].std(unbiased=False).item()),
+            'advantage/risk_mc_baseline_is_leave_one_out': float(
+                self.cost_actor_mc_baseline_mode == 'leave_one_out'),
             'advantage/risk_mc_correction_coef': (
                 self.cost_actor_mc_correction_coef),
             'advantage/risk_mc_balance_scale': float(
@@ -5060,6 +5108,8 @@ class DQCACBetaGPU(VecAgentBase):
                     risk_components['correction'].detach())
                 batch['_risk_mc_outage_label'] = (
                     risk_components['label'].detach())
+                batch['_risk_mc_baseline_raw'] = (
+                    risk_components['baseline'].detach())
                 batch['_risk_critic_mc_correlation'] = (
                     risk_components['critic_mc_correlation'].detach())
                 batch['_risk_mc_balance_scale'] = (
@@ -5169,6 +5219,12 @@ class DQCACBetaGPU(VecAgentBase):
                 batch['_risk_critic_mc_correlation'].item()),
             'advantage/risk_mc_outage_label_mean': float(
                 batch['_risk_mc_outage_label'].mean().item()),
+            'advantage/risk_mc_baseline_mean': float(
+                batch['_risk_mc_baseline_raw'].mean().item()),
+            'advantage/risk_mc_baseline_std': float(
+                batch['_risk_mc_baseline_raw'].std(unbiased=False).item()),
+            'advantage/risk_mc_baseline_is_leave_one_out': float(
+                self.cost_actor_mc_baseline_mode == 'leave_one_out'),
             'advantage/risk_mc_correction_coef': (
                 self.cost_actor_mc_correction_coef),
             'advantage/risk_mc_balance_scale': float(
@@ -5786,6 +5842,8 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_actor_mc_correction_coef),
             'debug/cost_actor_mc_correction_rms_balanced': float(
                 self.cost_actor_mc_correction_mode == 'rms_balanced'),
+            'debug/cost_actor_mc_baseline_is_leave_one_out': float(
+                self.cost_actor_mc_baseline_mode == 'leave_one_out'),
             'debug/cost_actor_mc_balance_reference_is_batch': float(
                 self.cost_actor_mc_balance_reference == 'batch'),
             'debug/cost_actor_mc_balance_std_floor': (
@@ -6201,6 +6259,7 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_actor_mc_correction_coef),
             'cost_actor_mc_correction_mode': (
                 self.cost_actor_mc_correction_mode),
+            'cost_actor_mc_baseline_mode': self.cost_actor_mc_baseline_mode,
             'cost_actor_mc_balance_reference': (
                 self.cost_actor_mc_balance_reference),
             'cost_actor_mc_balance_std_floor': (
