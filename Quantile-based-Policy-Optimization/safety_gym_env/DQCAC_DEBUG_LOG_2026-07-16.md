@@ -1886,3 +1886,12 @@
 - 这项路线只在“选中checkpoint的fresh test至少2/3进`[.18,.22]`、mean outage进带且mean reward不低于C-H18 final的1.0399”时晋级为可复用checkpoint-selection trick。outage低于.18不算通过；如果validation选模不能跨seed复现，则证明周期不可由低成本终点选择可靠修复，下一步才投入trajectory estimator/闭环算法改动。
 - checkpoint选择不能使用test、原final fresh512或训练seed特有的漂亮rollout；validation与test输出分别落到带有公开语义的JSON/log目录，不创建一次性脚本。评估只写vepfs现有`_runs`，预计新增日志/JSON远小于100MB；原checkpoint目录约6.7GB，不复制权重。
 
+### E163：C-H19 validation完成与独立test冻结（2026-07-18）
+
+- 五个候选×三seed共15个validation任务全部持久化exit0；每个严格256 episodes、共同eval seed10000、W&B disabled。三seed按1.4M/1.6M/1.8M/2.0M-pre/final-post排列的reward/outage分别为：seed0 `.966/.270, 1.097/.270, 1.173/.242, 1.197/.215, 1.173/.234`；seed1 `1.149/.324, 1.176/.348, 1.221/.359, 1.030/.285, .973/.309`；seed2 `.961/.293, .885/.262, 1.095/.312, .918/.254, .966/.242`。
+- 选择规则在看test前机械执行。seed0只有2.0M-pre落入validation宽带`[.17,.23]`，故选`rollout_step002000000.pt`；seed1无可行候选，按与.20绝对距离最小选择2.0M-pre；seed2无可行候选，选择距离最近的final-post。对应validation reward/outage为`1.19692/.21484, 1.02980/.28516, .96586/.24219`，只有1/3 validation可行。
+- validation已经说明checkpoint相位不是完整解法：seed1即使选最接近者仍高目标.085，seed2高.042。2.0M-pre相对final-post在seed0把outage `.234→.215`且reward `1.173→1.197`，在seed1把outage `.309→.285`且reward `.973→1.030`；方向有利，但必须由新随机流复现，不能用validation自身宣布Pareto改进。
+- 独立test现冻结为eval seed20000、每项512 episodes、严格工作带`[.18,.22]`。先并发评估三个预先选中checkpoint；由于seed0/1选中pre而非final，再用同一test流各评估final-post作为paired工程对照。seed2的selected即final，不重复计算。三条selected并发预计约9--13分钟，两条control并发约7--10分钟，合计约16--23分钟。
+- 晋级规则保持E162：selected test至少2/3 seed进带、seed mean outage进带、mean reward不低于C-H18原final的1.03991，且不能靠任一seed低于.18抵消另一seed高于.22。若失败，停止checkpoint-selection主线；图表仍作为“终点相位真实但不足以稳定控制”的消融证据，下一正式训练转B80独立trajectory batch或正交闭环改动。
+- validation候选CSV、冻结selection CSV/JSON和PNG位于`_runs/profiles/dqc_ch19_phaseaudit_ch18_2m_multiseed_2026-07-18/`。selection JSON在test启动前生成，记录validation/test seed、episode数、宽带/严格带、checkpoint绝对来源及选择原因；没有创建一次性脚本。
+
