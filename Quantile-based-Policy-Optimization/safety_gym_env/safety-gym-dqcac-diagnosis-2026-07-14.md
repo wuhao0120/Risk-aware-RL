@@ -2256,3 +2256,11 @@ C-H23的工程和数学链路都正确：leave-one-out baseline不含本轨迹�
 C-H24在600k时内置reward/outage为0.699/0.313，训练末也为0.623/0.300，短期性能明确没有超过旧C-H18。保留它的理由不是美化终点，而是预注册机制门全部通过：state risk advantage标准差0.153而非近零，state head的缩放后mean MAE约0.075，PPO首ratio误差1.4e-5，KL与clip均未饱和，PID也能响应outage变化。
 
 这正是短筛与最终实验的边界。600k可以拒绝公式错误、梯度泄漏、信号塌缩和数值发散，不能可靠拒绝一个已经观察到慢热现象的LSTM策略。所以下一条只把同配置延长到2M，不调学习率、tail index或PID；最终用固定新随机流512条轨迹先检验outage是否进入[0.18,0.22]，再比较reward。若仍失败，head-only隔离实验最多只导向一次shared-backbone消融，不恢复大范围组合搜索。
+
+### 13.149 head-only证明风险信用的瓶颈是表示方向，不是信号幅度（2026-07-18）
+
+C-H25在2M/fresh512把reward从C-H18的0.990显著提高到1.609，却把outage从0.232显著提高到0.471；outage差95%区间[0.181,0.294]完全为正。lambda最终超过1，state quantile-GAE标准差约0.245，PPO ratio/KL/clip均正常，所以失败不能再解释为风险项没启动、importance ratio漏做或梯度太小。
+
+head-only的本质限制是共享recurrent feature从未被cost loss塑形。reward/policy不断移动表示坐标，独立state head只能追踪；它可以产生很大的TD/GAE残差，却不保证残差与动作导致的未来违约同向。结果是高方差信号配合高lambda仍不能压低outage。这个证据也说明单纯增加quantile数量或加密查询点不会修复信用方向。
+
+最后只验证一次QCPO_refs原始核心：state cost loss与policy/value共同更新MLP+LSTM、按同一PPO epoch时钟更新，并让cost quantile-GAE使用参考gamma=0.99。Weibull权重始终为正且只改变0.5到1.5倍幅度，不是当前方向错误的首要修复。若共享核心仍不能在lambda升高后把outage带回0.20附近，就停止算法扩展，把现有最佳稳定配置和失败边界作为最终结论。

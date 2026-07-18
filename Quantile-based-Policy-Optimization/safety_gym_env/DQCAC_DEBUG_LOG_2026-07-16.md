@@ -2049,3 +2049,21 @@
 - PPO首epoch ratio最大误差`1.42e-5`，末KL/clip fraction为`.001589/.07943`，8个epoch全部执行；说明新risk advantage冻结在behavior rollout上且没有产生明显PPO饱和。PID能在outage首次升到`.275`后抬高lambda，并出现`.150→.225→.100→.200→.175→.300`的反馈响应，闭环已连通但仍在振荡。
 - 按E177预注册，C-H24属于“机制健康、短期性能差”，不能因600k终点拒绝。C-H25原样扩大到2M：seed1、B40、1个warmup、C20/A8、网络、head、GAE、PPO和PID全部冻结；仅`num_iterations:15→50`并更换名称/checkpoint目录。依据实测预计纯训练14--17分钟、内置128与同步2--4分钟，总计16--21分钟。
 - 2M后先跑固定eval seed20000 fresh512。晋级条件仍是outage点估计进入`[.18,.22]`且reward至少不低于C-H18同test`.98955`，目标是进一步提高；若outage超带，即使reward更高也失败。若head-only不通过，最多再验证一条共享主干路线，不扫描其余次要组件。
+
+### E179：C-H25 2M与fresh512——head-only显著提高reward但风险信用方向失败（2026-07-18）
+
+- C-H25持久化训练exit0，W&B run `md6l4x4c` finished并同步；纯训练`828.6s`、总墙钟`917s`，49个Actor/PID事件、1000个critic step和392个Actor step完成，无NaN/Inf/OOM。2M训练末reward/outage/lambda为`1.676/.450/1.286`，内置128为`1.65253/.42969`。
+- 后20%训练C-H18→C-H25 reward由`1.1547→1.629`，outage由`.3075→.5175`，lambda由`.4614→1.283`。高lambda没有把策略稳定拉回工作点；1.4--2M多数batch outage仍在`.425--.625`。这是reward--risk交换，不是前沿支配。
+- 固定eval seed20000 fresh512中，C-H18为reward/outage `.989551/119÷512=.232422`，C-H25为`1.608736/241÷512=.470703`。reward差`+.619185`的Welch95为`[+.559306,+.679064]`；outage差`+.238281`的Newcombe95为`[+.180674,+.293646]`，两项都显著增加。outage区间远离`[.18,.22]`，正式裁决`reject_no_seed_expansion`。
+- 失败不是数值塌缩。末state-head总/QR/mean loss为`.02052/.00710/.02685`，prediction/target mean为`1.3742/1.3713`，缩放后mean MAE`.1252`，grad norm`.00841`；state advantage std反而升到`.2450`。首ratio误差`1.81e-5`，末KL/clip `.000649/.02743`，PPO仍稳定。
+- 关键是“非零”不等于“方向正确”。600k时state advantage后段std约`.1531`，同批action-CDF约`.00552`；2M进一步放大，却不能在lambda>1时压低真实outage。head-only禁止cost loss写入MLP/LSTM，因此共享表示只服务reward/policy，state head只能追踪不断漂移的feature，不能主动形成可泛化的cost ordering。
+- fresh action-Q诊断的AUC由C-H18 `.5562`升到`.6245`，但CDF只报`.3659`而truth `.4707`，predicted/true mean cost为`13.281/19.174`；action-Q又不驱动本分支Actor。故不能用AUC局部改善掩盖最终约束失败，也不能把问题归因于PPO importance ratio或PID没启动。
+- 完整2M W&B曲线位于`_runs/profiles/dqc_ch18_vs_ch25_stateqgae_headonly_2m_s1_2026-07-18/`；fresh512 CSV/JSON/PNG位于`_runs/profiles/dqc_ch18_vs_ch25_stateqgae_headonly_2m_s1_test512_e20000_2026-07-18/`，两张PNG均已解码验证。未创建一次性脚本。
+
+### E180：唯一后续C-H26——QCPO_refs式shared-backbone核心对齐预注册（2026-07-18）
+
+- 不再调head-only系数、tail index、PID或quantile数量。C-H26把QCPO_refs中首轮有意隔离掉的三项作为一个明确的“参考核心包”迁移：①state-cost QR+mean loss与policy/reward-V在同一MLP+LSTM上联合反传；②每个8次PPO epoch更新一次state head，而不是按20次action-Q critic时钟单独更新；③quantile-GAE/one-step target使用参考`discount=gamma=.99`，而不是DQCAC undiscounted cost的`cost_gamma=1`。
+- 这不是单参数消融，而是回答“QCPO_refs稳定性是否来自共享cost representation及其原始时钟”的最终关键验证。Weibull density-ratio本轮仍不加入：源码把优势乘以`1+log(ratio)`，经clip后始终为正且约在`[.5,1.5]`，不能修复head-only的方向错误；若核心包都失败，不再用Weibull或IQN延长搜索。
+- 新模式必须默认关闭并保持旧/head-only逐位回归；shared模式不得创建第二个head optimizer，cost head与MLP/LSTM只由actor Adam更新。rollout前冻结old log-prob、state quantile-GAE和targets；每个epoch重新前向当前共享feature。新增state advantage与trajectory outage label相关、head/body/LSTM梯度范数，区分“有方差”与“有条件方向”。
+- 工程门先做解析公式、梯度可达性/无双优化器、time-major、checkpoint重载和小规模持久化smoke。正式先跑seed1/B40/T1000/C20/A8/QR32/LSTM512、warmup0的600k；除参考核心包外沿用C-H18的PPO/PID/normalization配置。预计开发与门30--60分钟，600k纯训练约4--6分钟、评估约1--2分钟。
+- 600k仍只作机制筛选：要求cost梯度确实进入body/LSTM、state/outage相关不退化、PPO ratio正确且lambda升高后outage方向合理；通过才跑2M+fresh512。失败则停止新算法扩展，回到已验证最佳C-H18配置并完成最终文档，不再展开更多路线。
