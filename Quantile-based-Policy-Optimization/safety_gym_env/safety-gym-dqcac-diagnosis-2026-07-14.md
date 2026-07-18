@@ -2208,3 +2208,11 @@ C-H21说明把actor学习率翻倍只能恢复PPO KL，不能恢复稳定前沿�
 工程证据已覆盖默认关闭逐位回归、time-major解析切片、小网络启用smoke、checkpoint重载和正式B80单事件。默认路径四个checkpoint全部module tensor与旧结果逐位相同；B80门实际得到40个critic和16个actor step，首ratio误差1.72e-5，66.59秒完成且全部有限。说明当前已不是“代码能不能跑”的问题，下一条2M正式run会直接回答多个B40小步能否同时保留B80降噪和B40 reward学习速度。
 
 仍需诚实记录一个极小差异：actor scheduler按rollout事件而非optimizer step推进，所以C-H22是25次、B40是50次调度；由于调度尺度b=10000，终点LR差约0.22%，远小于C-H21的2倍LR改动，首轮不再同时修它。正式判断继续是outage先进入[0.18,0.22]，再看reward是否至少0.94并争取超过0.9896；低于0.18但reward下降不算好，高于0.22不算满足约束。
+
+
+### 13.144 C-H22结论：恢复B40 optimizer时钟不足以恢复reward（2026-07-18）
+
+- B80拆成两个B40独立Adam子步后，critic/actor总step和trajectory exposure都与B40对齐，fresh outage点估计也落到`.1953`；但fresh reward只有`.8123`，与B80整批`.8330`统计上无差别，并显著低于B40的`.9896`。因此C-H20的reward损失不能主要归因于Adam step数减半。
+- 关键未对齐的时钟仍是rollout/控制器事件：B40有50次新on-policy数据、risk cache刷新和PID更新，B80只有25次。C-H22在同一个B80 risk cache上连续做16个actor step；importance ratio虽然正确地始终相对原behavior policy，并由clip控制，但条件风险权重本身不会随这些子步刷新。训练中outage与lambda仍呈明显相位循环。
+- 这区分了两个概念：PPO的off-policy修正已正确，分母应一直是采样策略概率，不能每个子步改存当前策略概率；当前问题更像risk target/控制信号陈旧，而不是漏做importance ratio。后续若继续该方向，应优先测试“Actor小步与risk重新查询/控制器时钟解耦”，而不是继续放大LR、增加第三个minibatch或单纯扩大num_envs。
+- 因为用户目标是outage约等于.20后最大化reward，C-H22虽比C-H20更接近约束，也不能晋级：reward显著下降。下一正式候选应同时预注册双侧outage带与reward门，避免把更安全但更低收益误记为改善。

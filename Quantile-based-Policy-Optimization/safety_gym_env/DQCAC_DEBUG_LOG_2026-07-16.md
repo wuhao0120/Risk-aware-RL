@@ -1975,3 +1975,16 @@
 - 使用压力seed1从头训练，W&B online名称/tag仅含公开算法语义，不含路径或隐私；通过`launch_background.sh`持久化。单事件门与C-H20正式耗时共同估算纯训练约15--25分钟，内置128约2分钟、共同eval seed20000 fresh512约4分钟，总计约21--31分钟。根分区不写大文件，全部checkpoint/W&B/log继续位于vepfs工作区。
 - C-H18已经证明1M可能误杀慢热策略，因此除NaN/Inf/OOM、ratio断言或确定工程错误外跑满2M，不以早期reward低作性能早停。机制门为首ratio`<1e-3`、40/16 step计数正确、全部有限，后段KL/clip不持续饱和。
 - 正式晋级仍按双侧目标：fresh512 outage必须进入`[.18,.22]`，然后reward至少`.94`，目标是不低于同test B40 seed1 `.98955`。`outage<.18`且reward下降记过度保守，`outage>.22`记风险预算超支，不能把更低outage自动算提升。通过才原样扩seed0/2；失败则停止该分支，不扫描B60/B100或第三个minibatch，并转向PID--actor时钟解耦/leave-one-out trajectory风险基线等下一项消融。
+
+
+### E172：C-H22正式结果——约束命中但reward未恢复，optimizer时钟不是主要瓶颈（2026-07-18）
+
+- 正式job `DQCAC_DynamicButton_ch22_b80_optmb40_batchrho1_target0175_2m_s1`绑定提交`d8ac0dd`，由`launch_background.sh`持久化完成、exit0；W&B run `76q0yofg` finished并同步。相对C-H20只增加`optimizer_minibatch_trajectories=40`，即每个B80 rollout在每个epoch拆成两个完整B40 trajectory子批，各自执行独立Adam step；PID、risk cache、GAE、rollout behavior log-prob和batch-rho1仍在完整B80上冻结。
+- 25个event全部完成，每event实际40个critic step、16个actor step，总计1000/400，与C-H18 B40完全相同；首behavior-ratio最大误差`1.7166e-5`，末次聚合KL/clip约`.001961/.10875`，无NaN、Inf、OOM或shape错误。纯训练`1015.4s`，约比C-H20的`924.2s`慢9.9%，其中包含本次较慢的W&B初始化；单event工程门耗时`66.59s`与C-H20的`66.42s`近似。
+- 训练闭环没有消除循环。outage从1.04M的`.200`升至1.52M的`.338`，随后降至2M pre-update的`.163`；lambda同步从0升至约`.319`再回到`.164`。末20% reward/outage/lambda为`.8221/.2325/.2533`，只是相位最终落在较安全一侧，不能解释为单调收敛。
+- 内置128回合reward/outage为`.8236/.2031`。独立eval seed20000的fresh512由持久化后台正常exit0，得到reward `.812337`、outage `100/512=.195313`，Wilson95 `[.16330,.23187]`；点估计严格进入预注册双侧工作带`[.18,.22]`，但reward低于最低门`.94`，更低于目标B40基线`.98955`，因此按规则不扩seed0/2。
+- 相对同测试流C-H20 B80整批，reward变化`-.02067`、Welch95 `[-.07708,+.03573]`，outage变化`-.03125`、Newcombe95 `[-.08111,+.01877]`，两项区间都跨0。恢复Adam step数没有带来可确认的reward提升；它可能把终点风险推低，但不能排除评估噪声。
+- 相对C-H18 B40，reward差`-.17721`的Welch95为`[-.23600,-.11843]`，是明确损失；outage差`-.03711`的Newcombe95为`[-.08718,+.01316]`，不能确认真实下降。故“B80 reward差主要因为optimizer step减半”被否定；剩余差异更符合每80条才更新一次Actor/PID、整批risk cache在16个actor step中陈旧，以及PID响应滞后的组合。
+- fresh critic仍不能提供可靠条件risk credit：hard/smooth CDF为`.16309/.16715`而truth为`.19531`，hard Brier/AUC/BSS为`.16478/.5241/-4.85%`，mean-cost误差`.31715`。相对B40虽Brier下降9.1%，BSS反而下降3.28个百分点且AUC接近随机；较低总体Brier主要受较低outage基率影响，不能当作critic变好。
+- eval-only最初因checkpoint恢复训练时mini-B40、而评估`num_envs=40`触发“mini必须小于full batch”校验。修复`be8b3ab`在eval-only加载后把纯训练参数`optimizer_minibatch_trajectories`重置为0，不改变网络或checkpoint权重；B2烟雾测试和正式B40并行fresh512均exit0。训练checkpoint中保存的16次actor更新诊断仍被保留。
+- 四run完整训练profile与对齐图位于`_runs/profiles/dqc_ch18_b40_ch20_b80_ch21_lr2_ch22_optmb40_2m_s1_2026-07-18/`；C-H18/C-H22和C-H20/C-H22的CSV、统计JSON、PNG位于对应`_runs/profiles/dqc_ch18_b40_vs_ch22_.../`及`dqc_ch20_b80_vs_ch22_.../`目录，PNG均已做文件格式验证。正式裁决为`reject_no_seed_expansion_constraint_hit_but_reward_failed`，节省约40--50分钟无效多seed计算。
