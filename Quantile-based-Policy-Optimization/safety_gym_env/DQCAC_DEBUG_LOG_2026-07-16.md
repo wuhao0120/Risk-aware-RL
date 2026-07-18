@@ -1847,3 +1847,20 @@
 - 长度因果门：2M run的1M checkpoint/history必须与C-H17 seed2在公共网络、lambda、已保存PID/runtime状态和非eval指标上exact或解释所有预期差异；轻量评估checkpoint不保存optimizer，不能声称对未保存状态做过比较。若总预算被scheduler读取而导致前1M不同，则不能把结果称为纯长度延长，必须停止并报告。
 - 2M宽screen要求数值有限、reward≥.65且outage在`[.05,.40]`。长度晋级门要求fresh reward至少比1M提高.05到`≥.76253`，且outage点估计进入原严格带`[.18,.22]`；若reward提高但outage> .24，说明只是沿reward--risk前沿变激进，不算训练时长修复。若reward不足或后1M趋势转平/反复，则停止长预算解释，不跑seed0/1的2M。
 - 只有弱seed同时通过reward和risk门，才把相同2M预算扩seed0/1；三seed 2M通过后才讨论5M与QCPO_refs统一预算。当前不继续setpoint小数插值，也不与retention guard、IQN、quantile加密或新PID组件混合。
+
+### E159：C-H18弱seed 2M长度审计——训练太短假设成立，但critic仍弱（2026-07-18）
+
+- 正式job `DQCAC_DynamicButton_ch18_batchref_rho1_pidtarget0175_b40_2m_s2`绑定提交`f3f6329`，持久化后台exit0；W&B run `muht6zqr` finished。相对C-H17 seed2只把25×B40=1M改为50×B40=2M，独占纯训练`793.9s`，比14--16分钟预估略快；50个Actor/PID事件、1000 critic updates全部完成，无非有限值。
+- 长度因果门完全通过。1M边界checkpoint与原C-H17 seed2的43个module leaves、1个lambda tensor、81个runtime/PID leaves和5个rollout metrics逐位相同，差异数0、最大绝对差0；配置只差`num_iterations`、checkpoint/W&B名称和固定预算tag。故后1M变化可归因于新增长度，不是初始化、并发、代码或调度器。
+- 内部128由1M的reward/outage `.7356/.2344`变为2M的`.9457/.2031`，通过宽screen。随后fresh512由`.71253/119÷512=.23242`改善为`.93826/99÷512=.19336`；2M reward95为`[.88216,.99437]`，outage Wilson95为`[.16149,.22980]`。点估计进入原`[.18,.22]`带并接近alpha=.20。
+- reward差`+.22574`的Welch95为`[+.15845,+.29302]`，显著通过预注册+.05门；outage差`-.03906`的Newcombe95为`[-.08904,+.01113]`，方向有利但区间跨0。准确结论是“reward提升明确、outage点估计同时改善”，不能说outage下降已统计显著。
+- 后20%训练reward均值`.95023`、斜率`+.4382/M`，相对1M末20%的`.61386`明显提高。同期训练batch outage为`.2775±.09966`、lambda `.3127±.1424`，范围仍大；最终fresh安全不代表PID--actor周期已经消失。2M最后几批处在高lambda后的安全相位，继续更长预算可能再次移动工作点，因此必须扩seed而不能只选这个终点。
+- 性能改善不是distributional critic全面变准。fresh hard/smooth CDF error从`.02625/.02436`恶化到`.04968/.05338`，mean-cost error从`1.085`增到`3.275`；Brier下降10.5%但因基率变化，BSS从`-5.57%`进一步到`-8.12%`，AUC只有`.5211`。trajectory residual在critic较弱时仍给出风险方向，reward actor靠更长训练恢复；critic仍是超过QCPO_refs的主要算法缺口。
+- 正式证据位于`_runs/profiles/dqc_ch17_1m_vs_ch18_2m_batchrho1_target0175_s2_fresh512_2026-07-18/`和`_runs/profiles/dqc_ch18_batchrho1_target0175_s2_full2m_2026-07-18/`，包含fresh CSV/JSON/PNG与完整2M曲线；W&B导出在对应`_runs/wandb_export/`目录。
+
+### E160：C-H18 seed0/1 2M扩展预注册（2026-07-18）
+
+- 按E158成功分支，seed0/1各自从头复用C-H18全部参数，仅改随机seed和输出名；不调PID target、rho、LR、quantile或checkpoint。两条严格串行独占，避免1M多seed时并发把单run从454s拖到约800s；每条预计纯训练13--15分钟、内部128约1--2分钟、fresh512约3--4分钟，两条总墙钟约36--44分钟。
+- 两条都要在1M边界与各自C-H17 checkpoint做公共module/tensor/runtime/metrics exact检查。内部数值有限、reward≥.65且outage在`[.05,.40]`后，无论结果漂亮与否都做fresh512；不根据训练末批挑checkpoint。
+- 2M三seed主报告以seed为重复单位：逐seed原值、sample mean±SD、paired 1M→2M差和合并episode比例并列。严格晋级要求至少2/3 seed outage在`[.18,.22]`、三seed mean outage也在该带、mean reward≥.90且不允许任何seed reward<.80；同时1M→2M reward平均至少+.05，不能靠提高mean outage超过+.01换取。
+- 若严格晋级，C-H18成为2M主候选，再预注册与QCPO_refs统一5M预算；若只在seed2成功或终点随周期分叉，则不直接跑5M，先做末段多checkpoint稳定性/闭环减振。critic AUC/BSS仍作为解释指标，不因策略过门就取消；retention guard、IQN和quantile加密继续作为独立消融，不与长度扩展混合。

@@ -2143,3 +2143,11 @@ target=.15到.175使C-H16→C-H17的reward和outage分别显著增加0.1594和0.
 retention guard不解决这个问题。它只在上一rollout Brier恶化时回滚cost critic与Adam，既不改PID target，也不直接训练reward actor。三seed中只有seed0的Brier Skill为正；seed1/2的条件风险排序仍弱，而seed2的主要症状是reward学习慢。此时开启guard更可能限制critic更新，不能解释或保证reward恢复。
 
 seed2后段训练reward仍有正斜率，因此一次从头2M长度审计是合理的。它只增加预算，并用1M公共前缀exact检查排除初始化/代码差异；fresh reward至少提高0.05且outage进入[0.18,0.22]才支持“1M太短”。若只提高reward同时把outage推高，则仍是沿前沿换风险，不是算法效率提升。
+
+### 13.137 2M证明weak seed主要是慢热，但好策略仍建立在弱critic上（2026-07-18）
+
+C-H18与C-H17 seed2的前1M checkpoint和history逐位相同，新增后1M把fresh reward从0.7125提高到0.9383，95%差区间[0.1585,0.2930]；outage还从0.2324降到0.1934。这个结果直接回答“1M是否太短”：对这个LSTM+GAE-PPO+batch residual组合，答案是肯定的。早期弱seed不是初始化后永久坏掉，新增训练让它进入高reward且目标附近的工作点。
+
+但不能把成功解释为cost distribution已经学准。2M fresh hard-CDF误差约0.050、mean-cost误差3.28、AUC 0.521、BSS -8.1%，比1M多项更差。更合理的机制是reward actor获得足够更新，trajectory二元残差在弱critic上提供了可用的总体风险方向；distributional critic对状态动作的细粒度排序仍没有稳定超过常数基率。
+
+训练batch的末段outage均值0.278、标准差0.100，而final fresh为0.193，说明终点仍受PID周期相位影响。2M结果是真实独立评估，不是小样本假象，但也不是收敛平台证明。因此下一步必须把相同2M预算扩seed0/1并保留1M前缀exact门；只有多seed工作点都在0.20附近且reward稳定，才有资格投入5M与QCPO_refs公平终局。
