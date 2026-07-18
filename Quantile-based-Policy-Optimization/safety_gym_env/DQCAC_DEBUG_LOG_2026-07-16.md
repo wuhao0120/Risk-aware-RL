@@ -2085,3 +2085,15 @@
 - 纯state-cost辅助梯度最后仍到达body/LSTM/head：`.00430/.00338/.00475`；实际联合梯度最后为`.04288/.01973/.00111`。首epoch ratio最大误差`2.2829e-5`，末KL/clip为`.001227/.0554`，8个PPO epoch没有饱和。
 - 闭环出现正确的一批延迟方向：480k/520k outage从`.225→.300`时lambda从`.0069→.0915`，下一批outage降到`.175`；lambda降至`.0304`后下一批outage回到`.250`。样本少，不能证明稳定控制，但足以排除head-only那种高lambda下持续向高outage跑的明显反方向。
 - 按E180预注册晋级2M，不调任何系数。新run仍从同seed1重新开始，B40×50、warmup0、C20/A8、共享state QR+mean、discount.99、PPO/PID全部冻结；600k前缀应可逐tensor审计。预计纯训练14--17分钟、内置128和W&B同步2--4分钟、fresh512约4分钟，总计20--25分钟。
+
+### E183：C-H27 2M最终裁决——共享表示可训练，但未形成可用的动作风险信用（2026-07-18）
+
+- 首次2M任务在任何rollout前因W&B 180秒初始化超时退出，未产生训练数据或checkpoint；retry只把外部握手超时改为600秒，算法配置不变。retry由持久化后台正常exit0，W&B run `q2899vfh` finished，纯训练`813.3s`。其200k前缀与600k筛选在公共网络、tensor、runtime和metrics上全部逐位一致，差异数0。
+- C-H27完成B40×50×T1000=2M、50个Actor/PID事件、1000/400个critic/actor optimizer step，无NaN/Inf/OOM。后20%训练reward/outage/lambda为`1.585/.530/1.359`，最终为`1.570/.500/1.4119`；内置128为`1.656/.46875`。高lambda没有把outage带回`.20`附近。
+- 机制没有断线：后20% state-advantage/outage相关为`.1890`，末值`.2239`，state-risk std为`.1363`；纯cost梯度继续到达body/LSTM/head，后20%范数为`.01530/.00698/.00276`。首epoch ratio误差始终小于`4.953e-5`，后20% PPO clip/KL为`.02698/.000677`。因此不能归因于importance ratio、梯度消失、PPO饱和或数值错误。
+- 但600k后方向质量没有继续改善：相关性由600k后段`.2646`降到2M后段`.1890`；state crossing约`.4123`，scaled mean MAE后段约`.0716`。共享cost表示改善了状态级预测，却没有稳定学出动作级因果排序。
+- 固定eval seed20000的fresh512中，C-H27 reward/outage为`1.613182/253÷512=.494141`；C-H18控制为`.989551/119÷512=.232422`。reward差`+.623631`的Welch95为`[+.562545,+.684716]`，outage差`+.261719`的Newcombe95为`[+.203929,+.317002]`。奖励和风险都显著上升，远离双侧工作带`[.18,.22]`，正式裁决`reject_stop_algorithm_expansion`。
+- C-H27与head-only C-H25也无明确优势：reward差`+.004446`，95%区间`[-.052185,+.061077]`；outage差`+.023438`，95%区间`[-.037652,+.084281]`。共享表示没有把head-only的高风险前沿推回目标。
+- fresh critic hard-CDF为`.53174`而truth `.49414`，Brier/AUC/BSS为`.28128/.56847/-12.53%`；概率排序仍弱。Brier只是概率校准诊断，不进入本轮loss，也不是新控制机制。
+- 最关键结论：DQCACBeta目前缺的不是更多quantile、CDF平滑、IQN、Weibull缩放或PID小数调参，而是能区分“当前动作如何改变未来违约概率”的action-conditioned causal credit。state-value GAE只能给同一状态序列分配风险，不能单独解决动作归因；继续提高其表示精度只会让错误或不完整的credit更精确。
+- 按E180停止扩展，不跑seed0/2、不跑5M，也不混入IQN/Weibull掩盖失败。当前可复用基线回到C-H18：2M三seed reward/outage为`1.03991±.12271/.23372±.03687`，虽未严格稳定命中`.20`，但它是现有DQCAC中风险最接近目标且reward最高的可复用配置。完整曲线、fresh比较和最终建议见`summary.md`。

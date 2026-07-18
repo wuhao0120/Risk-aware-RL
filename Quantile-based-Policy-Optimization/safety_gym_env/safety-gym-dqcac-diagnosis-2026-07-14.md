@@ -2280,3 +2280,15 @@ off-policy边界保持不变。行为策略的log probability、reward/cost GAE�
 cost监督也不再只是追逐漂移feature。共享模式的缩放后mean MAE降到0.0478，MLP、LSTM和head持续收到纯cost梯度；PPO ratio、KL和clip仍在正常范围。训练末端还出现了符合闭环预期的一批延迟：lambda上升后outage由0.30降到0.175，lambda回落后outage又升到0.25。单个周期不足以证明收敛，却足以通过机制筛选。
 
 因此600k应晋级2M，而不是按短期128回合outage提前停止。正式裁决仍只看独立fresh512：outage先进入[0.18,0.22]，然后reward至少不低于C-H18的0.9896并争取超过它。若2M再度出现高lambda而outage持续上升，说明共享表示仍不足；届时停止，不用IQN、更多quantile或Weibull掩盖根因。
+
+### 13.152 最终结论：共享state-cost表示修复了“能否学”，没有修复“该怪哪个动作”（2026-07-18）
+
+C-H27给出了一个清楚的否定结果。共享MLP+LSTM后，cost监督确实进入body和LSTM，state quantile-GAE与trajectory outage标签也由近零相关升到600k后段约0.265；这说明QCPO_refs的共享表示组件有真实作用。可是到2M后相关降到约0.189，高lambda下outage仍升到约0.53。fresh512的reward/outage为1.6132/0.4941，与head-only的1.6087/0.4707统计上无明确差别，且都远离目标0.20。
+
+所以最终问题不是实现错误或更新次数不够。PPO始终用rollout时冻结的behavior probability作分母，首epoch ratio误差小于5e-5；每次epoch后保存当前概率作为新分母反而是错误的。GAE、观测归一化、LSTM、共享cost梯度和PID都已工作。它们修复了旧版本“均值和quantile不涨”的工程问题，却不能自动生成动作级风险因果信用。
+
+state-value cost distribution学习的是“沿当前行为策略，从这个历史状态出发有多危险”。同一状态下不同动作的相对风险仍要由Q(s,a)或等价的反事实估计提供。当前action-Q advantage后段标准差约0.00388，和trajectory标签相关约0.003；这才是瓶颈。state quantile-GAE有更大方差，但主要包含状态/时间风险，不能可靠告诉Actor哪个动作应被抑制。lambda变大时，Actor仍可能沿高reward、高outage方向移动。
+
+这也解释了为什么更多quantile、查询点局部加密、平滑CDF和IQN不是当前第一修复。冻结策略实验中IQN到600k可把总体CDF/mean误差改善约16.1%/19.4%，N64可偶然把总体CDF点误差降得很小，但Brier、crossing或mean并未同步通过门；它们提高表示精度，不补动作归因。Weibull正权缩放和scalar PID也只能改风险梯度幅度或闭环工作点，不能把错误方向改对。
+
+现阶段推荐保留C-H18作为DQCACBeta主基线，并如实报告它的三seed 2M结果，而不是把高reward、高outage的C-H25/C-H27当进步。若以后继续研究，只保留一个最高优先级：构造并验证真正action-conditioned的风险优势，例如共享recurrent表示上的distributional Q(s,a)-V(s)或trajectory score-function加状态依赖baseline；首先要求该优势对动作扰动/未来违约有可重复的排序能力，再投入完整闭环训练。其余组件只作为该核心通过后的消融。
