@@ -1827,3 +1827,23 @@
 - 两个run逐项复用C-H17，仅改随机seed与checkpoint/name/tag；每个仍为B40×25×T1000=1M、C20/A8、batch-reference rho1、PID target=.175、QR32/MC、LSTM512、obs RMS、GAE-PPO和脱敏W&B online。128核、227GiB内存、A100 80GiB当前空闲，两个40-env任务并行预计单run纯训练约8--10分钟、共同墙钟约10--13分钟；若资源竞争使吞吐或数值异常则停止并改串行，不能把并发差异当算法差异。
 - 每个seed训练后先做内部128宽screen，有限且reward≥.60、outage在`.05--.40`才做独立512。报告所有seed原值、Wilson/reward区间、seed均值/标准差和相对C-H8同seed结果；不只汇报最好seed。
 - 严格稳健性报告同时保留两层：逐seed仍按`[.18,.22]`判带内；组层面检查三seed mean outage是否在该带、变异是否小于C-H8/P-M8，并比较mean reward。只有risk接近目标且reward优势不由单一seed驱动，才把C-H17升级为最终候选；否则转向闭环减振或状态动作risk credit，不继续调seed1 setpoint。
+
+### E157：C-H17三seed结果——risk工作点更一致，但reward优势尚不稳健（2026-07-18）
+
+- seed0/2首次并发启动均在训练前因W&B默认90秒`init_timeout`退出，exit1且env step为0；不是容量、权限、GPU或算法错误。串行完成在线握手并设置`WANDB_INIT_TIMEOUT=180`后，retry run `l9fqp53h/91e81k7l`均finished；seed1为`pmt9uwtz`。上传配置继续经`wandb_public_config`脱敏，评估禁用W&B。失败空run不进入任何性能统计。
+- retry只改变外部W&B握手超时和run名，不改变算法配置。seed0/2并发纯训练为`803.0s/779.8s`，显著慢于seed1独占的`454.5s`；共同墙钟仍较串行短，但以后正式训练按仓库纪律独占执行，避免CPU worker竞争。三个run均为1M步、25个Actor/PID事件、无NaN/OOM，后段风险修正/critic标准差比约等于1。
+- 独立fresh512结果为：seed0 reward/outage `.94081/110÷512=.21484`，seed1 `.91604/115÷512=.22461`，seed2 `.71253/119÷512=.23242`。严格`[.18,.22]`只有seed0通过；seed1/2分别高上界`.00461/.01242`，不能按“约等于.20”取消逐seed失败标签。
+- 三seed C-H17 reward为`.85646±.12526`、outage为`.22396±.00881`（seed sample SD）；合并事件`344/1536=.22396`，Wilson95为`[.20381,.24548]`。相比C-H8的`.76631±.04637/.21094±.04115`，reward均值提高`.09015`，outage均值提高`.01302`；但n=3配对t95分别为`[-.20674,.38703]`与`[-.07727,.10331]`，均跨0，不能宣布跨seed统计显著。
+- 分seed相对C-H8的reward差为`+.20634/+.09654/-.03243`。seed0/1的episode-level Welch区间分别为`[+.13580,+.27687]`与`[+.04524,+.14784]`，seed2为`[-.09319,+.02832]`；因此两seed显著提高、弱seed无显著变化，而不是三seed一致支配。outage差为`+.04688/-.02539/+.01758`，每个Newcombe区间都跨0。
+- C-H17把跨seed outage SD从`.04115`降到`.00881`，下降约78.6%，说明batch residual+target .175把不同初始化的风险工作点聚到约.224附近；这是比P-M8的`.250±.06796`更稳定的进步。但它仍有约+.024的系统偏差，且reward SD扩大到.125，不能只看聚合均值升级为最终配置。
+- fresh critic只有seed0显示可靠的条件信息：seed0 hard Brier/AUC/BSS为`.1649/.6146/+2.25%`，seed1为`.1942/.5583/-11.52%`，seed2为`.1883/.5375/-5.57%`。所以retention guard不启用；它只能依据旧rollout Brier回滚cost critic，不能修复seed2的reward慢学习，也不是outage setpoint控制器。
+- 正式多seedCSV/JSON/图位于`_runs/profiles/dqc_ch17_batchrho1_target0175_b40_1m_multiseed_2026-07-18/`，完整W&B history位于对应`_runs/wandb_export/`目录；另有三组逐seed C-H8/C-H17比较图。当前结果仍是1M筛选，远不能和QCPO_refs的5M reward `1.6696`作最终排序。
+
+### E158：C-H18弱seed 2M长度审计预注册（2026-07-18）
+
+- 选择seed2而不是seed0/1，是因为它fresh reward最低`.71253`，但训练末20% reward均值`.61386`、全程斜率`+.70097/M`，仍有慢热可能。用最弱seed检验“1M太短”比继续延长最好seed更保守，也能直接回答用户关于短训练误杀的质疑。
+- C-H18从头训练，逐项复用C-H17 seed2，只把`num_iterations=25→50`，得到B40×50×T1000=2M；不从轻量eval checkpoint伪续训，因为该checkpoint不保存完整optimizer/RNG/env状态。PID target=.175、batch-rho1、C20/A8、QR32/MC、LSTM512、obs RMS、GAE-PPO、LR及W&B脱敏均不变。
+- 独占资源预计纯训练约14--16分钟，内部128约1--2分钟；通过宽screen才做fresh512约3--4分钟，总计约19--22分钟。使用`launch_background.sh`和W&B online，`WANDB_INIT_TIMEOUT=180`只影响外部握手。
+- 长度因果门：2M run的1M checkpoint/history必须与C-H17 seed2在公共网络、lambda、已保存PID/runtime状态和非eval指标上exact或解释所有预期差异；轻量评估checkpoint不保存optimizer，不能声称对未保存状态做过比较。若总预算被scheduler读取而导致前1M不同，则不能把结果称为纯长度延长，必须停止并报告。
+- 2M宽screen要求数值有限、reward≥.65且outage在`[.05,.40]`。长度晋级门要求fresh reward至少比1M提高.05到`≥.76253`，且outage点估计进入原严格带`[.18,.22]`；若reward提高但outage> .24，说明只是沿reward--risk前沿变激进，不算训练时长修复。若reward不足或后1M趋势转平/反复，则停止长预算解释，不跑seed0/1的2M。
+- 只有弱seed同时通过reward和risk门，才把相同2M预算扩seed0/1；三seed 2M通过后才讨论5M与QCPO_refs统一预算。当前不继续setpoint小数插值，也不与retention guard、IQN、quantile加密或新PID组件混合。

@@ -2133,3 +2133,13 @@ C-H17的fresh512为reward/outage 0.9160/0.2246。outage比预注册工程带上�
 target=.15到.175使C-H16→C-H17的reward和outage分别显著增加0.1594和0.0625，证明PID setpoint能控制reward--risk工作点。但风险修正比仍逐批精确为1时，末20% outage标准差却从0.0339升至0.1042，范围达到0.125--0.400。这说明current-batch配平修复的是残差增益漂移，不是整个PID--actor闭环；二项观测噪声、PID积分记忆和Actor响应时延仍会产生周期。
 
 因此不再针对seed1插值setpoint。seed0/2只作为预注册稳健性审计：保留seed1严格near-miss标签，检查高reward与目标附近risk是否跨seed存在。如果三seed分散，下一步应做闭环减振或改善状态动作risk credit；如果三seed整体落在目标附近且reward优势稳定，再把batch-rho1/target=.175作为最终候选。
+
+### 13.136 C-H17降低了跨seed风险方差，但没有解决弱seed的reward学习（2026-07-18）
+
+三条fresh512显示一个比单seed更有价值的结构：C-H17 outage为0.2148/0.2246/0.2324，seed标准差只有0.0088；C-H8是0.1680/0.2500/0.2148，标准差0.0412。current-batch trajectory residual把风险工作点聚到约0.224，跨seed方差下降约79%，说明它确实在提供比纯critic advantage更稳定的风险方向。
+
+但它不是最终胜利。严格[0.18,0.22]只有1/3 seed通过，三seed平均0.224仍略高；reward均值0.856高于C-H8的0.766，但差值由seed0/1驱动，seed2为0.713且相对基线差异区间跨0。以seed为重复单位时n=3区间很宽，所以不能把1536条episode合并后伪装成算法有1536个独立训练重复。
+
+retention guard不解决这个问题。它只在上一rollout Brier恶化时回滚cost critic与Adam，既不改PID target，也不直接训练reward actor。三seed中只有seed0的Brier Skill为正；seed1/2的条件风险排序仍弱，而seed2的主要症状是reward学习慢。此时开启guard更可能限制critic更新，不能解释或保证reward恢复。
+
+seed2后段训练reward仍有正斜率，因此一次从头2M长度审计是合理的。它只增加预算，并用1M公共前缀exact检查排除初始化/代码差异；fresh reward至少提高0.05且outage进入[0.18,0.22]才支持“1M太短”。若只提高reward同时把outage推高，则仍是沿前沿换风险，不是算法效率提升。
