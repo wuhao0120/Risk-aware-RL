@@ -2250,3 +2250,9 @@ C-H23的工程和数学链路都正确：leave-one-out baseline不含本轨迹�
 首轮采用head-only是为了可归因：state distribution head读取当前recurrent feature，但其QR与mean-anchor损失不更新MLP/LSTM；只有Actor loss能更新共享表示。公式解析测试、梯度隔离、默认逐位回归、持久化训练smoke与checkpoint重载均已通过。短smoke不能证明收益，只把“代码错误”风险降到可接受水平。
 
 接下来先跑600k seed1机制筛选，但不把600k当最终性能裁决。只要head学习有限、risk advantage不塌缩、PPO比例正确且闭环有合理响应，即使初期reward不高也跑满2M；最终仍按fresh512 outage进入双侧`[0.18,0.22]`后最大化mean reward。head-only若在2M失败，最多再验证一次shared-backbone；IQN、N=64、查询点加密、Weibull和PID小数扫描暂缓，避免用表示细节绕开风险credit根因。
+
+### 13.148 600k只证明state quantile-GAE信号可训练，不证明性能已提高（2026-07-18）
+
+C-H24在600k时内置reward/outage为0.699/0.313，训练末也为0.623/0.300，短期性能明确没有超过旧C-H18。保留它的理由不是美化终点，而是预注册机制门全部通过：state risk advantage标准差0.153而非近零，state head的缩放后mean MAE约0.075，PPO首ratio误差1.4e-5，KL与clip均未饱和，PID也能响应outage变化。
+
+这正是短筛与最终实验的边界。600k可以拒绝公式错误、梯度泄漏、信号塌缩和数值发散，不能可靠拒绝一个已经观察到慢热现象的LSTM策略。所以下一条只把同配置延长到2M，不调学习率、tail index或PID；最终用固定新随机流512条轨迹先检验outage是否进入[0.18,0.22]，再比较reward。若仍失败，head-only隔离实验最多只导向一次shared-backbone消融，不恢复大范围组合搜索。

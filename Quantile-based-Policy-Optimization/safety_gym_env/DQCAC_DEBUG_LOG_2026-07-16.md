@@ -2040,3 +2040,12 @@
 - 600k只作机制门，不能因早期reward低就判最终性能失败。继续到2M的条件是：全部有限、首epochratio误差`<1e-3`、state-head loss/误差没有持续爆炸、state risk advantage保持非退化方差、Actor/PID对风险信号有可解释响应且PPO不过度持续clip。即使600k reward尚未超过C-H18，也只要机制健康就继续；只有NaN/OOM、序列/ratio断言、head发散、risk advantage塌缩或完全错误方向才提前停止。
 - 600k采用持久化`launch_background.sh`、脱敏W&B online、每200k checkpoint；根据旧C-H18 2M约13.2分钟及新head额外recurrent forward，预计纯训练6--10分钟，内置128评估后总计约8--13分钟。若晋级，2M单seed预计20--30分钟，fresh512约4分钟；通过双侧outage带`[.18,.22]`且reward不降后才扩seed0/2。
 - 若head-only机制健康但2M性能不通过，只允许再做一条QCPO_refs式shared-backbone消融；其余IQN、局部quantile加密、N=64、Weibull和PID细扫全部暂缓。这样本阶段只解决关键问题，不继续铺开低优先级组合。
+
+### E178：C-H24 600k机制筛选通过、C-H25 2M性能验证预注册（2026-07-18）
+
+- C-H24持久化job正常exit0，W&B run `hc206zg9` finished并同步3个文件。纯训练`260.8s`，总墙钟`347s`；14个Actor/PID事件、300个critic step和112个Actor step全部完成，无NaN/Inf/OOM或序列断言。
+- 600k训练末reward/outage/lambda为`.623/.300/.1506`，同seed C-H18为`.667/.225/.0069`；内置128为`.69947/.31250`。短期主指标没有改善，尤其outage明显超出工作带，因此不能把本轮写成性能提升。
+- 机制门通过：state risk advantage mean/std为`.00457/.15345`，没有塌缩；state-head总/QR/mean loss为`.006368/.000970/.010796`，prediction/target mean为`.93034/.92654`，缩放后mean MAE`.07519`，head grad norm`.001138`，均有限且未触发grad clip。固定tau输出crossing约`.419`，GAE按参考实现排序后使用；它是需要继续监控的表示缺陷，但不是600k停止条件。
+- PPO首epoch ratio最大误差`1.42e-5`，末KL/clip fraction为`.001589/.07943`，8个epoch全部执行；说明新risk advantage冻结在behavior rollout上且没有产生明显PPO饱和。PID能在outage首次升到`.275`后抬高lambda，并出现`.150→.225→.100→.200→.175→.300`的反馈响应，闭环已连通但仍在振荡。
+- 按E177预注册，C-H24属于“机制健康、短期性能差”，不能因600k终点拒绝。C-H25原样扩大到2M：seed1、B40、1个warmup、C20/A8、网络、head、GAE、PPO和PID全部冻结；仅`num_iterations:15→50`并更换名称/checkpoint目录。依据实测预计纯训练14--17分钟、内置128与同步2--4分钟，总计16--21分钟。
+- 2M后先跑固定eval seed20000 fresh512。晋级条件仍是outage点估计进入`[.18,.22]`且reward至少不低于C-H18同test`.98955`，目标是进一步提高；若outage超带，即使reward更高也失败。若head-only不通过，最多再验证一条共享主干路线，不扫描其余次要组件。
