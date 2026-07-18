@@ -2067,3 +2067,12 @@
 - 新模式必须默认关闭并保持旧/head-only逐位回归；shared模式不得创建第二个head optimizer，cost head与MLP/LSTM只由actor Adam更新。rollout前冻结old log-prob、state quantile-GAE和targets；每个epoch重新前向当前共享feature。新增state advantage与trajectory outage label相关、head/body/LSTM梯度范数，区分“有方差”与“有条件方向”。
 - 工程门先做解析公式、梯度可达性/无双优化器、time-major、checkpoint重载和小规模持久化smoke。正式先跑seed1/B40/T1000/C20/A8/QR32/LSTM512、warmup0的600k；除参考核心包外沿用C-H18的PPO/PID/normalization配置。预计开发与门30--60分钟，600k纯训练约4--6分钟、评估约1--2分钟。
 - 600k仍只作机制筛选：要求cost梯度确实进入body/LSTM、state/outage相关不退化、PPO ratio正确且lambda升高后outage方向合理；通过才跑2M+fresh512。失败则停止新算法扩展，回到已验证最佳C-H18配置并完成最终文档，不再展开更多路线。
+
+### E181：C-H26共享主干实现与工程门通过（2026-07-18）
+
+- 新增`cost_state_gradient_mode=shared_backbone`。该模式不创建独立state-head optimizer；Actor Adam拥有policy、reward-V、cost quantile head及共享MLP+LSTM的全部参数。每个PPO epoch在一次当前策略forward中计算policy loss、reward-value loss和state-cost QR+mean loss，按固定顺序相加后只执行一次`backward/clip/step`。
+- rollout behavior log-prob、state quantile-GAE和QR/mean targets都在本轮任何optimizer step前冻结。每个PPO epoch只重算当前策略分子与当前共享feature，importance ratio仍为`pi_current/pi_behavior`，不会把上一个epoch的概率错误保存为新分母。
+- 新增独立`cost_state_discount`；默认`None`继续使用历史`cost_gamma`，因此head-only保持原值1。C-H26显式设`.99`，与QCPO_refs的state-cost Bellman/GAE折扣一致。旧action-Q仍按C-H18训练但只作诊断，不驱动shared分支Actor。
+- 持久化shared smoke使用seed509、B4/T32、C3/A2、QR8/LSTM32、warmup0，共384步，纯训练21.0秒、exit0；首ratio最大误差`4.7624e-5`，checkpoint独立eval-only恢复exit0。纯state-cost辅助梯度到达body/LSTM分别为`.26405/.06606`，cost-head联合梯度`.30993`，全部有限且非零。
+- 修改前后head-only用相同seed507/config重新跑384步，逐项比较final checkpoint：modules、running tensors、runtime和全部公共metrics的mismatch均为0，最大tensor差0；唯一新增字段是`cost_state_discount`。因此共享实现没有改变旧对照权重、RNG、PID或PPO。
+- 下一步只跑C-H26 seed1/B40 600k机制筛选。若共享梯度、state/outage关系与闭环方向正常，再原样扩2M和fresh512；若lambda上升仍不能降低outage或信用方向明显错误，按E180停止，不展开IQN、CDF平滑、quantile加密或Weibull。

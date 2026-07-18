@@ -2264,3 +2264,11 @@ C-H25在2M/fresh512把reward从C-H18的0.990显著提高到1.609，却把outage�
 head-only的本质限制是共享recurrent feature从未被cost loss塑形。reward/policy不断移动表示坐标，独立state head只能追踪；它可以产生很大的TD/GAE残差，却不保证残差与动作导致的未来违约同向。结果是高方差信号配合高lambda仍不能压低outage。这个证据也说明单纯增加quantile数量或加密查询点不会修复信用方向。
 
 最后只验证一次QCPO_refs原始核心：state cost loss与policy/value共同更新MLP+LSTM、按同一PPO epoch时钟更新，并让cost quantile-GAE使用参考gamma=0.99。Weibull权重始终为正且只改变0.5到1.5倍幅度，不是当前方向错误的首要修复。若共享核心仍不能在lambda升高后把outage带回0.20附近，就停止算法扩展，把现有最佳稳定配置和失败边界作为最终结论。
+
+### 13.150 QCPO_refs核心差异已经按同一优化器时钟接入（2026-07-18）
+
+shared-backbone模式现在不是在旧DQCAC旁边再训练一个head，而是复现参考实现真正关键的耦合：policy、reward value、state cost distribution读取同一MLP+LSTM表示，cost QR和mean目标在每个PPO epoch与policy/value共同反传。这样cost损失可以主动塑造历史表示，不再只能追逐reward主干产生的漂移坐标。
+
+off-policy边界保持不变。行为策略的log probability、reward/cost GAE和state distribution targets在rollout后一次冻结；后续8个epoch始终以原behavior probability为分母。每次更新后保存新前向概率并作为下一次分母并不正确，那会把标准PPO改成逐步近端链，掩盖策略相对原数据分布的累计漂移。
+
+384步工程门证明纯state-cost梯度同时进入MLP、LSTM与cost head，首ratio误差小于5e-5，checkpoint可独立恢复；head-only旧路径逐tensor完全一致。现在剩余不确定性已经从“代码是否接错”收缩为“共享cost representation能否学到足够正确的条件风险方向”。600k只筛机制，2M与fresh512才裁决性能；若这条核心路线失败，继续加quantile数量、IQN或Weibull只是在错误信用上提高分辨率或缩放幅度，不再投入正式预算。

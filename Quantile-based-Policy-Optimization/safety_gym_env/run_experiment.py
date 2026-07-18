@@ -210,6 +210,8 @@ def base_args(algo, seed, device, env_key):
         a.cost_state_value_grad_clip = 10.0
         a.cost_state_value_cost_scale = 10.0
         a.cost_state_gae_lambda = 0.97
+        # None沿用历史cost_gamma；QCPO_refs共享主干实验显式设为0.99。
+        a.cost_state_discount = None
         a.cost_state_huber_kappa = 1.0
         a.cost_state_quantile_loss_coef = 1.0
         a.cost_state_mean_loss_coef = 0.5

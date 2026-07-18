@@ -650,6 +650,12 @@ class DQCACBetaGPU(VecAgentBase):
             args, 'cost_state_value_cost_scale', 10.0))
         self.cost_state_gae_lambda = float(getattr(
             args, 'cost_state_gae_lambda', self.gae_lambda))
+        # None保留历史cost_gamma；正式QCPO_refs共享主干路线显式使用0.99，
+        # 避免把DQCAC原先未折扣cost口径误当作参考实现的cost Bellman折扣。
+        cost_state_discount = getattr(args, 'cost_state_discount', None)
+        self.cost_state_discount = float(
+            self.cost_gamma if cost_state_discount is None
+            else cost_state_discount)
         self.cost_state_huber_kappa = float(getattr(
             args, 'cost_state_huber_kappa', 1.0))
         self.cost_state_quantile_loss_coef = float(getattr(
@@ -759,11 +765,11 @@ class DQCACBetaGPU(VecAgentBase):
             if self.optimizer_minibatch_trajectories != 0:
                 raise ValueError(
                     "QCPO state quantile-GAE currently requires full-batch optimizer steps")
-            if self.cost_state_gradient_mode != 'head_only':
+            if self.cost_state_gradient_mode not in {
+                    'head_only', 'shared_backbone'}:
                 raise ValueError(
-                    "first QCPO state quantile-GAE ablation requires "
-                    "cost_state_gradient_mode='head_only'; shared_backbone is a "
-                    "separate follow-up after the isolated credit test")
+                    "cost_state_gradient_mode must be 'head_only' or "
+                    "'shared_backbone'")
             if self.cost_state_value_lr <= 0.0:
                 raise ValueError("cost_state_value_lr must be positive")
             if self.cost_state_value_grad_clip < 0.0:
@@ -774,6 +780,8 @@ class DQCACBetaGPU(VecAgentBase):
                     "cost_state_value_cost_scale must be positive")
             if not 0.0 <= self.cost_state_gae_lambda <= 1.0:
                 raise ValueError("cost_state_gae_lambda must lie in [0,1]")
+            if not 0.0 < self.cost_state_discount <= 1.0:
+                raise ValueError("cost_state_discount must lie in (0,1]")
             if self.cost_state_huber_kappa <= 0.0:
                 raise ValueError("cost_state_huber_kappa must be positive")
             if self.cost_state_quantile_loss_coef < 0.0:
@@ -1583,6 +1591,7 @@ class DQCACBetaGPU(VecAgentBase):
               f"/grad{self.cost_state_gradient_mode}"
               f"/scale{self.cost_state_value_cost_scale:g}"
               f"/gae{self.cost_state_gae_lambda:g}"
+              f"/discount{self.cost_state_discount:g}"
               f"/norm{self.cost_state_advantage_norm}, "
               f"actor_cost_query={self.cost_actor_query_mode}"
               f"/mcfix{self.cost_actor_mc_correction_coef:g}"
@@ -4665,7 +4674,8 @@ class DQCACBetaGPU(VecAgentBase):
             batch['costs'].reshape(n, B) / self.cost_state_value_cost_scale)
         one_step_target = (
             scaled_cost.unsqueeze(-1)
-            + self.cost_gamma * not_done.unsqueeze(-1) * next_distribution)
+            + self.cost_state_discount
+            * not_done.unsqueeze(-1) * next_distribution)
         temporal_difference = one_step_target - sorted_distribution
 
         # 反向递推保留每条环境轨迹和每个quantile独立的eligibility trace；
@@ -4674,7 +4684,8 @@ class DQCACBetaGPU(VecAgentBase):
         running_advantage = torch.zeros(
             B, self.num_quantiles,
             dtype=sorted_distribution.dtype, device=self.device)
-        trace_discount = self.cost_gamma * self.cost_state_gae_lambda
+        trace_discount = (
+            self.cost_state_discount * self.cost_state_gae_lambda)
         for t in range(n - 1, -1, -1):
             running_advantage = (
                 temporal_difference[t]
@@ -4723,12 +4734,13 @@ class DQCACBetaGPU(VecAgentBase):
         self.last_cost_state_actor_advantage_std = float(
             selected_actor.std(unbiased=False).item())
 
-    def _cost_state_value_objective(self, actor_features, batch):
+    def _cost_state_value_objective(
+            self, actor_features, batch, detach_feature=True):
         """
         计算QCPO_refs尺度的state-cost QR + mean-value监督，返回可反传标量。
 
-        actor_features在head_only路径已经detach；因此backward只会产生
-        actor.cost_value参数梯度。prediction tau与target tau做完整NxN配对，
+        detach_feature=True时只训练head；False时梯度继续进入共享MLP+LSTM。
+        prediction tau与target tau做完整NxN配对，
         所有transition/head/target元素取mean，严格对应参考quantile_huber_loss。
         """
         if not self.cost_state_value_enabled or self.actor.cost_value is None:
@@ -4749,7 +4761,7 @@ class DQCACBetaGPU(VecAgentBase):
                 "state cost quantile target must have shape [T*B,N]")
 
         prediction = self.actor.cost_distribution(
-            actor_features, detach_feature=True)
+            actor_features, detach_feature=detach_feature)
         if not bool(torch.isfinite(prediction).all()):
             raise FloatingPointError(
                 "state cost exp head produced non-finite quantiles")
@@ -5150,6 +5162,11 @@ class DQCACBetaGPU(VecAgentBase):
         cell0 = transform(batch['c0'])[0].unsqueeze(0).contiguous()
 
         shared_cost_enabled = self.cost_shared_backbone_coef > 0.0
+        state_cost_shared_enabled = (
+            self.cost_state_value_enabled
+            and self.cost_state_gradient_mode == 'shared_backbone')
+        state_cost_loss = observations.new_zeros(())
+        state_cost_info = {}
         if shared_cost_enabled:
             if self.cost_shared_gradient_mode == 'adapter':
                 # policy/value使用正常可微adapter；cost分支重新对base.detach()应用同一个
@@ -5172,6 +5189,23 @@ class DQCACBetaGPU(VecAgentBase):
             shared_cost_loss, shared_cost_info = (
                 self._shared_backbone_reference_cost_loss(
                     shared_cost_features, batch))
+        elif state_cost_shared_enabled:
+            # 与QCPO_refs一致，policy、reward-V和state-cost分布共享同一次
+            # MLP+LSTM forward；cost QR+mean loss直接塑造循环表示和cost head。
+            means, log_stds, value_pred, _final_state, actor_features = self.actor(
+                observations, prev_actions, prev_rewards, (hidden0, cell0),
+                return_features=True)
+            state_cost_features = self._inverse_transform_recurrent(
+                actor_features, B).reshape(n * B, self.actor.lstm_size)
+            state_cost_loss, state_cost_info = self._cost_state_value_objective(
+                state_cost_features, batch, detach_feature=False)
+            shared_cost_loss = observations.new_zeros(())
+            shared_cost_info = {
+                'shared_cost/qr_loss': 0.0,
+                'shared_cost/mean_loss': 0.0,
+                'shared_cost/objective_loss': 0.0,
+                'shared_cost/weighted_loss': 0.0,
+            }
         else:
             # 默认关闭分支保留历史四元actor forward，保证旧checkpoint数值路径不变。
             means, log_stds, value_pred, _final_state = self.actor(
@@ -5244,6 +5278,23 @@ class DQCACBetaGPU(VecAgentBase):
                     risk_weight_flat = batch['_cost_state_actor_advantage']
                     batch['_risk_advantage_action_cdf_raw'] = (
                         action_cdf_advantage.detach())
+                    # 同一trajectory的outage标签沿time重复；正相关表示更高的
+                    # state quantile-GAE确实指向更可能违约的行为片段。
+                    centered_state_advantage = raw_adv_c - raw_adv_c.mean()
+                    centered_outage_label = (
+                        risk_components['label']
+                        - risk_components['label'].mean())
+                    correlation_denominator = (
+                        centered_state_advantage.pow(2).mean().sqrt()
+                        * centered_outage_label.pow(2).mean().sqrt())
+                    state_outage_correlation = torch.where(
+                        correlation_denominator > 1e-12,
+                        (centered_state_advantage
+                         * centered_outage_label).mean()
+                        / correlation_denominator.clamp_min(1e-12),
+                        torch.zeros_like(correlation_denominator))
+                    batch['_cost_state_outage_label_correlation'] = float(
+                        state_outage_correlation.item())
                 else:
                     raw_adv_c = action_cdf_advantage
                     if self.advantage_norm == 'qcpo':
@@ -5337,9 +5388,48 @@ class DQCACBetaGPU(VecAgentBase):
             total_loss = primary_loss + shared_cost_loss
             gradient_info = self._shared_objective_gradient_stats(
                 primary_loss, shared_cost_loss)
+        elif state_cost_shared_enabled:
+            # 参考实现每个PPO epoch用同一个Adam联合更新policy、reward-V、
+            # state-cost quantiles和共享MLP+LSTM，不再额外执行独立head step。
+            total_loss = primary_loss + state_cost_loss
         else:
             # coef=0保持原表达式与加法顺序，避免默认回归因无效+0改变浮点图。
             total_loss = primary_loss
+
+        # 每个rollout只额外测一次纯state-cost梯度，证明辅助目标确实能到达
+        # MLP、LSTM与cost head；autograd.grad不写Parameter.grad，因此真正参数
+        # 更新仍只有下方total_loss.backward和actor Adam这一次。
+        if (state_cost_shared_enabled
+                and '_cost_state_aux_body_grad_norm' not in batch):
+            state_groups = [
+                list(self.actor.body.parameters()),
+                list(self.actor.lstm.parameters()),
+                list(self.actor.cost_value.parameters()),
+            ]
+            state_parameters = [
+                parameter for group in state_groups for parameter in group]
+            state_gradients = torch.autograd.grad(
+                state_cost_loss, state_parameters, retain_graph=True,
+                create_graph=False, allow_unused=True)
+            offset = 0
+            state_group_norms = []
+            for group in state_groups:
+                squared_norm = observations.new_zeros(
+                    (), dtype=torch.float32)
+                for gradient in state_gradients[
+                        offset:offset + len(group)]:
+                    if gradient is not None:
+                        squared_norm += (
+                            gradient.detach().float().pow(2).sum())
+                state_group_norms.append(float(squared_norm.sqrt().item()))
+                offset += len(group)
+            for name, value in zip(
+                    ('body', 'lstm', 'head'), state_group_norms):
+                if not np.isfinite(value) or value <= 0.0:
+                    raise FloatingPointError(
+                        f"state-cost auxiliary {name} gradient must be "
+                        "finite and nonzero")
+                batch[f'_cost_state_aux_{name}_grad_norm'] = value
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         approx_kl = ((ratio.detach() - 1.0) - log_ratio.detach()).mean()
@@ -5353,6 +5443,7 @@ class DQCACBetaGPU(VecAgentBase):
         lstm_grad_norm = torch.zeros((), device=self.device)
         policy_head_grad_norm = torch.zeros((), device=self.device)
         value_head_grad_norm = torch.zeros((), device=self.device)
+        state_cost_head_grad_norm = torch.zeros((), device=self.device)
         cost_head_grad_present = 0.0
 
         def component_grad_norm(parameters):
@@ -5369,7 +5460,7 @@ class DQCACBetaGPU(VecAgentBase):
             grad_norm = torch.zeros((), device=self.device)
         else:
             total_loss.backward()
-            if shared_cost_enabled:
+            if shared_cost_enabled or state_cost_shared_enabled:
                 body_grad_norm = component_grad_norm(
                     self.actor.body.parameters())
                 lstm_grad_norm = component_grad_norm(
@@ -5378,6 +5469,16 @@ class DQCACBetaGPU(VecAgentBase):
                     self.actor.mu.parameters())
                 value_head_grad_norm = component_grad_norm(
                     self.actor.value.parameters())
+            if state_cost_shared_enabled:
+                # policy/reward-V不连接cost head，因此这里是纯state-cost目标梯度；
+                # body/lstm范数则是三个目标联合后的实际optimizer梯度。
+                state_cost_head_grad_norm = component_grad_norm(
+                    self.actor.cost_value.parameters())
+                if (not bool(torch.isfinite(state_cost_head_grad_norm))
+                        or float(state_cost_head_grad_norm.item()) <= 0.0):
+                    raise FloatingPointError(
+                        "shared state-cost head gradient must be finite and nonzero")
+            if shared_cost_enabled:
                 cost_head_grad_present = float(any(
                     parameter.grad is not None
                     for parameter in self.cost_critic.parameters()))
@@ -5395,6 +5496,52 @@ class DQCACBetaGPU(VecAgentBase):
                 batch['_shared_cost_feature_dirty'] = True
             with torch.no_grad():
                 self.actor.log_std.clamp_(self.log_std_min, self.log_std_max)
+
+        if state_cost_shared_enabled:
+            # cost head只连接state目标，所以该范数是纯cost梯度；主干joint范数
+            # 则是PPO、reward-V和cost三者实际合成后送入actor Adam的梯度。
+            state_cost_info.update({
+                'critic/cost_state_grad_norm': float(
+                    state_cost_head_grad_norm.item()),
+                'critic/cost_state_grad_clip_fraction': 0.0,
+                'critic/cost_state_aux_body_grad_norm': float(
+                    batch['_cost_state_aux_body_grad_norm']),
+                'critic/cost_state_aux_lstm_grad_norm': float(
+                    batch['_cost_state_aux_lstm_grad_norm']),
+                'critic/cost_state_aux_head_grad_norm': float(
+                    batch['_cost_state_aux_head_grad_norm']),
+                'critic/cost_state_joint_body_grad_norm': float(
+                    body_grad_norm.item()),
+                'critic/cost_state_joint_lstm_grad_norm': float(
+                    lstm_grad_norm.item()),
+                'critic/cost_state_joint_head_grad_norm': float(
+                    state_cost_head_grad_norm.item()),
+                'debug/cost_state_value_enabled': 1.0,
+                'debug/cost_state_gradient_is_head_only': 0.0,
+                'debug/cost_state_gradient_is_shared_backbone': 1.0,
+            })
+            self.last_cost_state_value_info = {
+                'value_loss': state_cost_info[
+                    'critic/cost_state_value_loss'],
+                'quantile_loss': state_cost_info[
+                    'critic/cost_state_quantile_loss'],
+                'mean_loss': state_cost_info[
+                    'critic/cost_state_mean_loss'],
+                'prediction_mean': state_cost_info[
+                    'critic/cost_state_prediction_mean'],
+                'target_mean': state_cost_info[
+                    'critic/cost_state_target_mean'],
+                'mean_abs_error': state_cost_info[
+                    'critic/cost_state_mean_abs_error'],
+                'crossing_fraction': state_cost_info[
+                    'critic/cost_state_crossing_fraction'],
+                'grad_norm': state_cost_info[
+                    'critic/cost_state_grad_norm'],
+                'aux_body_grad_norm': state_cost_info[
+                    'critic/cost_state_aux_body_grad_norm'],
+                'aux_lstm_grad_norm': state_cost_info[
+                    'critic/cost_state_aux_lstm_grad_norm'],
+            }
 
         # value explained variance 与 MLP 路径同定义；这里的 grad_norm 是共享骨干
         # policy+value 联合梯度，另用 joint 键明确标注，避免误读为纯 value 梯度。
@@ -5437,6 +5584,7 @@ class DQCACBetaGPU(VecAgentBase):
                 value_head_grad_norm.item()),
             'shared_cost/cost_head_grad_present': cost_head_grad_present,
             **shared_cost_info,
+            **state_cost_info,
             **gradient_info,
             'advantage/mean_adv_std': float(
                 batch['_reward_advantage_raw'].std(unbiased=False).item()),
@@ -5470,6 +5618,8 @@ class DQCACBetaGPU(VecAgentBase):
                 batch.get('_cost_state_behavior_mean', 0.0)),
             'advantage/cost_state_target_mean': float(
                 batch.get('_cost_state_target_mean', 0.0)),
+            'advantage/cost_state_outage_label_correlation': float(
+                batch.get('_cost_state_outage_label_correlation', 0.0)),
             'advantage/risk_critic_adv_std': float(
                 batch['_risk_advantage_critic_raw'].std(
                     unbiased=False).item()),
@@ -6323,9 +6473,12 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_state_value_enabled),
             'debug/cost_state_gradient_is_head_only': float(
                 self.cost_state_gradient_mode == 'head_only'),
+            'debug/cost_state_gradient_is_shared_backbone': float(
+                self.cost_state_gradient_mode == 'shared_backbone'),
             'debug/cost_state_value_cost_scale': (
                 self.cost_state_value_cost_scale),
             'debug/cost_state_gae_lambda': self.cost_state_gae_lambda,
+            'debug/cost_state_discount': self.cost_state_discount,
             'debug/cost_state_target_index': float(
                 self.cost_state_target_index),
             'debug/cost_state_tail_index': float(
@@ -6757,6 +6910,7 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_state_value_cost_scale': (
                 self.cost_state_value_cost_scale),
             'cost_state_gae_lambda': self.cost_state_gae_lambda,
+            'cost_state_discount': self.cost_state_discount,
             'cost_state_huber_kappa': self.cost_state_huber_kappa,
             'cost_state_quantile_loss_coef': (
                 self.cost_state_quantile_loss_coef),
