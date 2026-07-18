@@ -2076,3 +2076,12 @@
 - 持久化shared smoke使用seed509、B4/T32、C3/A2、QR8/LSTM32、warmup0，共384步，纯训练21.0秒、exit0；首ratio最大误差`4.7624e-5`，checkpoint独立eval-only恢复exit0。纯state-cost辅助梯度到达body/LSTM分别为`.26405/.06606`，cost-head联合梯度`.30993`，全部有限且非零。
 - 修改前后head-only用相同seed507/config重新跑384步，逐项比较final checkpoint：modules、running tensors、runtime和全部公共metrics的mismatch均为0，最大tensor差0；唯一新增字段是`cost_state_discount`。因此共享实现没有改变旧对照权重、RNG、PID或PPO。
 - 下一步只跑C-H26 seed1/B40 600k机制筛选。若共享梯度、state/outage关系与闭环方向正常，再原样扩2M和fresh512；若lambda上升仍不能降低outage或信用方向明显错误，按E180停止，不展开IQN、CDF平滑、quantile加密或Weibull。
+
+### E182：C-H26 600k共享主干机制筛选通过，晋级2M（2026-07-18）
+
+- 正式job绑定提交`86f6230`，由持久化后台正常exit0；W&B run `3vv7hqzf` finished并同步3个文件。B40×15×T1000=600k、warmup0、C20/A8全部完成，纯训练`255.1s`，无NaN/Inf/OOM或梯度断言。
+- 训练末reward/outage/lambda为`.6441/.2500/.0847`，内置128为`.7097/.3203`。同预算后20% reward/outage为`.6083/.2417`；C-H18为`.6349/.1417`，head-only为`.5616/.2250`。因此本轮尚无短期性能优势，尤其128条outage仍超目标，不能写成最终提升。
+- 机制方向明显优于head-only：state advantage与同trajectory真实outage标签相关性从`.0624`升至末值`.2756`，后20%均值`.2646`；state risk std末段`.0765`且末值`.0736`，未塌缩。state总loss由`.01583`降至`.001621`，缩放后mean MAE由`.1021`降至`.04782`，优于head-only末值`.07519`。
+- 纯state-cost辅助梯度最后仍到达body/LSTM/head：`.00430/.00338/.00475`；实际联合梯度最后为`.04288/.01973/.00111`。首epoch ratio最大误差`2.2829e-5`，末KL/clip为`.001227/.0554`，8个PPO epoch没有饱和。
+- 闭环出现正确的一批延迟方向：480k/520k outage从`.225→.300`时lambda从`.0069→.0915`，下一批outage降到`.175`；lambda降至`.0304`后下一批outage回到`.250`。样本少，不能证明稳定控制，但足以排除head-only那种高lambda下持续向高outage跑的明显反方向。
+- 按E180预注册晋级2M，不调任何系数。新run仍从同seed1重新开始，B40×50、warmup0、C20/A8、共享state QR+mean、discount.99、PPO/PID全部冻结；600k前缀应可逐tensor审计。预计纯训练14--17分钟、内置128和W&B同步2--4分钟、fresh512约4分钟，总计20--25分钟。

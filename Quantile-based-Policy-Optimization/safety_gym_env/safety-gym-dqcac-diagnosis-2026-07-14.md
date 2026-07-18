@@ -2272,3 +2272,11 @@ shared-backbone模式现在不是在旧DQCAC旁边再训练一个head，而是�
 off-policy边界保持不变。行为策略的log probability、reward/cost GAE和state distribution targets在rollout后一次冻结；后续8个epoch始终以原behavior probability为分母。每次更新后保存新前向概率并作为下一次分母并不正确，那会把标准PPO改成逐步近端链，掩盖策略相对原数据分布的累计漂移。
 
 384步工程门证明纯state-cost梯度同时进入MLP、LSTM与cost head，首ratio误差小于5e-5，checkpoint可独立恢复；head-only旧路径逐tensor完全一致。现在剩余不确定性已经从“代码是否接错”收缩为“共享cost representation能否学到足够正确的条件风险方向”。600k只筛机制，2M与fresh512才裁决性能；若这条核心路线失败，继续加quantile数量、IQN或Weibull只是在错误信用上提高分辨率或缩放幅度，不再投入正式预算。
+
+### 13.151 共享cost表示首次产生了可观测的违约方向信息（2026-07-18）
+
+600k结果没有直接超过控制组：内置reward/outage为0.710/0.320，真实约束仍未满足。但它与head-only的关键区别不是优势方差大小，而是优势方向开始与真实trajectory标签对齐。state quantile-GAE与outage标签的相关性在训练末段约0.265，末值0.276；head-only此前只能证明std非零，无法证明方向正确。
+
+cost监督也不再只是追逐漂移feature。共享模式的缩放后mean MAE降到0.0478，MLP、LSTM和head持续收到纯cost梯度；PPO ratio、KL和clip仍在正常范围。训练末端还出现了符合闭环预期的一批延迟：lambda上升后outage由0.30降到0.175，lambda回落后outage又升到0.25。单个周期不足以证明收敛，却足以通过机制筛选。
+
+因此600k应晋级2M，而不是按短期128回合outage提前停止。正式裁决仍只看独立fresh512：outage先进入[0.18,0.22]，然后reward至少不低于C-H18的0.9896并争取超过它。若2M再度出现高lambda而outage持续上升，说明共享表示仍不足；届时停止，不用IQN、更多quantile或Weibull掩盖根因。
