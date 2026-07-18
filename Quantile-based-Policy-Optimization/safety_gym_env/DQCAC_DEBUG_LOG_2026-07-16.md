@@ -1916,3 +1916,10 @@
 - 由于C-H18已证明1M会误杀慢热策略，B80正式run不按前300k/1M reward早停；只有NaN/Inf/OOM、ratio断言或确定工程错误才停止。性能晋级要求fresh512 outage进入`[.18,.22]`，reward至少.94且目标不低于参考.98955；低于.18且reward下降判过度保守，高于.22判风险不足。通过才原样扩seed0/2，不扫描B60/B100/B120或同时改target/rho。
 - 若B80只降低训练raw outage抖动却fresh仍失败，说明剩余主因是policy响应/条件risk credit而非独立标签数；下一步转明确的控制器/actor时钟或风险估计器改动。若reward/outage同时改善，则B80作为工程组件晋级，最终仍需三seed2M和统一5M QCPO_refs比较。
 
+### E166：C-H20 B80完整event工程门通过（2026-07-18）
+
+- 持久化smoke使用B80×T1000、C20/A8、batch-rho1、PID target .175/W100和正式LSTM512配置，单个完整event纯训练66.42秒、exit0；80条trajectory、1次Actor事件、1次PID事件全部完成，PID事件确认接收80条完整cost。
+- 首个PPO epoch的`max|ratio-1|=1.7166e-5`，远低于1e-3门；没有OOM、NaN、Inf、shape广播或worker泄漏。短评估16回合reward/outage `.054/.062`只验证链路，不进入性能判断。
+- checkpoint写入`rollout_step000080000.pt`与`final_post_update.pt`。独立持久化eval-only使用不同eval seed和B4 worker成功重建B80训练配置、加载`phase=post_update_final, step=80000`并完成4回合，exit0；证明num_envs只影响采样批量，不把checkpoint结构锁死在B80。
+- 工程门全部通过，按E165启动正式seed1 2M。基于smoke每80k约66秒的保守外推为27.5分钟，但单event包含固定初始化/保存开销且C-H18整段实测约13分钟；正式训练墙钟预估修订为13--24分钟，内部128与fresh512另约5--7分钟。不会用smoke的短策略表现早停正式run。
+
