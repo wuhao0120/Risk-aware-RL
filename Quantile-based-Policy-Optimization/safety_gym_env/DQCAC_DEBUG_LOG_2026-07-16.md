@@ -1956,3 +1956,22 @@
 - fresh cost critic仍弱：hard/smooth CDF为`.26514/.26706`而truth为`.31445`，绝对误差`.04932/.04739`；hard Brier/AUC/BSS为`.21803/.5671/-1.14%`，predicted/true mean cost为`10.349/12.254`。相对C-H20，CDF、smooth-CDF、mean-cost和Brier误差分别恶化29.5%/38.4%/43.8%/20.8%；不能把风险超支归因于critic已经给出更准确而Actor单纯更激进。
 - 正式裁决为`reject_stop_lr_scaling_no_seed_expansion`。不试9e-4/1.2e-3，也不因训练末reward接近1而忽略outage。结果支持下一条若继续B80，应使用多个较小optimizer step而非一次更大Adam step，并保持整批PID统计；真正trajectory minibatch必须冻结整批old log-prob、GAE与risk weights，不能把现有只累积梯度的`critic_minibatch_size`误当成optimizer minibatch。
 - 完整W&B history与三run对齐曲线位于`_runs/wandb_export/dqc_ch18_b40_ch20_b80_ch21_b80_actorlr6e4_2m_s1_2026-07-18/`和同名`_runs/profiles/`。fresh比较CSV/JSON/PNG分别位于`_runs/profiles/dqc_ch20_b80_vs_ch21_b80_actorlr6e4_2m_s1_test512_e20000_2026-07-18/`及`dqc_ch18_b40_vs_ch21_b80_actorlr6e4_2m_s1_test512_e20000_2026-07-18/`；三张PNG均已解码验证，未创建临时脚本。
+
+### E170：C-H22 B80采样、2×B40 trajectory optimizer-minibatch实现与工程门（2026-07-18）
+
+- 新增`optimizer_minibatch_trajectories`，默认`0`严格保留历史整批Adam；正数按完整环境trajectory拆分，每个子批执行独立optimizer step。它与`critic_minibatch_size`不同：后者只把同一个整批loss分块backward并执行一次Adam，不能恢复B80丢失的优化时钟。首轮实现有意只开放已经验证的recurrent/GAE-PPO/actor-feature/MC-QR/online主线，拒绝IQN/NQ、crossfit/preupdate、replay、retention guard、Weibull、shared/adapter、feature refresh、direct CDF、s0辅助、target-KL与critic chunk组合，避免首个性能结果混入多变量。
+- recurrent切片以环境trajectory索引为唯一单位：`[T,B,*]`沿B切，`[T*B,*]`先还原time-major再切B并展平，`[B,*]`沿episode切，`[K,T*B,A]` baseline action显式还原为`[K,T,B,A]`。纯张量编号测试选择env `[3,1]`后，state/action/old-logprob/GAE/cost feature/baseline action/h0均得到`[3,1,7,5,11,9]`的正确time-major序列，证明没有把LSTM轨迹或风险标签交叉配对。
+- 完整B80上的GAE/value target、rollout `old_log_probs`和cost trajectory标签在采样后冻结；首个actor epoch前，使用完成两个B40 critic step后的同一online critic在完整B80上只查询一次risk CDF、K个behavior baseline action和batch-rho1尺度，只推进一次component/constraint EMA。随后两个B40 actor子批只切片缓存。importance ratio的分母始终是采样时保存的`π_behavior(a|h)`；每个子批step重新计算当前策略分子，不保存上一个更新后的probability作为新分母，否则会把PPO目标错误改成逐step近端链。
+- 每个optimizer epoch使用独立CPU generator打乱80条trajectory；该RNG不推进policy Gaussian action噪声。两个B40 critic各自`zero_grad/backward/clip/Adam.step`，并在每个真实step后推进Polyak target与`learning_steps`；两个B40 actor同样各自Adam。PID、outage、trajectory residual尺度和risk EMA仍看完整B80。actor scheduler仍按25个rollout事件推进，不伪装成50个事件；相对B40的50次调度，`b=10000,c=.9`下终点LR差仅约0.22%，作为已记录的残余时钟差，不与首轮同时再改scheduler。
+- 默认关闭精确回归使用改动前gold与改动后post同seed503、B4/T32、3 rollouts、C3/A2。四个checkpoint在每个时点的44个公共模块/运行tensor leaves全部逐位相同，final的209个公共旧标量也相同，eval JSON逐项相同；新代码只增加配置/诊断字段，没有改变默认权重、采样RNG、PID或旧指标。
+- 启用小smoke使用seed504、B4→2×B2、T32、C3/A2，持久化后台`21.7s`、exit0。每事件实际critic/actor step为`6/4`，三轮actor/PID事件都完成；完整behavior batch首ratio最大误差`4.8161e-5`，末KL/clip为`6.59e-5/0`，四个checkpoint全部有限。独立eval-only重载exit0，评估逐项相同，checkpoint自动恢复`optimizer_minibatch_trajectories=2`。
+- 正式规模工程门使用seed505、B80/T1000、C20/A8、`optimizer_minibatch_trajectories=40`，纯训练`66.59s`、exit0；实际完成40个critic Adam和16个actor Adam，PID/actor风险批各80条完整trajectory。首ratio最大误差`1.7166e-5`，末KL/clip为`.001961/.10875`，pre/final checkpoint全部有限，无OOM、NaN、shape或worker错误。它与旧B80整批工程门`66.42s`耗时近似，说明两个B40的optimizer开销被更小的critic pairwise张量抵消；该短run只证明工程可行，不作性能判断。
+- 代码改动集中在`agents/dqc_ac_beta_gpu.py`和`run_experiment.py`；新增W&B/JSON键显式报告optimizer子批大小/数量、每事件配置step数、实际actor step数，以及全部子批KL/clip/ratio-std的mean/max。所有测试均用`launch_background.sh`持久化，W&B disabled；没有创建一次性脚本，gold/post/smoke产物保留在对应`_runs/jobs`、`_runs/logs`和`_runs/checkpoints`以便复核。
+
+### E171：C-H22 seed1 2M正式性能实验预注册（2026-07-18）
+
+- C-H22严格复用C-H20 seed1全部算法参数和2M数据预算，仅新增`optimizer_minibatch_trajectories=40`：B80×25×T1000、W100、C20/A8、theta LR `3e-4`、critic LR `1e-3`、QR32/MC、mean anchor、batch-rho1、PID target `.175`、LSTM512、obs RMS和GAE-PPO均冻结。相对C-H21恢复LR到`3e-4`，不把多小步与大单步混合。
+- 每个B80 event变为`20×2=40`个critic step和`8×2=16`个actor step；25 events总计1000/400个step，分别与C-H18 B40×50的1000/400完全相同。critic/actor trajectory exposure仍为40000/16000，PID事件仍为25且每次看B80，故实验只测试“低方差完整风险统计 + 恢复B40 optimizer时钟”，不是增加样本、epoch或学习率。Polyak target也按1000个真实critic step推进。
+- 使用压力seed1从头训练，W&B online名称/tag仅含公开算法语义，不含路径或隐私；通过`launch_background.sh`持久化。单事件门与C-H20正式耗时共同估算纯训练约15--25分钟，内置128约2分钟、共同eval seed20000 fresh512约4分钟，总计约21--31分钟。根分区不写大文件，全部checkpoint/W&B/log继续位于vepfs工作区。
+- C-H18已经证明1M可能误杀慢热策略，因此除NaN/Inf/OOM、ratio断言或确定工程错误外跑满2M，不以早期reward低作性能早停。机制门为首ratio`<1e-3`、40/16 step计数正确、全部有限，后段KL/clip不持续饱和。
+- 正式晋级仍按双侧目标：fresh512 outage必须进入`[.18,.22]`，然后reward至少`.94`，目标是不低于同test B40 seed1 `.98955`。`outage<.18`且reward下降记过度保守，`outage>.22`记风险预算超支，不能把更低outage自动算提升。通过才原样扩seed0/2；失败则停止该分支，不扫描B60/B100或第三个minibatch，并转向PID--actor时钟解耦/leave-one-out trajectory风险基线等下一项消融。

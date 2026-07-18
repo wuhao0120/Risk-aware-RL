@@ -176,6 +176,9 @@ def base_args(algo, seed, device, env_key):
         a.critic_hidden = [256, 256]
         a.critic_lr = 1e-3
         a.critic_minibatch_size = 0                     # 0=历史整批；大 B/N 时显式设 chunk
+        # 与上面的显存chunk不同：正数会按完整trajectory执行独立Adam step。
+        # 默认0严格保留整批更新；C-H22显式用B80采样、2×B40优化。
+        a.optimizer_minibatch_trajectories = 0
         # 历史 QR loss 对 target quantile 求和，梯度随 N 线性放大。默认 legacy_sum
         # 保持所有旧 run 可复现；reference_mean 用 reference/N 缩放，供 N=64/128
         # 做公平分辨率消融，避免“quantile 更多”被隐式改成“critic 梯度更大”。

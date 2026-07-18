@@ -546,6 +546,21 @@ class DQCACBetaGPU(VecAgentBase):
         # [batch,N,N] pairwise TD-error 峰值显存，不改变 optimizer step 次数。
         self.critic_minibatch_size = max(
             0, int(getattr(args, 'critic_minibatch_size', 0)))
+        # optimizer minibatch按环境轨迹维拆批，每个子批执行独立Adam step；它与
+        # critic_minibatch_size只分块累积一次梯度的语义不同。0保持历史整批路径。
+        self.optimizer_minibatch_trajectories = max(
+            0, int(getattr(args, 'optimizer_minibatch_trajectories', 0)))
+        self.optimizer_minibatch_count = (
+            1 if self.optimizer_minibatch_trajectories == 0 else
+            self.num_envs // self.optimizer_minibatch_trajectories)
+
+        # 专用generator把optimizer shuffle与policy action噪声解耦；默认关闭时不
+        # 构造generator、不消耗任何全局RNG，支持旧checkpoint逐位回归。
+        self.optimizer_minibatch_generator = None
+        if self.optimizer_minibatch_trajectories > 0:
+            self.optimizer_minibatch_generator = torch.Generator(device='cpu')
+            self.optimizer_minibatch_generator.manual_seed(
+                int(getattr(args, 'seed', 0)) + 32452843)
 
         # QR-DQN 原实现对 target sample 维求和，因此 target quantile 数 N 翻倍时，
         # loss 与裁剪前梯度也约翻倍。legacy_sum 是逐式兼容的默认路径；
@@ -1027,6 +1042,51 @@ class DQCACBetaGPU(VecAgentBase):
             raise ValueError("pid_reference_episodes must be non-negative")
         self.sum_norm = bool(getattr(args, 'sum_norm', False))
 
+        # C-H22首轮只在已经验证的B80 recurrent/GAE-PPO/actor-feature/MC-QR
+        # 主线上解耦sampling batch与optimizer batch。限制组合不是永久API边界；
+        # 它保证首个结果只归因于“两个B40 Adam step”，而非同时混入其它消融。
+        if self.optimizer_minibatch_trajectories > 0:
+            mini_b = self.optimizer_minibatch_trajectories
+            if mini_b >= self.num_envs or self.num_envs % mini_b != 0:
+                raise ValueError(
+                    "optimizer_minibatch_trajectories must be smaller than num_envs "
+                    "and divide num_envs exactly")
+            if not self.recurrent_policy or self.reward_actor_mode != 'gae_ppo':
+                raise ValueError(
+                    "trajectory optimizer minibatches currently require recurrent gae_ppo")
+            if (self.freeze_policy_updates or self.actor_updates_per_episode <= 0
+                    or self.actor_update_interval != 1):
+                raise ValueError(
+                    "trajectory optimizer minibatches require live actor updates and "
+                    "actor_update_interval=1")
+            if self.ppo_target_kl != 0.0:
+                raise ValueError(
+                    "first trajectory optimizer-minibatch ablation requires ppo_target_kl=0")
+            if (self.cost_target_mode != 'mc'
+                    or self.cost_history_mode != 'actor_feature'
+                    or self.cost_distribution_model != 'qr'
+                    or self.cost_quantile_grid_mode != 'uniform'
+                    or self.cost_quantile_output != 'linear'
+                    or self.cost_cdf_estimator != 'quantile'
+                    or self.cost_actor_query_mode != 'online'):
+                raise ValueError(
+                    "trajectory optimizer minibatches currently require the "
+                    "actor_feature/MC/QR/uniform/linear/quantile/online cost path")
+            if (self.critic_minibatch_size != 0
+                    or self.cost_actor_feature_refresh
+                    or self.cost_s0_aux_coef > 0.0
+                    or self.cost_transition_replay_batches > 0
+                    or self.cost_holdout_guard
+                    or self.cost_weibull_tail_coef > 0.0
+                    or self.cost_shared_backbone_coef > 0.0
+                    or self.cost_adapter_width > 0):
+                raise ValueError(
+                    "first trajectory optimizer-minibatch ablation cannot combine "
+                    "critic chunking, refresh, replay/guard, auxiliary or shared-cost paths")
+            if self.dual_update_mode != 'empirical_pid':
+                raise ValueError(
+                    "first trajectory optimizer-minibatch ablation requires empirical_pid")
+
         # qcpo 归一化配方: σ_R (reward 回报尺度) / σ_c (cost 约束优势尺度) + warmup
         self.norm_ema_decay = float(getattr(args, 'norm_ema_decay', 0.1))
         _wi = getattr(args, 'warmup_iters', None)
@@ -1358,7 +1418,9 @@ class DQCACBetaGPU(VecAgentBase):
               f"qr_target={self.quantile_target_reduction}/ref{self.quantile_loss_reference_samples}, "
               f"iters={self.num_iterations}, critic_updates/iter={self.updates_per_episode}, "
               f"actor_updates/iter={self.actor_updates_per_episode}"
-              f"/interval{self.actor_update_interval}, reward_actor={self.reward_actor_mode}, "
+              f"/interval{self.actor_update_interval}, "
+              f"optimizer_mb={self.optimizer_minibatch_trajectories}"
+              f"x{self.optimizer_minibatch_count}, reward_actor={self.reward_actor_mode}, "
               f"ppo_target_kl={self.ppo_target_kl:g}, "
               f"actor_cost_query={self.cost_actor_query_mode}"
               f"/mcfix{self.cost_actor_mc_correction_coef:g}"
@@ -1475,13 +1537,29 @@ class DQCACBetaGPU(VecAgentBase):
             # 上一rollout在本轮只用于无梯度选择；第一轮cache为空，state=None。
             cost_holdout_state = self._begin_cost_holdout_guard()
 
-            def apply_actor_epoch():
-                """执行一次允许的actor epoch，并统一维护early-stop/scheduler计数。"""
+            actor_optimizer_diagnostics = []
+
+            def apply_actor_epoch(selected_actor_batch=None):
+                """执行一次actor Adam step，并统一维护early-stop、计数与子批诊断。"""
                 nonlocal actor_info, actor_updated
                 nonlocal actor_updates_completed, actor_early_stopped
-                if actor_batch is None:
-                    raise RuntimeError("actor epoch requested without an accumulated batch")
-                actor_info = self.update_actor(actor_batch)
+                effective_batch = (
+                    actor_batch if selected_actor_batch is None
+                    else selected_actor_batch)
+                if effective_batch is None:
+                    raise RuntimeError(
+                        "actor epoch requested without an accumulated batch")
+                actor_info = self.update_actor(effective_batch)
+                # 每个独立optimizer子批都保留KL/clip；末个子批仍占历史主键，
+                # aggregate键才描述整个PPO事件，避免把单个B40误当成完整B80。
+                actor_optimizer_diagnostics.append({
+                    'approx_kl': float(actor_info.get('ppo/approx_kl', 0.0)),
+                    'clip_fraction': float(
+                        actor_info.get('ppo/clip_fraction', 0.0)),
+                    'ratio_std': float(actor_info.get('ppo/ratio_std', 0.0)),
+                    'update_applied': float(
+                        actor_info.get('ppo/update_applied', 1.0)),
+                })
                 # target-KL越界的probe epoch不执行optimizer.step；它和剩余epoch
                 # 都不能推进actor scheduler，但critic更新预算保持不变。
                 update_applied = bool(
@@ -1494,52 +1572,47 @@ class DQCACBetaGPU(VecAgentBase):
                     if (self.cost_shared_backbone_coef > 0.0
                             or self.cost_actor_feature_refresh):
                         batch['_shared_cost_feature_dirty'] = True
+                        effective_batch['_shared_cost_feature_dirty'] = True
                 if bool(actor_info.get('ppo/early_stop', 0.0)):
                     actor_early_stopped = True
 
-            for update_idx in range(self.updates_per_episode):
-                actor_epoch_allowed = (
-                    not self.freeze_policy_updates and not in_warmup
-                    and actor_update_due
-                    and update_idx < self.actor_updates_per_episode
-                    and not actor_early_stopped)
-                # C-X3只把首个actor epoch提前到任何current-batch QR step之前。
-                # update_actor会在这一刻缓存risk weight；后续epoch即使位于critic
-                # 更新后也复用缓存，因此当前批cost标签不会即时回灌同批actor。
-                actor_before_critic = (
-                    self.cost_actor_query_mode == 'preupdate'
-                    and update_idx == 0 and actor_epoch_allowed)
-                if actor_before_critic:
-                    apply_actor_epoch()
-
+            def apply_critic_step(selected_batch, diagnostic_step):
+                """对一个整批或trajectory子批执行一次独立critic Adam step。"""
+                nonlocal critic_info
                 cost_update_allowed = (
                     cost_holdout_state is None
                     or not cost_holdout_state['stopped'])
                 critic_info = self.update_critic(
-                    batch, apply_cost_update=cost_update_allowed)
+                    selected_batch, apply_cost_update=cost_update_allowed)
                 # 在同一步actor epoch之前完成验证/回滚；因此被拒绝的head不会继续
-                # 驱动本epoch风险优势。reward critic的本步更新按设计保留。
+                # 驱动本epoch风险优势。optimizer-minibatch首轮已显式禁用guard。
                 cost_update_retained = bool(
                     critic_info['critic/cost_update_applied'])
                 if cost_holdout_state is not None and cost_update_allowed:
                     cost_update_retained = self._guard_cost_holdout_after_step(
-                        cost_holdout_state, update_idx + 1)
+                        cost_holdout_state, diagnostic_step)
                 critic_info['critic/cost_update_retained'] = float(
                     cost_update_retained)
-                # 标量 reward value 在warmup中也训练；actor仍由下面的in_warmup控制。
+                # 标量 reward value 在warmup中也训练；actor仍由in_warmup控制。
                 # value每个epoch拟合同一批冻结λ-return，actor复用冻结advantage。
-                if self.reward_actor_mode != 'distributional' and not self.recurrent_policy:
-                    critic_info.update(self.update_reward_value(batch))
+                if (self.reward_actor_mode != 'distributional'
+                        and not self.recurrent_policy):
+                    critic_info.update(self.update_reward_value(selected_batch))
                 critic_update_diagnostics.append({
-                    'cost_grad_norm': float(critic_info['critic/cost_grad_norm']),
+                    'cost_grad_norm': float(
+                        critic_info['critic/cost_grad_norm']),
                     'cost_head_grad_norm': float(
                         critic_info['critic/cost_head_grad_norm']),
                     'cost_history_grad_norm': float(
                         critic_info['critic/cost_history_grad_norm']),
-                    'joint_grad_norm': float(critic_info['critic/joint_grad_norm']),
-                    'reward_grad_norm': float(critic_info['critic/reward_grad_norm']),
-                    'grad_clipped': float(critic_info['critic/grad_clip_fraction']),
-                    'cost_qr_loss': float(critic_info['critic/cost_qr_loss']),
+                    'joint_grad_norm': float(
+                        critic_info['critic/joint_grad_norm']),
+                    'reward_grad_norm': float(
+                        critic_info['critic/reward_grad_norm']),
+                    'grad_clipped': float(
+                        critic_info['critic/grad_clip_fraction']),
+                    'cost_qr_loss': float(
+                        critic_info['critic/cost_qr_loss']),
                     'cost_mean_anchor_loss': float(
                         critic_info['critic/cost_mean_anchor_loss']),
                     'cost_objective_loss': float(
@@ -1547,20 +1620,85 @@ class DQCACBetaGPU(VecAgentBase):
                     'cost_update_retained': float(
                         critic_info['critic/cost_update_retained']),
                 })
-                # 保留每个C-step的Weibull曲线，而不只记录第20次末值。
+                # 保留每个C-step的Weibull曲线，而不只记录末值。
                 critic_update_diagnostics[-1].update({
-                    "cost_weibull_loss": float(
-                        critic_info["critic/cost_weibull_loss"]),
-                    "cost_weibull_tail_clamp_fraction": float(
-                        critic_info["critic/cost_weibull_tail_clamp_fraction"]),
-                    "cost_weibull_head_grad_norm": float(
-                        critic_info["critic/cost_weibull_head_grad_norm"]),
+                    'cost_weibull_loss': float(
+                        critic_info['critic/cost_weibull_loss']),
+                    'cost_weibull_tail_clamp_fraction': float(
+                        critic_info[
+                            'critic/cost_weibull_tail_clamp_fraction']),
+                    'cost_weibull_head_grad_norm': float(
+                        critic_info['critic/cost_weibull_head_grad_norm']),
                 })
-                if actor_epoch_allowed and not actor_before_critic:
-                    apply_actor_epoch()
-                if self.learning_steps % self.target_update_interval == 0:
-                    self._soft_update_target()
-                self.learning_steps += 1
+
+            use_optimizer_minibatches = (
+                self.optimizer_minibatch_trajectories > 0)
+            for update_idx in range(self.updates_per_episode):
+                actor_epoch_allowed = (
+                    not self.freeze_policy_updates and not in_warmup
+                    and actor_update_due
+                    and update_idx < self.actor_updates_per_episode
+                    and not actor_early_stopped)
+
+                if not use_optimizer_minibatches:
+                    # 默认关闭路径逐式保持历史顺序：一次整批critic Adam，随后至多
+                    # 一次整批actor Adam；没有shuffle、额外forward或缓存构造。
+                    actor_before_critic = (
+                        self.cost_actor_query_mode == 'preupdate'
+                        and update_idx == 0 and actor_epoch_allowed)
+                    if actor_before_critic:
+                        apply_actor_epoch()
+                    apply_critic_step(batch, update_idx + 1)
+                    if actor_epoch_allowed and not actor_before_critic:
+                        apply_actor_epoch()
+                    if self.learning_steps % self.target_update_interval == 0:
+                        self._soft_update_target()
+                    self.learning_steps += 1
+                    continue
+
+                # 每个epoch重新打乱完整trajectory索引；专用CPU generator不推进
+                # policy action RNG。相同索引顺序同时用于critic和actor，便于审计。
+                trajectory_order = torch.randperm(
+                    self.num_envs,
+                    generator=self.optimizer_minibatch_generator)
+                mini_b = self.optimizer_minibatch_trajectories
+                trajectory_groups = [
+                    trajectory_order[begin:begin + mini_b]
+                    for begin in range(0, self.num_envs, mini_b)
+                ]
+                if len(trajectory_groups) != self.optimizer_minibatch_count:
+                    raise RuntimeError(
+                        "optimizer minibatch count changed after initialization")
+
+                # 先让两个B40 critic都各走一次Adam；每一步后按真实optimizer时钟
+                # 更新Polyak target和learning_steps，恢复B40基线的总step数量。
+                for trajectory_group in trajectory_groups:
+                    critic_batch = self._slice_trajectory_batch(
+                        batch, trajectory_group)
+                    apply_critic_step(
+                        critic_batch, len(critic_update_diagnostics) + 1)
+                    if self.learning_steps % self.target_update_interval == 0:
+                        self._soft_update_target()
+                    self.learning_steps += 1
+
+                if actor_epoch_allowed:
+                    if '_risk_weight' not in actor_batch:
+                        # 只在首个PPO epoch、且任何actor子批尚未step时执行；风险
+                        # component EMA/constraint RMS和首ratio检查均以完整B80为单位。
+                        self._prepare_recurrent_actor_risk_cache(actor_batch)
+                        self._cache_full_recurrent_behavior_ratio_error(
+                            actor_batch)
+                    # 风险cache写入完整batch后再切片；否则第二个子批会重新查询
+                    # 已被第一个actor step改变的policy/critic状态，破坏冻结目标。
+                    actor_minibatches = [
+                        self._slice_trajectory_batch(
+                            actor_batch, trajectory_group)
+                        for trajectory_group in trajectory_groups
+                    ]
+                    for actor_minibatch in actor_minibatches:
+                        if actor_early_stopped:
+                            break
+                        apply_actor_epoch(actor_minibatch)
 
             # 同一rollout被重复拟合时，first→last轨迹比单独记录最后一次更能识别
             # “当前batch loss下降，但跨rollout泛化变差”的重复更新过拟合。保留原有
@@ -1677,8 +1815,43 @@ class DQCACBetaGPU(VecAgentBase):
                 actor_info[
                     'advantage/risk_query_preupdate_postupdate_abs_mean'] = preupdate_drift
 
+            # optimizer-minibatch下历史PPO主键是最后一个B40；以下aggregate
+            # 覆盖本事件全部实际actor step。默认整批也填同名键，便于统一画图。
+            if actor_optimizer_diagnostics:
+                actor_kl = np.asarray([
+                    item['approx_kl'] for item in actor_optimizer_diagnostics
+                ], dtype=np.float64)
+                actor_clip = np.asarray([
+                    item['clip_fraction'] for item in actor_optimizer_diagnostics
+                ], dtype=np.float64)
+                actor_ratio_std = np.asarray([
+                    item['ratio_std'] for item in actor_optimizer_diagnostics
+                ], dtype=np.float64)
+                actor_info.update({
+                    'ppo/optimizer_approx_kl_mean': float(actor_kl.mean()),
+                    'ppo/optimizer_approx_kl_max': float(actor_kl.max()),
+                    'ppo/optimizer_clip_fraction_mean': float(
+                        actor_clip.mean()),
+                    'ppo/optimizer_clip_fraction_max': float(
+                        actor_clip.max()),
+                    'ppo/optimizer_ratio_std_mean': float(
+                        actor_ratio_std.mean()),
+                    'ppo/optimizer_ratio_std_max': float(
+                        actor_ratio_std.max()),
+                    'ppo/optimizer_probe_count': float(
+                        len(actor_optimizer_diagnostics)),
+                })
+
             # configured epochs与实际optimizer steps必须同时记录；否则target-KL只看
             # 最终KL会误以为仍执行了固定8次更新。
+            actor_info['training/optimizer_minibatch_trajectories'] = float(
+                self.optimizer_minibatch_trajectories)
+            actor_info['training/optimizer_minibatch_count'] = float(
+                self.optimizer_minibatch_count)
+            actor_info['training/critic_optimizer_steps_configured'] = float(
+                self.updates_per_episode * self.optimizer_minibatch_count)
+            actor_info['training/actor_optimizer_steps_configured'] = float(
+                self.actor_updates_per_episode * self.optimizer_minibatch_count)
             actor_info['training/actor_updates_completed'] = float(
                 actor_updates_completed)
             actor_info['ppo/early_stop'] = float(actor_early_stopped)
@@ -1888,6 +2061,222 @@ class DQCACBetaGPU(VecAgentBase):
                 T * merged['_actor_num_envs'],
                 self.action_dim)
         return merged
+
+    def _slice_trajectory_batch(self, batch, trajectory_indices):
+        """
+        按完整环境轨迹切分time-major rollout，绝不打断LSTM时间连续性。
+
+        输入trajectory_indices只选择环境维j。所有[T,B,*]字段沿dim=1切；所有
+        [T*B,*]字段先恢复time-major再切B并展平；episode字段[B,*]沿dim=0切。
+        标量诊断与Python元数据只读共享。该函数不采样、不detach新图，也不更新
+        任何RMS/EMA，因此整批冻结的old log-prob、GAE与risk weight保持同一版本。
+        """
+        full_b = int(batch.get('_actor_num_envs', self.num_envs))
+        if not torch.is_tensor(trajectory_indices):
+            trajectory_indices = torch.as_tensor(
+                trajectory_indices, dtype=torch.long)
+        trajectory_indices = trajectory_indices.reshape(-1).to(
+            dtype=torch.long, device='cpu')
+        mini_b = int(trajectory_indices.numel())
+        if mini_b <= 0:
+            raise ValueError("trajectory minibatch cannot be empty")
+        if int(trajectory_indices.min()) < 0 or int(trajectory_indices.max()) >= full_b:
+            raise IndexError("trajectory minibatch index is outside the actor batch")
+        if int(torch.unique(trajectory_indices).numel()) != mini_b:
+            raise ValueError("trajectory minibatch indices must be unique")
+
+        time_major_keys = {
+            'actor_obs', 'prev_action', 'prev_reward', 'h0', 'c0',
+            'actor_value', 'actor_mean', 'actor_log_std',
+        }
+        episode_keys = {
+            's0', 'disc_return', 'disc_cost', 'undisc_cost',
+            '_cost_crossfit_s0_fold',
+        }
+        sliced = {'_actor_num_envs': mini_b}
+        for key, value in batch.items():
+            if key == '_actor_num_envs':
+                continue
+            if not torch.is_tensor(value) or value.ndim == 0:
+                # 例如首epoch ratio误差、holdout字典和布尔dirty flag；子批只读。
+                sliced[key] = value
+                continue
+
+            index = trajectory_indices.to(device=value.device)
+            if key == '_actor_baseline_actions':
+                expected = (
+                    self.num_action_samples, self.n * full_b, self.action_dim)
+                if tuple(value.shape) != expected:
+                    raise ValueError(
+                        "actor baseline actions lost [K,T*B,A] layout: "
+                        f"{tuple(value.shape)} != {expected}")
+                selected = value.reshape(
+                    self.num_action_samples, self.n, full_b,
+                    self.action_dim).index_select(2, index)
+                sliced[key] = selected.reshape(
+                    self.num_action_samples, self.n * mini_b, self.action_dim)
+            elif key in time_major_keys:
+                if value.shape[0] != self.n or value.shape[1] != full_b:
+                    raise ValueError(
+                        f"{key} must have leading [T,B], got {tuple(value.shape)}")
+                sliced[key] = value.index_select(1, index)
+            elif key in episode_keys:
+                if value.shape[0] != full_b:
+                    raise ValueError(
+                        f"{key} must have leading [B], got {tuple(value.shape)}")
+                sliced[key] = value.index_select(0, index)
+            elif value.shape[0] == self.n * full_b:
+                # 展平字段包括state/action/TD target/budget/GAE/old-logπ、cost
+                # recurrent feature和全部逐transition risk cache；统一按t*B+j切。
+                restored = value.reshape(
+                    self.n, full_b, *value.shape[1:])
+                selected = restored.index_select(1, index)
+                sliced[key] = selected.reshape(
+                    self.n * mini_b, *value.shape[1:])
+            elif value.shape[0] == full_b:
+                # 对未来新增的episode字段提供安全兼容；显式字段仍走上面形状断言。
+                sliced[key] = value.index_select(0, index)
+            else:
+                # 固定quantile网格或全局诊断tensor不属于trajectory轴，只读共享。
+                sliced[key] = value
+
+        # 这些字段同时被critic和actor使用；在真正optimizer step前做最终对齐门。
+        required = {
+            'states', 'actions', 'steps', 'boot_states', 'boot_actions',
+            'nstep_reward', 'mc_cost', 'cost_feature', 'old_log_probs',
+            '_reward_advantage', '_reward_value_targets', 'disc_cost',
+        }
+        missing = sorted(required.difference(sliced))
+        if missing:
+            raise KeyError(f"trajectory minibatch missing required fields: {missing}")
+        expected_rows = self.n * mini_b
+        for key in ('states', 'actions', 'steps', 'old_log_probs',
+                    '_reward_advantage', '_reward_value_targets', 'mc_cost'):
+            if sliced[key].shape[0] != expected_rows:
+                raise RuntimeError(
+                    f"{key} trajectory slice has {sliced[key].shape[0]} rows, "
+                    f"expected {expected_rows}")
+        return sliced
+
+    @torch.no_grad()
+    def _prepare_recurrent_actor_risk_cache(self, batch):
+        """
+        在任何actor子批step前，用完整behavior batch冻结一次风险优势。
+
+        这段计算逐式对应_update_recurrent_actor_value首epoch的no-grad分支，但不
+        执行actor forward/backward。B80的critic查询、trajectory标签、baseline
+        action、component RMS和constraint RMS都只更新一次；随后两个B40子批只
+        切片缓存，不能让第一个actor step改变第二个子批的风险监督。
+        """
+        if '_risk_weight' in batch:
+            return
+        if not self.recurrent_policy:
+            raise RuntimeError("full-batch recurrent risk cache requires mlp_lstm policy")
+        n = self.n
+        full_b = int(batch.get('_actor_num_envs', self.num_envs))
+        states = batch['states']
+        budgets = batch['budgets']
+        steps = batch['steps']
+        cost_inputs = self._cost_inputs(
+            states, steps, batch.get('cost_feature'))
+        query_folds = batch.get('_cost_crossfit_fold')
+        psi_cdf = self._cost_actor_query_probability(
+            cost_inputs, batch['actions'], budgets,
+            label_folds=query_folds)
+        batch['_risk_query_target_online_abs_mean'] = (
+            self._cost_actor_query_disagreement(
+                cost_inputs, batch['actions'], budgets, psi_cdf).detach())
+
+        behavior_mean = batch['actor_mean'].reshape(
+            n * full_b, self.action_dim)
+        behavior_log_std = batch['actor_log_std'].reshape(
+            n * full_b, self.action_dim)
+        precomputed_actions = batch.get('_actor_baseline_actions')
+        if precomputed_actions is None:
+            # 与历史首PPO epoch相同：按sample_idx依次抽K个完整behavior batch。
+            precomputed_actions = torch.stack([
+                self._sample_from_params(behavior_mean, behavior_log_std)
+                for _ in range(self.num_action_samples)
+            ], dim=0).detach()
+            batch['_actor_baseline_actions'] = precomputed_actions
+        expected_shape = (
+            self.num_action_samples, n * full_b, self.action_dim)
+        if tuple(precomputed_actions.shape) != expected_shape:
+            raise ValueError(
+                "precomputed actor baseline action shape mismatch: "
+                f"{tuple(precomputed_actions.shape)} != {expected_shape}")
+        baseline_cdfs = [
+            self._cost_actor_query_probability(
+                cost_inputs, precomputed_actions[sample_idx], budgets,
+                label_folds=query_folds)
+            for sample_idx in range(self.num_action_samples)
+        ]
+        baseline_cdf = torch.stack(baseline_cdfs, dim=0).mean(dim=0)
+        risk_components = self._cost_actor_advantage_components(
+            batch, psi_cdf, baseline_cdf,
+            update_balance_stats=(
+                self.cost_actor_mc_correction_mode == 'rms_balanced'))
+        raw_adv_c = risk_components['blended']
+        if self.cost_actor_mc_correction_mode == 'rms_balanced':
+            self._ema_update(
+                self.constraint_rms,
+                float(raw_adv_c.mean().item()),
+                float(raw_adv_c.var(unbiased=False).item()))
+        normalized_adv_c = (
+            raw_adv_c / self.constraint_rms.std
+            if self.advantage_norm == 'qcpo'
+            else self._maybe_norm(raw_adv_c))
+        batch['_risk_weight'] = (batch['e'] * normalized_adv_c).detach()
+        batch['_risk_advantage_raw'] = raw_adv_c.detach()
+        batch['_risk_cdf'] = psi_cdf.detach()
+        batch['_risk_advantage_critic_raw'] = (
+            risk_components['critic'].detach())
+        batch['_risk_advantage_mc_raw'] = risk_components['mc'].detach()
+        batch['_risk_mc_residual_raw'] = risk_components['residual'].detach()
+        batch['_risk_mc_correction_raw'] = (
+            risk_components['correction'].detach())
+        batch['_risk_mc_outage_label'] = risk_components['label'].detach()
+        batch['_risk_critic_mc_correlation'] = (
+            risk_components['critic_mc_correlation'].detach())
+        batch['_risk_mc_balance_scale'] = (
+            risk_components['balance_scale'].detach())
+        batch['_risk_mc_critic_scale_reference'] = (
+            risk_components['critic_scale_reference'].detach())
+        batch['_risk_mc_residual_scale_reference'] = (
+            risk_components['residual_scale_reference'].detach())
+        batch['_risk_mc_correction_to_critic_std_ratio'] = (
+            risk_components['correction_to_critic_std_ratio'].detach())
+
+    @torch.no_grad()
+    def _cache_full_recurrent_behavior_ratio_error(self, batch):
+        """
+        在第一个actor子批更新前，对完整B80执行π_current/π_behavior自检。
+
+        如果分别在两个B40里首次写缓存，第二个子批会在第一个Adam step后才测，
+        被误报成“首epoch不等于1”。这里先用完整batch测一次，再把同一Python标量
+        复制进所有子批，既能发现hidden/old-logπ接错，也不会改变policy或RNG。
+        """
+        transform = self._transform_recurrent
+        n = self.n
+        full_b = int(batch.get('_actor_num_envs', self.num_envs))
+        observations = transform(batch['actor_obs'])
+        prev_actions = transform(batch['prev_action'])
+        prev_rewards = transform(batch['prev_reward'])
+        actions = transform(
+            batch['actions'].reshape(n, full_b, self.action_dim))
+        old_log_probs = transform(
+            batch['old_log_probs'].reshape(n, full_b))
+        hidden0 = transform(batch['h0'])[0].unsqueeze(0).contiguous()
+        cell0 = transform(batch['c0'])[0].unsqueeze(0).contiguous()
+        means, log_stds, _value, _state = self.actor(
+            observations, prev_actions, prev_rewards, (hidden0, cell0))
+        current_log_probs = self._logp_from_params(
+            actions, means, log_stds)
+        ratio_error = float(
+            (torch.exp(current_log_probs - old_log_probs) - 1.0)
+            .abs().max().item())
+        batch['_first_epoch_ratio_max_error'] = ratio_error
+        return ratio_error
 
     # ============================================================ 循环策略 rollout / BPTT 工具 ============================================================
     @staticmethod
@@ -5463,6 +5852,15 @@ class DQCACBetaGPU(VecAgentBase):
             'training/actor_lr': float(self.actor_scheduler.get_last_lr()[0]),
             'training/actor_updates_per_iteration': self.actor_updates_per_episode,
             'training/actor_update_interval': self.actor_update_interval,
+            'training/optimizer_minibatch_trajectories': float(
+                self.optimizer_minibatch_trajectories),
+            'training/optimizer_minibatch_count': float(
+                self.optimizer_minibatch_count),
+            'training/critic_optimizer_steps_per_iteration': float(
+                self.updates_per_episode * self.optimizer_minibatch_count),
+            'training/actor_optimizer_steps_per_event': float(
+                self.actor_updates_per_episode
+                * self.optimizer_minibatch_count),
         }
         # pre 是本轮训练前的新样本泛化，post 是同一批被重复更新后的拟合；
         # 两者键完全对齐，profile 可直接计算 post-pre 而不混入动作/RNG差异。
@@ -5909,6 +6307,14 @@ class DQCACBetaGPU(VecAgentBase):
             'cost_quantile_local_count': self.cost_quantile_local_count,
             'quantile_target_reduction': self.quantile_target_reduction,
             'quantile_loss_reference_samples': self.quantile_loss_reference_samples,
+            'optimizer_minibatch_trajectories': (
+                self.optimizer_minibatch_trajectories),
+            'optimizer_minibatch_count': self.optimizer_minibatch_count,
+            'critic_optimizer_steps_per_iteration': (
+                self.updates_per_episode * self.optimizer_minibatch_count),
+            'actor_optimizer_steps_per_event': (
+                self.actor_updates_per_episode
+                * self.optimizer_minibatch_count),
             'actor_updates_per_episode': self.actor_updates_per_episode,
             'actor_update_interval': self.actor_update_interval,
             'actor_update_events': self.actor_update_events,

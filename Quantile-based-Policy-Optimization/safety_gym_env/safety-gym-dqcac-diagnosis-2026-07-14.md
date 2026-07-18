@@ -2198,3 +2198,13 @@ C-H21证明C-H20确有Actor更新不足：把B80的actor LR从3e-4加到6e-4后�
 fresh512最终为reward/outage 0.9098/0.3145。相对原B80，reward与outage都显著增加；相对B40，reward显著更低且outage显著更高。因此LR翻倍路线停止，不扩seed。目标仍是先让outage贴近0.20再推高reward，不能因0.910比0.833高就忽略风险超支。
 
 如果继续B80，下一候选应把80条采样统计与optimizer batch解耦：PID和trajectory residual scale继续看完整B80，而每个PPO/critic epoch按trajectory分成两个B40 optimizer step，LR保留3e-4。多个较小step有机会恢复B40的optimizer时钟而不产生6e-4的单步过冲。现有`critic_minibatch_size`只分块backward后执行一次Adam step，不能完成这个实验；新实现必须默认关闭、回归旧路径，并严格处理recurrent time-major切片、hidden/cell、old log-prob和整批冻结risk weight。
+
+### 13.143 B80采样与B40优化时钟已经解耦，C-H22现在检验真正的多小步方案（2026-07-18）
+
+C-H21说明把actor学习率翻倍只能恢复PPO KL，不能恢复稳定前沿。C-H22因此不再放大单步，而是让B80继续提供低方差的outage、PID和trajectory residual统计，再把完整轨迹随机拆成两个B40分别执行Adam。固定2M下，critic和actor总step从C-H20的500/200恢复到C-H18的1000/400；LR回到3e-4，样本数、trajectory exposure、PID setpoint和风险修正增益都不变。
+
+这里最容易犯的off-policy错误已经显式避免。GAE、value target、trajectory标签和old log-prob都由完整behavior rollout一次冻结；risk CDF和batch-rho1也在任何actor子批更新前用完整B80算一次。第二个B40并不把第一个B40更新后的概率保存为新分母，而是继续使用rollout时的behavior probability，重新前向当前policy形成`π_current/π_behavior`并由PPO clip约束。这正是多epoch/minibatch PPO的定义；逐step替换分母反而会改变目标、掩盖相对原behavior的累计漂移。
+
+工程证据已覆盖默认关闭逐位回归、time-major解析切片、小网络启用smoke、checkpoint重载和正式B80单事件。默认路径四个checkpoint全部module tensor与旧结果逐位相同；B80门实际得到40个critic和16个actor step，首ratio误差1.72e-5，66.59秒完成且全部有限。说明当前已不是“代码能不能跑”的问题，下一条2M正式run会直接回答多个B40小步能否同时保留B80降噪和B40 reward学习速度。
+
+仍需诚实记录一个极小差异：actor scheduler按rollout事件而非optimizer step推进，所以C-H22是25次、B40是50次调度；由于调度尺度b=10000，终点LR差约0.22%，远小于C-H21的2倍LR改动，首轮不再同时修它。正式判断继续是outage先进入[0.18,0.22]，再看reward是否至少0.94并争取超过0.9896；低于0.18但reward下降不算好，高于0.22不算满足约束。
