@@ -1923,3 +1923,24 @@
 - checkpoint写入`rollout_step000080000.pt`与`final_post_update.pt`。独立持久化eval-only使用不同eval seed和B4 worker成功重建B80训练配置、加载`phase=post_update_final, step=80000`并完成4回合，exit0；证明num_envs只影响采样批量，不把checkpoint结构锁死在B80。
 - 工程门全部通过，按E165启动正式seed1 2M。基于smoke每80k约66秒的保守外推为27.5分钟，但单event包含固定初始化/保存开销且C-H18整段实测约13分钟；正式训练墙钟预估修订为13--24分钟，内部128与fresh512另约5--7分钟。不会用smoke的短策略表现早停正式run。
 
+
+
+### E167：C-H20 B80正式结果——反馈噪声下降，但optimizer时钟减半导致reward欠训练（2026-07-18）
+
+- 正式job `DQCAC_DynamicButton_ch20_b80_w100_batchrho1_target0175_2m_s1`由`launch_background.sh`持久化完成，exit0；W&B run `ff9ymksp` finished并同步3个文件。配置为B80×25×T1000=2M、W100、C20/A8、batch-rho1、PID target .175、QR32/MC、LSTM512、obs RMS与GAE-PPO；相对C-H18 B40基线只做E165预注册的batch scaling。纯训练`924.2s`，含内置128评估的后台总墙钟约`1047s`，无NaN/OOM/ratio错误。
+- 内置128条reward/outage为`.82593/.26563`。完全独立的共同eval seed20000 fresh512为reward `.833011`、outage `116/512=.226563`，Wilson95为`[.19242,.26478]`。outage仍高于双侧工程带`[.18,.22]`，因此不能因它低于B40就宣布风险通过。
+- 同一test流的C-H18 B40 seed1为`.989551/119÷512=.232422`。B80-B40 reward差`-.156540`，Welch95 `[-.218470,-.094610]`，是明确的性能损失；outage差`-.005859`，Newcombe95 `[-.057317,+.045634]`，不能排除零差异。B80既未命中约束，也未保住reward，正式裁决为`reject_no_seed_expansion_but_keep_noise_reduction_evidence`。
+- 降噪机制确实存在。全部训练事件的相邻batch outage绝对跳变均值由B40的`.06939`降到B80的`.04115`，约下降40.7%；后20% outage标准差由`.05921`降到`.04430`，约下降25.2%。但后段相邻跳变`.07222→.06875`改善很小，fresh风险也几乎不变；更多并行环境只减少单批Bernoulli噪声，不会自动消除Actor/PID相位周期或条件risk credit误差。
+- reward欠训练与optimizer时钟一致。固定2M时B40有50个Actor事件，B80只有25个；每个事件仍是8次full-batch PPO更新，所以Adam step数减半，尽管总trajectory exposure相同。后20% PPO KL由`.002436`降到`.001295`，clip fraction由`.12936`降到`.06133`，ratio std由`.06940`降到`.05062`；reward训练均值由`1.15470`降到`.74490`，fresh reward显著下降。reward value explained variance相近`.7808/.7921`，不支持把主要损失归因于value网络完全失效。
+- cost critic没有随B80稳定变准。fresh hard/smooth CDF error相对B40分别恶化32.5%/7.3%，mean-cost error由`.0665`增到`1.3244`，Brier仅改善0.4%而BSS恶化1.42个百分点，crossing增加`.0261`。因此不把critic LR同时放大；先隔离actor时钟，避免一次实验同时改变两条优化链。
+- 图表和统计位于`_runs/profiles/dqc_ch18_b40_vs_ch20_b80_batchrho1_target0175_2m_s1_test512_e20000_2026-07-18/`与同名训练profile目录，两张PNG已解码验证；W&B export位于`_runs/wandb_export/dqc_ch20_b80_w100_batchrho1_target0175_2m_s1_2026-07-18/`及B40/B80合并目录。未创建一次性脚本。
+- retention guard不参与本结论。guard只以旧rollout smooth-Brier回滚cost critic与Adam，不改变PID、lambda、setpoint或reward actor；既有guard约`.579/.141`是低收益过度保守。全项目统一优化顺序是先让真实outage贴近alpha=.20，再最大化mean reward：`<.18`且reward下降记为过度保守，`>.22`记为预算超支，outage不是越小越好。
+
+### E168：C-H21 B80 actor学习率2倍补偿预注册（2026-07-18）
+
+- 下一条严格复用C-H20 seed1，只把`theta_lr0:3e-4→6e-4`；critic LR仍`1e-3`，B80×25、W100、C20/A8、PPO clip .1、target-KL关闭、PID target/增益、batch-rho1、网络、quantile与2M预算全部冻结。它回答“B80失败是否主要来自固定env-step下Actor Adam step减半”，不是新一轮联合调参。
+- 名义累计actor步长由`25×8×3e-4`恢复为`25×8×6e-4`，等于B40的`50×8×3e-4`；这只是Adam下的工程近似，不声称严格等价于把B80分成两个B40 optimizer minibatch。QCPO_refs公开配置默认`minibatches=1, epochs=8`，所以不能把多minibatch误写成参考算法已有trick。
+- 先不放大critic LR：B80 fresh critic的CDF/mean-cost/BSS并未改善，且旧实验中更高critic LR有过不利证据。actor-only补偿保持风险估计器可归因；若成功，再讨论把sampling batch与optimizer minibatch显式解耦这一更规范但需代码改造的路线。
+- 使用同一压力seed1、持久化后台、脱敏W&B online和B80 checkpoint；依据C-H20实测，纯训练预计15--18分钟、内置128约2分钟，fresh512约4分钟，总计约21--25分钟。C-H18已证明1M可能误杀慢热策略，所以除NaN/Inf/OOM、PPO ratio断言或明显发散外，正式run跑满2M，不因前半段reward低而提前停止。
+- 机制门要求首epoch`max|ratio-1|<1e-3`、全部有限、后段KL/clip相对C-H20明显恢复但不出现持续饱和；由于`ppo_target_kl=0`，若KL爆炸只能按预注册工程故障停止，不能事后用early-stop改变配置。正式性能先要求fresh512 outage进入`[.18,.22]`，再要求reward至少`.94`且目标不低于B40参考`.98955`；低于.18且reward下降仍判过保守。
+- 若seed1同时通过风险和reward门，原样扩seed0/2；若reward恢复但outage高于.22，说明actor补偿只把策略沿高reward--高risk方向推进，停止LR扫描并转optimizer minibatch/闭环设计；若reward仍低，则B80的不足不只是actor step数，停止B80主线，不尝试9e-4或1.2e-3。无论结果如何，都保留为num_envs与optimizer时钟消融。

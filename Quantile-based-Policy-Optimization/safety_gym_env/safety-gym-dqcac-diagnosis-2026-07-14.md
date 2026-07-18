@@ -2170,3 +2170,20 @@ C-H19用独立validation预先选checkpoint，再用新test随机流检验，避
 
 因此retention/checkpoint guard只能避免某次明显退化，不能作为outage setpoint控制器。下一步转B80固定暴露量：每个risk/PID事件从40增到80条独立trajectory，同时把事件数减半保持2M样本和trajectory-epoch exposure不变。窗口按batch同比50到100只是保持80%替换率，不能误写成另一次window平滑调参。目标仍是outage约0.20后最大化reward，不以更低为优。
 
+
+
+### 13.140 B80降低风险观测噪声，但不能只靠增大num_envs提高最终性能（2026-07-18）
+
+C-H20把每次采样从40增到80条trajectory，并按定义把PID窗口从50同比扩到100，在相同2M环境步和相同trajectory exposure下把Actor/PID事件减半。训练batch的整体outage跳变约下降41%、末段标准差下降25%，所以更多独立trajectory确实降低了Bernoulli风险反馈的方差。这是可复用的工程事实，不因最终失败而否认。
+
+但fresh512只从B40的reward/outage 0.9896/0.2324变为B80的0.8330/0.2266。outage减少0.0059的区间跨0且仍高于双侧目标带，reward却显著下降0.1565。更大的num_envs不是免费性能提升：固定env-step预算下，full-batch Actor更新事件从50减到25，PPO KL和clip fraction约减半，策略学习明显不足。它减少观测噪声，却同时放慢以optimizer step计的学习时钟。
+
+目标函数必须保持双侧：真实outage先贴近0.20，再最大化mean reward。outage低于0.18且reward下降是过度保守失败，不是安全加分；outage高于0.22是风险不足。retention guard只回滚使旧rollout Brier恶化的cost critic更新，不读取这一双侧目标，也不更新PID/lambda，因此不能拿它解决B80或终点相位问题。
+
+### 13.141 下一步只补偿Actor时钟，不把大batch、critic和控制器混在一起（2026-07-18）
+
+C-H21把B80 actor初始学习率从3e-4加到6e-4，其余配置完全冻结。因为B80的Adam step数减半，这使名义累计步长恢复到B40水平；它不是严格数学等价，所以上限由PPO KL、clip fraction与fresh风险共同约束，而不是只看训练reward。
+
+不同时放大critic LR，是因为C-H20的fresh cost critic误差并未改善：CDF误差、mean-cost误差、BSS和crossing总体混合偏坏。若actor-only补偿成功，说明num_envs可以与optimizer时钟配套使用；若reward恢复但outage超支，说明更激进actor只是沿旧reward--risk前沿移动，下一路线应显式解耦sampling batch和optimizer minibatch，或重新设计闭环风险信用，而不是继续扫描学习率。
+
+一条更规范但代码量更大的分歧路线，是B80采样后按trajectory拆为两个B40 PPO minibatch，同时在整批上冻结old log-prob、GAE与risk weights。这能保留B80的风险统计稳定性及B40的optimizer step数，但需要严格处理time-major recurrent state和PPO顺序；先用C-H21判断“时钟补偿”是否值得投入该改造。QCPO_refs默认是单full-batch、8 epochs，不能错误地把多minibatch当作其稳定性来源。
