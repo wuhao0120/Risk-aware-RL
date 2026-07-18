@@ -547,6 +547,17 @@ class DQCACBetaGPU(VecAgentBase):
             "beta_mean": 0.0, "log_beta_abs_max": 0.0,
             "head_grad_norm": 0.0,
         }
+        # 状态cost head的最后一次训练/advantage诊断进入final JSON；
+        # 默认关闭时保持固定零值，不创建tensor或额外module。
+        self.last_cost_state_value_info = {
+            'value_loss': 0.0, 'quantile_loss': 0.0, 'mean_loss': 0.0,
+            'prediction_mean': 0.0, 'target_mean': 0.0,
+            'mean_abs_error': 0.0, 'crossing_fraction': 0.0,
+            'grad_norm': 0.0,
+        }
+        self.last_cost_state_advantage_mean = 0.0
+        self.last_cost_state_advantage_std = 0.0
+        self.last_cost_state_actor_advantage_std = 0.0
         self.advantage_norm = getattr(args, 'advantage_norm', 'qcpo')
         self.entropy_coef = getattr(args, 'entropy_coef', 0.0)
         self.lambda_max = getattr(args, 'lambda_max', 50.0)
@@ -616,6 +627,44 @@ class DQCACBetaGPU(VecAgentBase):
         self.log_std_min = float(getattr(args, 'log_std_min', -5.0))
         self.log_std_max = float(getattr(args, 'log_std_max', 2.0))
 
+        # 风险信用来源做成显式消融：action_cdf保持历史DQCAC；新模式迁移
+        # QCPO_refs的state-value cost distribution与逐quantile GAE。所有新增
+        # 超参在默认关闭时只保存Python标量，不构造模块或推进任意RNG。
+        self.cost_actor_advantage_mode = str(getattr(
+            args, 'cost_actor_advantage_mode', 'action_cdf')).lower()
+        valid_cost_advantage_modes = {
+            'action_cdf', 'qcpo_state_quantile_gae'}
+        if self.cost_actor_advantage_mode not in valid_cost_advantage_modes:
+            raise ValueError(
+                "cost_actor_advantage_mode must be 'action_cdf' or "
+                "'qcpo_state_quantile_gae'")
+        self.cost_state_value_enabled = (
+            self.cost_actor_advantage_mode == 'qcpo_state_quantile_gae')
+        self.cost_state_gradient_mode = str(getattr(
+            args, 'cost_state_gradient_mode', 'head_only')).lower()
+        self.cost_state_value_lr = float(getattr(
+            args, 'cost_state_value_lr', 3e-4))
+        self.cost_state_value_grad_clip = float(getattr(
+            args, 'cost_state_value_grad_clip', 10.0))
+        self.cost_state_value_cost_scale = float(getattr(
+            args, 'cost_state_value_cost_scale', 10.0))
+        self.cost_state_gae_lambda = float(getattr(
+            args, 'cost_state_gae_lambda', self.gae_lambda))
+        self.cost_state_huber_kappa = float(getattr(
+            args, 'cost_state_huber_kappa', 1.0))
+        self.cost_state_quantile_loss_coef = float(getattr(
+            args, 'cost_state_quantile_loss_coef', 1.0))
+        self.cost_state_mean_loss_coef = float(getattr(
+            args, 'cost_state_mean_loss_coef', 0.5))
+        self.cost_state_tail_prob = float(getattr(
+            args, 'cost_state_tail_prob', 0.3))
+        self.cost_state_advantage_norm = str(getattr(
+            args, 'cost_state_advantage_norm', 'reference')).lower()
+        self.cost_state_target_index = int(np.floor(
+            self.num_quantiles * (1.0 - self.q_alpha) - 0.5))
+        self.cost_state_tail_index = int(np.floor(
+            self.num_quantiles * (1.0 - self.cost_state_tail_prob) - 0.5))
+
         # policy_arch=mlp_lstm 时，actor 与 reward V 共享一个已经和 QCPO_refs
         # 数值逐项对拍的 MLP+LSTM 骨干。分布 critic 仍保持 DQCAC 所需的
         # action-conditioned Z(s,a)，不能误换成 QCPO_refs 的 state-value cost head。
@@ -647,7 +696,10 @@ class DQCACBetaGPU(VecAgentBase):
                 normalize_observation=self.normalize_observation,
                 var_clip=self.obs_norm_var_clip,
                 cost_adapter_width=self.cost_adapter_width,
-                cost_adapter_scale=self.cost_adapter_scale).to(self.device)
+                cost_adapter_scale=self.cost_adapter_scale,
+                cost_value_quantiles=(
+                    self.num_quantiles if self.cost_state_value_enabled else 0)
+                ).to(self.device)
 
         # cost history 三路线：
         # - raw：历史默认，只看当前 Markov observation；
@@ -679,6 +731,82 @@ class DQCACBetaGPU(VecAgentBase):
             if self.cost_target_mode != 'mc':
                 raise ValueError(
                     "cost_actor_feature_refresh currently requires cost_target_mode='mc'")
+
+        # 首轮状态cost-GAE只接入已验证的C-H18 recurrent/MC-QR主线，禁止同时
+        # 混入replay、Weibull、旧shared-cost或optimizer minibatch。这样短筛的
+        # 唯一因变量就是风险信用来源；机制通过后再逐项开放组合消融。
+        if self.cost_state_value_enabled:
+            if not self.recurrent_policy or self.reward_actor_mode != 'gae_ppo':
+                raise ValueError(
+                    "QCPO state quantile-GAE requires recurrent gae_ppo")
+            if not self.episodic:
+                raise ValueError(
+                    "first QCPO state quantile-GAE ablation requires episodic=True")
+            if self.cost_target_mode != 'mc':
+                raise ValueError(
+                    "QCPO state quantile-GAE currently requires cost_target_mode='mc'")
+            if (self.cost_history_mode != 'actor_feature'
+                    or self.cost_distribution_model != 'qr'
+                    or self.cost_quantile_grid_mode != 'uniform'
+                    or self.cost_actor_query_mode != 'online'
+                    or self.cost_cdf_estimator != 'quantile'):
+                raise ValueError(
+                    "QCPO state quantile-GAE first ablation requires the "
+                    "actor_feature/QR/uniform/online-quantile diagnostic path")
+            if self.actor_update_interval != 1:
+                raise ValueError(
+                    "QCPO state quantile-GAE currently requires actor_update_interval=1")
+            if self.optimizer_minibatch_trajectories != 0:
+                raise ValueError(
+                    "QCPO state quantile-GAE currently requires full-batch optimizer steps")
+            if self.cost_state_gradient_mode != 'head_only':
+                raise ValueError(
+                    "first QCPO state quantile-GAE ablation requires "
+                    "cost_state_gradient_mode='head_only'; shared_backbone is a "
+                    "separate follow-up after the isolated credit test")
+            if self.cost_state_value_lr <= 0.0:
+                raise ValueError("cost_state_value_lr must be positive")
+            if self.cost_state_value_grad_clip < 0.0:
+                raise ValueError(
+                    "cost_state_value_grad_clip must be non-negative")
+            if self.cost_state_value_cost_scale <= 0.0:
+                raise ValueError(
+                    "cost_state_value_cost_scale must be positive")
+            if not 0.0 <= self.cost_state_gae_lambda <= 1.0:
+                raise ValueError("cost_state_gae_lambda must lie in [0,1]")
+            if self.cost_state_huber_kappa <= 0.0:
+                raise ValueError("cost_state_huber_kappa must be positive")
+            if self.cost_state_quantile_loss_coef < 0.0:
+                raise ValueError(
+                    "cost_state_quantile_loss_coef must be non-negative")
+            if self.cost_state_mean_loss_coef < 0.0:
+                raise ValueError(
+                    "cost_state_mean_loss_coef must be non-negative")
+            if not self.q_alpha <= self.cost_state_tail_prob < 1.0:
+                raise ValueError(
+                    "cost_state_tail_prob must lie in [q_alpha,1)")
+            if self.cost_state_advantage_norm not in {
+                    'reference', 'standardize'}:
+                raise ValueError(
+                    "cost_state_advantage_norm must be 'reference' or 'standardize'")
+            if not 0 <= self.cost_state_tail_index <= self.cost_state_target_index:
+                raise ValueError(
+                    "state cost tail index must not exceed target outage index")
+            if self.cost_state_target_index >= self.num_quantiles:
+                raise ValueError(
+                    "state cost target outage index exceeds quantile count")
+            if (self.cost_actor_mc_correction_coef > 0.0
+                    or self.cost_actor_feature_refresh
+                    or self.cost_s0_aux_coef > 0.0
+                    or self.cost_transition_replay_batches > 0
+                    or self.cost_holdout_guard
+                    or self.cost_weibull_tail_coef > 0.0
+                    or self.cost_shared_backbone_coef > 0.0
+                    or self.cost_adapter_width > 0):
+                raise ValueError(
+                    "QCPO state quantile-GAE first ablation cannot combine "
+                    "MC correction, refresh, replay/guard, Weibull or old shared-cost paths")
+
         if self.cost_s0_aux_coef > 0.0:
             if self.cost_target_mode != 'mc':
                 raise ValueError("cost_s0_aux_coef>0 currently requires cost_target_mode='mc'")
@@ -1156,7 +1284,25 @@ class DQCACBetaGPU(VecAgentBase):
                  & (iqn_query_taus <= local_high)).sum().item())
 
         # -------------------- actor 两时间尺度优化器 (Adam, 与模板一致) --------------------
-        self.actor_optimizer = Adam(self.actor.parameters(), 1.0, eps=1e-5)
+        # head_only时policy Adam明确排除state-cost head；独立Adam只写head，避免
+        # 同一Parameter被两个优化器交替更新。默认关闭时列表与旧actor.parameters()
+        # 顺序完全相同；shared_backbone则由联合PPO loss一次反传全部actor参数。
+        all_actor_parameters = list(self.actor.parameters())
+        self.cost_state_value_optimizer = None
+        if (self.cost_state_value_enabled
+                and self.cost_state_gradient_mode == 'head_only'):
+            cost_state_parameters = list(self.actor.cost_value.parameters())
+            cost_state_parameter_ids = {
+                id(parameter) for parameter in cost_state_parameters}
+            self.actor_trainable_parameters = [
+                parameter for parameter in all_actor_parameters
+                if id(parameter) not in cost_state_parameter_ids]
+            self.cost_state_value_optimizer = Adam(
+                cost_state_parameters, self.cost_state_value_lr, eps=1e-5)
+        else:
+            self.actor_trainable_parameters = all_actor_parameters
+        self.actor_optimizer = Adam(
+            self.actor_trainable_parameters, 1.0, eps=1e-5)
         self.actor_scheduler = LambdaLR(
             self.actor_optimizer,
             lr_lambda=lambda k: lr_lambda(k, args.theta_a, args.theta_b, args.theta_c))
@@ -1433,6 +1579,11 @@ class DQCACBetaGPU(VecAgentBase):
               f"optimizer_mb={self.optimizer_minibatch_trajectories}"
               f"x{self.optimizer_minibatch_count}, reward_actor={self.reward_actor_mode}, "
               f"ppo_target_kl={self.ppo_target_kl:g}, "
+              f"actor_cost_adv={self.cost_actor_advantage_mode}"
+              f"/grad{self.cost_state_gradient_mode}"
+              f"/scale{self.cost_state_value_cost_scale:g}"
+              f"/gae{self.cost_state_gae_lambda:g}"
+              f"/norm{self.cost_state_advantage_norm}, "
               f"actor_cost_query={self.cost_actor_query_mode}"
               f"/mcfix{self.cost_actor_mc_correction_coef:g}"
               f":{self.cost_actor_mc_correction_mode}"
@@ -1471,6 +1622,10 @@ class DQCACBetaGPU(VecAgentBase):
             # GAE 与 value target 每个 rollout 固定一次，供后续多个 epoch 共同使用。
             if self.reward_actor_mode != 'distributional':
                 self._prepare_reward_gae(batch)
+            # state-cost advantage必须在本轮任何head/critic optimizer step之前冻结；
+            # 这与old log-prob同属behavior-policy监督，后续全部PPO epoch只复用。
+            if self.cost_state_value_enabled:
+                self._prepare_cost_state_quantile_gae(batch)
             # obs norm 首批只建立 moments；随后 PPO ratio 才比较同一批的 old/current policy。
             norm_warmup = self.obs_norm_warmup_iters if self.normalize_observation else 0
             in_warmup = it < max(self.warmup_iters, norm_warmup)
@@ -1596,6 +1751,12 @@ class DQCACBetaGPU(VecAgentBase):
                     or not cost_holdout_state['stopped'])
                 critic_info = self.update_critic(
                     selected_batch, apply_cost_update=cost_update_allowed)
+                # head-only状态cost分布与action-Q critic共享更新时钟，但使用独立
+                # optimizer。warmup期间也训练它；冻结actor advantage已在循环外生成。
+                if (self.cost_state_value_enabled
+                        and self.cost_state_gradient_mode == 'head_only'):
+                    critic_info.update(
+                        self.update_cost_state_value_head(selected_batch))
                 # 在同一步actor epoch之前完成验证/回滚；因此被拒绝的head不会继续
                 # 驱动本epoch风险优势。optimizer-minibatch首轮已显式禁用guard。
                 cost_update_retained = bool(
@@ -2720,6 +2881,11 @@ class DQCACBetaGPU(VecAgentBase):
                 'boot_actions': boot_actions.detach(),
                 'boot_cost_features': boot_cost_features.detach(),
             })
+            if self.cost_state_value_enabled:
+                # s_T feature只供continuing口径的末步bootstrap与诊断；首轮episodic
+                # 配方会用done mask置零，但仍保存它以验证完整接口和未来扩展。
+                batch['_cost_state_terminal_feature'] = (
+                    roll['terminal_feature'].detach())
             if self.cost_history_mode == 'actor_feature':
                 # 统一 key 让后续调用不必猜测 feature 来源；仍保留 actor_feature
                 # 供行为策略诊断，且两者都已 detach。
@@ -4435,6 +4601,270 @@ class DQCACBetaGPU(VecAgentBase):
                 "sample_weights length must match transition batch size")
         return (per_transition * sample_weights.reshape(-1)).mean()
 
+    # ============================================================ QCPO_refs 状态cost分布 + quantile-GAE ============================================================
+    @torch.no_grad()
+    def _prepare_cost_state_quantile_gae(self, batch):
+        """
+        用behavior state-cost head一次性冻结逐quantile GAE、QR target与actor权重。
+
+        参考链路（全部在cost/scale单位）:
+            delta_t^i = c_t + gamma_c * Q_{t+1}^i - Q_t^i
+            A_t^i = delta_t^i + gamma_c * lambda_c * A_{t+1}^i
+            Y_t^i = c_t + gamma_c * Q_{t+1}^i
+        Actor选i=floor(N*(1-omega)-0.5)；首轮不乘Weibull density-ratio，
+        因此本消融只回答“状态分布+quantile-GAE信用”是否优于action-Q CDF信用。
+
+        该函数必须位于本rollout任何optimizer step之前。Q_t来自产生行为数据时
+        保存的LSTM feature与旧head；之后即使head训练10次、actor PPO多epoch，
+        风险advantage和监督target也保持冻结，不产生同批标签泄漏。
+        """
+        if not self.cost_state_value_enabled:
+            raise RuntimeError(
+                "state quantile-GAE preparation requested while mode is disabled")
+        if self.actor.cost_value is None:
+            raise RuntimeError("recurrent actor is missing the state cost head")
+
+        n, B = self.n, int(batch.get('_actor_num_envs', self.num_envs))
+        expected_rows = n * B
+        behavior_feature = batch.get('actor_feature')
+        terminal_feature = batch.get('_cost_state_terminal_feature')
+        if behavior_feature is None or terminal_feature is None:
+            raise KeyError(
+                "state quantile-GAE requires rollout actor and terminal features")
+        if tuple(behavior_feature.shape) != (
+                expected_rows, self.actor.lstm_size):
+            raise ValueError(
+                "behavior actor feature must have shape [T*B,lstm_size]")
+        if tuple(terminal_feature.shape) != (
+                B, self.actor.lstm_size):
+            raise ValueError(
+                "terminal actor feature must have shape [B,lstm_size]")
+
+        # Head输出是cost/scale单位；排序只用于quantile Bellman/GAE对齐，
+        # QR loss仍以原head顺序和固定tau训练，逐式对应QCPO_refs。
+        behavior_distribution = self.actor.cost_distribution(
+            behavior_feature).reshape(n, B, self.num_quantiles)
+        terminal_distribution = self.actor.cost_distribution(
+            terminal_feature).reshape(B, self.num_quantiles)
+        sorted_distribution = torch.sort(
+            behavior_distribution, dim=-1).values
+        sorted_terminal = torch.sort(
+            terminal_distribution, dim=-1).values
+
+        # 首轮实验是固定T完整episode：最后一步done=1，不bootstrap。保留
+        # continuing分支是为了让公式接口完整，但初始化校验暂时禁止正式使用。
+        not_done = torch.ones(
+            n, B, dtype=sorted_distribution.dtype, device=self.device)
+        if self.episodic:
+            not_done[-1].zero_()
+        next_distribution = torch.cat([
+            sorted_distribution[1:],
+            sorted_terminal.unsqueeze(0),
+        ], dim=0)
+        scaled_cost = (
+            batch['costs'].reshape(n, B) / self.cost_state_value_cost_scale)
+        one_step_target = (
+            scaled_cost.unsqueeze(-1)
+            + self.cost_gamma * not_done.unsqueeze(-1) * next_distribution)
+        temporal_difference = one_step_target - sorted_distribution
+
+        # 反向递推保留每条环境轨迹和每个quantile独立的eligibility trace；
+        # 不在此处再乘beta^t，因为GAE本身已经包含gamma_c的时间折扣。
+        advantage = torch.empty_like(temporal_difference)
+        running_advantage = torch.zeros(
+            B, self.num_quantiles,
+            dtype=sorted_distribution.dtype, device=self.device)
+        trace_discount = self.cost_gamma * self.cost_state_gae_lambda
+        for t in range(n - 1, -1, -1):
+            running_advantage = (
+                temporal_difference[t]
+                + trace_discount * not_done[t].unsqueeze(-1)
+                * running_advantage)
+            advantage[t] = running_advantage
+        quantile_return = advantage + sorted_distribution
+
+        # QCPO_refs只在Weibull tail内保留cost advantages，再取目标outage quantile。
+        # reference模式复现源码默认normalize_cost_advantage=False；standardize
+        # 则按源码可选normalize()在整个[T,B,tail]上做一次中心化/标准化。
+        tail_advantage = advantage[:, :, self.cost_state_tail_index:]
+        actor_tail_advantage = tail_advantage
+        if self.cost_state_advantage_norm == 'standardize':
+            tail_mean = tail_advantage.mean()
+            tail_std = tail_advantage.std(unbiased=False).clamp_min(1e-6)
+            actor_tail_advantage = (
+                tail_advantage - tail_mean) / tail_std
+        selected_offset = (
+            self.cost_state_target_index - self.cost_state_tail_index)
+        selected_raw = tail_advantage[:, :, selected_offset]
+        selected_actor = actor_tail_advantage[:, :, selected_offset]
+
+        # 所有字段按time-major [t*B+j]展平，与action、old-logpi和reward GAE对齐。
+        batch['_cost_state_quantile_target'] = (
+            one_step_target.reshape(expected_rows, self.num_quantiles).detach())
+        batch['_cost_state_mean_target'] = (
+            quantile_return.mean(dim=-1).reshape(expected_rows).detach())
+        batch['_cost_state_advantage_raw'] = (
+            selected_raw.reshape(expected_rows).detach())
+        batch['_cost_state_actor_advantage'] = (
+            selected_actor.reshape(expected_rows).detach())
+        batch['_cost_state_behavior_distribution'] = (
+            behavior_distribution.reshape(
+                expected_rows, self.num_quantiles).detach())
+        batch['_cost_state_tail_advantage_std'] = float(
+            tail_advantage.std(unbiased=False).item())
+        batch['_cost_state_target_mean'] = float(
+            one_step_target.mean().item())
+        batch['_cost_state_behavior_mean'] = float(
+            behavior_distribution.mean().item())
+        self.last_cost_state_advantage_mean = float(
+            selected_raw.mean().item())
+        self.last_cost_state_advantage_std = float(
+            selected_raw.std(unbiased=False).item())
+        self.last_cost_state_actor_advantage_std = float(
+            selected_actor.std(unbiased=False).item())
+
+    def _cost_state_value_objective(self, actor_features, batch):
+        """
+        计算QCPO_refs尺度的state-cost QR + mean-value监督，返回可反传标量。
+
+        actor_features在head_only路径已经detach；因此backward只会产生
+        actor.cost_value参数梯度。prediction tau与target tau做完整NxN配对，
+        所有transition/head/target元素取mean，严格对应参考quantile_huber_loss。
+        """
+        if not self.cost_state_value_enabled or self.actor.cost_value is None:
+            raise RuntimeError("state cost objective requested while disabled")
+        target_quantiles = batch.get('_cost_state_quantile_target')
+        mean_target = batch.get('_cost_state_mean_target')
+        if target_quantiles is None or mean_target is None:
+            raise KeyError(
+                "call _prepare_cost_state_quantile_gae before state cost updates")
+        expected_rows = int(batch['actions'].shape[0])
+        if tuple(actor_features.shape) != (
+                expected_rows, self.actor.lstm_size):
+            raise ValueError(
+                "state cost actor features must have shape [T*B,lstm_size]")
+        if tuple(target_quantiles.shape) != (
+                expected_rows, self.num_quantiles):
+            raise ValueError(
+                "state cost quantile target must have shape [T*B,N]")
+
+        prediction = self.actor.cost_distribution(
+            actor_features, detach_feature=True)
+        if not bool(torch.isfinite(prediction).all()):
+            raise FloatingPointError(
+                "state cost exp head produced non-finite quantiles")
+
+        # pairwise_delta[m,i,j]=target_j-prediction_i；indicator detach，
+        # 与参考实现一样不对分位点次序判定求导。
+        pairwise_delta = (
+            target_quantiles.unsqueeze(1) - prediction.unsqueeze(2))
+        absolute_delta = pairwise_delta.abs()
+        kappa = self.cost_state_huber_kappa
+        huber = torch.where(
+            absolute_delta > kappa,
+            kappa * (absolute_delta - 0.5 * kappa),
+            0.5 * pairwise_delta.pow(2))
+        tau = self.taus.to(
+            device=prediction.device, dtype=prediction.dtype).view(
+                1, self.num_quantiles, 1)
+        quantile_weight = (
+            tau - (pairwise_delta.detach() < 0).to(prediction.dtype)).abs()
+        quantile_loss = (quantile_weight * huber).mean()
+
+        # c_return用quantile-GAE return的均值；线性期望下等价于参考标量
+        # generalized_advantage_estimation(c_value)的lambda-return。
+        mean_prediction = prediction.mean(dim=-1)
+        mean_error = mean_prediction - mean_target
+        mean_loss = 0.5 * mean_error.pow(2).mean()
+        objective = (
+            self.cost_state_quantile_loss_coef * quantile_loss
+            + self.cost_state_mean_loss_coef * mean_loss)
+
+        # head未强制non-crossing；相邻固定tau输出逆序率用于判断训练是否退化。
+        crossing_fraction = (
+            (prediction[:, 1:] < prediction[:, :-1]).float().mean()
+            if self.num_quantiles > 1 else prediction.new_zeros(()))
+        info = {
+            'critic/cost_state_value_loss': float(
+                objective.detach().item()),
+            'critic/cost_state_quantile_loss': float(
+                quantile_loss.detach().item()),
+            'critic/cost_state_mean_loss': float(
+                mean_loss.detach().item()),
+            'critic/cost_state_prediction_mean': float(
+                mean_prediction.detach().mean().item()),
+            'critic/cost_state_prediction_std': float(
+                prediction.detach().std(unbiased=False).item()),
+            'critic/cost_state_target_mean': float(
+                target_quantiles.mean().item()),
+            'critic/cost_state_mean_target_mean': float(
+                mean_target.mean().item()),
+            'critic/cost_state_mean_abs_error': float(
+                mean_error.detach().abs().mean().item()),
+            'critic/cost_state_crossing_fraction': float(
+                crossing_fraction.detach().item()),
+        }
+        return objective, info
+
+    def update_cost_state_value_head(self, batch):
+        """
+        在当前actor坐标上执行一次独立state-cost head Adam step。
+
+        每个critic epoch都重算当前MLP+LSTM feature，但在no_grad下阻断主干；
+        这样head不会持续拟合actor更新前的陈旧坐标，也不会改变behavior policy。
+        target与风险advantage则始终来自rollout前冻结的旧head，二者不能混淆。
+        """
+        if (not self.cost_state_value_enabled
+                or self.cost_state_gradient_mode != 'head_only'
+                or self.cost_state_value_optimizer is None):
+            raise RuntimeError("head-only state cost optimizer is unavailable")
+
+        with torch.no_grad():
+            current_features = (
+                self._recompute_recurrent_actor_features(batch).detach())
+        objective, info = self._cost_state_value_objective(
+            current_features, batch)
+
+        self.cost_state_value_optimizer.zero_grad(set_to_none=True)
+        objective.backward()
+        state_parameters = list(self.actor.cost_value.parameters())
+        if self.cost_state_value_grad_clip > 0.0:
+            grad_norm = nn.utils.clip_grad_norm_(
+                state_parameters, self.cost_state_value_grad_clip)
+        else:
+            grad_norm = torch.zeros((), device=self.device)
+        if not bool(torch.isfinite(grad_norm)):
+            raise FloatingPointError(
+                "state cost head gradient norm became non-finite")
+        self.cost_state_value_optimizer.step()
+
+        info.update({
+            'critic/cost_state_grad_norm': float(grad_norm.item()),
+            'critic/cost_state_grad_clip_fraction': float(
+                grad_norm.item() > self.cost_state_value_grad_clip
+                if self.cost_state_value_grad_clip > 0.0 else 0.0),
+            'debug/cost_state_value_enabled': 1.0,
+            'debug/cost_state_gradient_is_head_only': 1.0,
+            'debug/cost_state_target_index': float(
+                self.cost_state_target_index),
+            'debug/cost_state_tail_index': float(
+                self.cost_state_tail_index),
+        })
+        self.last_cost_state_value_info = {
+            'value_loss': info['critic/cost_state_value_loss'],
+            'quantile_loss': info['critic/cost_state_quantile_loss'],
+            'mean_loss': info['critic/cost_state_mean_loss'],
+            'prediction_mean': info[
+                'critic/cost_state_prediction_mean'],
+            'target_mean': info['critic/cost_state_target_mean'],
+            'mean_abs_error': info[
+                'critic/cost_state_mean_abs_error'],
+            'crossing_fraction': info[
+                'critic/cost_state_crossing_fraction'],
+            'grad_norm': info['critic/cost_state_grad_norm'],
+        }
+        return info
+
     # ============================================================ 可选 reward V+GAE ============================================================
     def _prepare_reward_gae(self, batch):
         """
@@ -4699,9 +5129,10 @@ class DQCACBetaGPU(VecAgentBase):
         """
         用固定 behavior hidden/logπ/GAE target 执行一次 recurrent PPO 更新。
 
-        reward-V 与 actor 共享 QCPO_refs 同形骨干，因此只做一次联合 backward；cost
-        advantage 仍来自 DQCAC 的 action-conditioned distributional critic，并在首个
-        actor epoch 后缓存，防止后续 critic epoch 移动 PPO 的监督目标。
+        reward-V与actor共享QCPO_refs同形骨干，因此只做一次联合backward。默认
+        cost advantage来自DQCAC action-conditioned critic；新消融改用rollout前
+        冻结的state quantile-GAE。两种模式都在首个actor epoch后缓存，防止随后
+        critic/head更新移动PPO监督目标。
         """
         transform = self._transform_recurrent
         n = self.n
@@ -4797,20 +5228,32 @@ class DQCACBetaGPU(VecAgentBase):
                     batch, psi_cdf, baseline_cdf,
                     update_balance_stats=(
                         self.cost_actor_mc_correction_mode == 'rms_balanced'))
-                raw_adv_c = risk_components['blended']
+                action_cdf_advantage = risk_components['blended']
                 if self.cost_actor_mc_correction_mode == 'rms_balanced':
                     # 与组件EMA相同，每个behavior batch只在首个PPO epoch更新一次；
                     # 当前raw_adv正是随后全部epoch复用的风险监督。
                     self._ema_update(
                         self.constraint_rms,
-                        float(raw_adv_c.mean().item()),
-                        float(raw_adv_c.var(unbiased=False).item()))
+                        float(action_cdf_advantage.mean().item()),
+                        float(action_cdf_advantage.var(unbiased=False).item()))
 
-                if self.advantage_norm == 'qcpo':
-                    normalized_adv_c = raw_adv_c / self.constraint_rms.std
+                if self.cost_state_value_enabled:
+                    # 正式actor权重来自rollout前冻结的状态quantile-GAE；这里仍
+                    # 完整计算action-Q CDF，作为同批信用相关性内部对照，不参与loss。
+                    raw_adv_c = batch['_cost_state_advantage_raw']
+                    risk_weight_flat = batch['_cost_state_actor_advantage']
+                    batch['_risk_advantage_action_cdf_raw'] = (
+                        action_cdf_advantage.detach())
                 else:
-                    normalized_adv_c = self._maybe_norm(raw_adv_c)
-                risk_weight_flat = batch['e'] * normalized_adv_c
+                    raw_adv_c = action_cdf_advantage
+                    if self.advantage_norm == 'qcpo':
+                        normalized_adv_c = (
+                            raw_adv_c / self.constraint_rms.std)
+                    else:
+                        normalized_adv_c = self._maybe_norm(raw_adv_c)
+                    # 历史DQCAC额外使用Abel beta^t；state quantile-GAE已在递推中
+                    # 使用gamma_c，不能重复施加一个时间折扣。
+                    risk_weight_flat = batch['e'] * normalized_adv_c
                 batch['_risk_weight'] = risk_weight_flat.detach()
                 batch['_risk_advantage_raw'] = raw_adv_c.detach()
                 batch['_risk_cdf'] = psi_cdf.detach()
@@ -4943,7 +5386,7 @@ class DQCACBetaGPU(VecAgentBase):
                         "shared cost actor backward unexpectedly wrote cost-head gradients")
             if self.actor_grad_clip and self.actor_grad_clip > 0:
                 grad_norm = nn.utils.clip_grad_norm_(
-                    self.actor.parameters(), self.actor_grad_clip)
+                    self.actor_trainable_parameters, self.actor_grad_clip)
             else:
                 grad_norm = torch.zeros((), device=self.device)
             self.actor_optimizer.step()
@@ -5001,6 +5444,32 @@ class DQCACBetaGPU(VecAgentBase):
             'advantage/risk_adv_abs_mean': float(raw_adv_c.abs().mean().item()),
             'advantage/risk_adv_nonzero_fraction': float(
                 (raw_adv_c.abs() > 1e-6).float().mean().item()),
+            # state模式下主risk_adv键代表quantile-GAE；action_cdf键保留原
+            # action-Q信用作为同批对照。默认模式不新增前向或张量缓存。
+            'advantage/risk_action_cdf_blended_std': float(
+                batch.get(
+                    '_risk_advantage_action_cdf_raw',
+                    batch['_risk_advantage_raw']).std(
+                        unbiased=False).item()),
+            'advantage/risk_source_is_state_quantile_gae': float(
+                self.cost_state_value_enabled),
+            'advantage/cost_state_raw_mean': float(
+                batch['_cost_state_advantage_raw'].mean().item()
+                if self.cost_state_value_enabled else 0.0),
+            'advantage/cost_state_raw_std': float(
+                batch['_cost_state_advantage_raw'].std(
+                    unbiased=False).item()
+                if self.cost_state_value_enabled else 0.0),
+            'advantage/cost_state_actor_std': float(
+                batch['_cost_state_actor_advantage'].std(
+                    unbiased=False).item()
+                if self.cost_state_value_enabled else 0.0),
+            'advantage/cost_state_tail_std': float(
+                batch.get('_cost_state_tail_advantage_std', 0.0)),
+            'advantage/cost_state_behavior_mean': float(
+                batch.get('_cost_state_behavior_mean', 0.0)),
+            'advantage/cost_state_target_mean': float(
+                batch.get('_cost_state_target_mean', 0.0)),
             'advantage/risk_critic_adv_std': float(
                 batch['_risk_advantage_critic_raw'].std(
                     unbiased=False).item()),
@@ -5850,6 +6319,19 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_actor_mc_balance_std_floor),
             'debug/cost_actor_mc_balance_ratio_max': (
                 self.cost_actor_mc_balance_ratio_max),
+            'debug/cost_actor_advantage_is_state_quantile_gae': float(
+                self.cost_state_value_enabled),
+            'debug/cost_state_gradient_is_head_only': float(
+                self.cost_state_gradient_mode == 'head_only'),
+            'debug/cost_state_value_cost_scale': (
+                self.cost_state_value_cost_scale),
+            'debug/cost_state_gae_lambda': self.cost_state_gae_lambda,
+            'debug/cost_state_target_index': float(
+                self.cost_state_target_index),
+            'debug/cost_state_tail_index': float(
+                self.cost_state_tail_index),
+            'debug/cost_state_advantage_is_standardized': float(
+                self.cost_state_advantage_norm == 'standardize'),
             'debug/cost_cdf_is_sigmoid': float(
                 self.cost_cdf_mode == 'sigmoid'),
             'debug/cost_cdf_temperature': self.cost_cdf_temperature,
@@ -6266,6 +6748,36 @@ class DQCACBetaGPU(VecAgentBase):
                 self.cost_actor_mc_balance_std_floor),
             'cost_actor_mc_balance_ratio_max': (
                 self.cost_actor_mc_balance_ratio_max),
+            'cost_actor_advantage_mode': self.cost_actor_advantage_mode,
+            'cost_state_value_enabled': self.cost_state_value_enabled,
+            'cost_state_gradient_mode': self.cost_state_gradient_mode,
+            'cost_state_value_lr': self.cost_state_value_lr,
+            'cost_state_value_grad_clip': (
+                self.cost_state_value_grad_clip),
+            'cost_state_value_cost_scale': (
+                self.cost_state_value_cost_scale),
+            'cost_state_gae_lambda': self.cost_state_gae_lambda,
+            'cost_state_huber_kappa': self.cost_state_huber_kappa,
+            'cost_state_quantile_loss_coef': (
+                self.cost_state_quantile_loss_coef),
+            'cost_state_mean_loss_coef': self.cost_state_mean_loss_coef,
+            'cost_state_tail_prob': self.cost_state_tail_prob,
+            'cost_state_tail_index': self.cost_state_tail_index,
+            'cost_state_target_index': self.cost_state_target_index,
+            'cost_state_advantage_norm': (
+                self.cost_state_advantage_norm),
+            'cost_state_head_parameter_count': (
+                0 if getattr(self.actor, 'cost_value', None) is None else
+                sum(parameter.numel()
+                    for parameter in self.actor.cost_value.parameters())),
+            'cost_state_value_last': dict(
+                self.last_cost_state_value_info),
+            'cost_state_advantage_mean_last': (
+                self.last_cost_state_advantage_mean),
+            'cost_state_advantage_std_last': (
+                self.last_cost_state_advantage_std),
+            'cost_state_actor_advantage_std_last': (
+                self.last_cost_state_actor_advantage_std),
             'risk_query_target_online_abs_mean': (
                 self.last_risk_query_target_online_abs_mean),
             'cost_s0_aux_coef': self.cost_s0_aux_coef,

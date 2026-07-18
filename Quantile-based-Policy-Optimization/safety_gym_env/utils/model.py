@@ -134,16 +134,17 @@ class RecurrentActorValue(nn.Module):
         log_std 是可学习的逐动作全局参数
         feature_t = MLP_feature_t + LSTM_output_t（lstm_skip=True 时）
 
-    cost distribution 不放进本类：DQCAC 仍需 action-conditioned Z_c(history,a)，不能用
-    QCPO_refs 的 state-value cost head 偷换算法语义。两个算法会共享这里的 policy/V 骨干，
-    各自的 constraint critic 作为独立 head/网络接入。
+    默认不创建 cost distribution，严格保留历史 DQCAC 的 action-conditioned
+    Z_c(history,a)。显式启用 QCPO quantile-GAE 消融时，才额外挂接参考实现同形的
+    state-value cost head exp(Linear(feature))；原 action-conditioned critic 仍保留，
+    因而可以在同一 rollout 上比较两种风险信用，而不是永久偷换算法语义。
     """
 
     def __init__(self, observation_dim, action_dim, hidden=None, lstm_size=512,
                  lstm_skip=True, init_std=1.0, learn_std=True,
                  normalize_observation=True, var_clip=1e-6,
                  hidden_nonlinearity='tanh', cost_adapter_width=0,
-                 cost_adapter_scale=1.0):
+                 cost_adapter_scale=1.0, cost_value_quantiles=0):
         """
         Args:
             observation_dim: 已追加 previous_cost 后的维度，即 raw_state_dim+1。
@@ -156,6 +157,8 @@ class RecurrentActorValue(nn.Module):
             cost_adapter_width: 正数时在共享feature后增加H→W→H零初始化残差adapter；
                                 0保持QCPO与历史DQCAC逐式结构不变。
             cost_adapter_scale: adapter残差的固定缩放系数。
+            cost_value_quantiles: 正数时创建QCPO_refs同形的状态cost quantile头；
+                                  0保持历史state_dict与forward路径完全不变。
         """
         super().__init__()
         hidden = [512, 512] if hidden is None else list(hidden)
@@ -216,6 +219,22 @@ class RecurrentActorValue(nn.Module):
             finally:
                 torch.set_rng_state(rng_state)
 
+        # QCPO_refs 的 constraint head 直接输出 cost/scale 单位的正 quantiles：
+        # c_dist=exp(Linear(feature))。默认0时既没有模块/state_dict键，也不改变
+        # actor.parameters()顺序。显式启用时恢复CPU RNG，防止新增头推进随后
+        # reward/cost critic初始化与Gaussian动作噪声的全局随机流。
+        self.cost_value_quantiles = int(cost_value_quantiles)
+        if self.cost_value_quantiles < 0:
+            raise ValueError("cost_value_quantiles must be non-negative")
+        self.cost_value = None
+        if self.cost_value_quantiles > 0:
+            rng_state = torch.get_rng_state()
+            try:
+                self.cost_value = nn.Linear(
+                    self.lstm_size, self.cost_value_quantiles)
+            finally:
+                torch.set_rng_state(rng_state)
+
     def apply_cost_adapter(self, base_feature, detach_input=False):
         """
         返回base+scale*adapter(base)，可选阻断梯度进入MLP/LSTM基础表示。
@@ -228,6 +247,19 @@ class RecurrentActorValue(nn.Module):
             return source
         residual = self.cost_adapter(source)
         return source + self.cost_adapter_scale * residual
+
+    def cost_distribution(self, feature, detach_feature=False):
+        """
+        由历史条件feature预测状态cost quantiles，数值单位由Agent的cost scale定义。
+
+        detach_feature=True只训练cost head，不让其loss写回policy MLP/LSTM；False则
+        复现QCPO_refs的共享多任务梯度。exp保证输出为正，逐式对齐参考QcpoModel。
+        """
+        if self.cost_value is None:
+            raise RuntimeError(
+                "state cost distribution requested without cost_value_quantiles")
+        source = feature.detach() if detach_feature else feature
+        return torch.exp(self.cost_value(source))
 
     def initial_state(self, batch_size, device=None):
         """返回零初始化 (h,c)，形状均为 [1,B,H]。"""

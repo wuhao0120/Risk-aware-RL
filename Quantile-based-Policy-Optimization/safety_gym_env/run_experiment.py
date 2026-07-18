@@ -200,6 +200,21 @@ def base_args(algo, seed, device, env_key):
         a.cost_actor_mc_balance_reference = 'ema'
         a.cost_actor_mc_balance_std_floor = 1e-4
         a.cost_actor_mc_balance_ratio_max = 1.0
+        # 风险actor信用来源：action_cdf逐式保留DQCAC；新模式使用QCPO_refs
+        # 同形state-cost distribution与quantile-GAE，同时保留Q-CDF只作诊断。
+        a.cost_actor_advantage_mode = 'action_cdf'
+        # head_only先隔离“信用公式”因果效应；shared_backbone再消融参考实现的
+        # cost梯度共享。reference表示沿用源码默认、不额外标准化cost advantage。
+        a.cost_state_gradient_mode = 'head_only'
+        a.cost_state_value_lr = 3e-4
+        a.cost_state_value_grad_clip = 10.0
+        a.cost_state_value_cost_scale = 10.0
+        a.cost_state_gae_lambda = 0.97
+        a.cost_state_huber_kappa = 1.0
+        a.cost_state_quantile_loss_coef = 1.0
+        a.cost_state_mean_loss_coef = 0.5
+        a.cost_state_tail_prob = 0.3
+        a.cost_state_advantage_norm = 'reference'
         # n-step TD: T=1000 未折扣口径下 1-step 传播太慢 (600 updates 传不满 1000 步链,
         # 实测 cost-critic 在 s0 恒 0 → λ 不动)。n_step=100 → bootstrap 链长 10, 数百
         # updates 即可覆盖; on-policy 每迭代重采, n-step 和 + 截断 mask 均合法。

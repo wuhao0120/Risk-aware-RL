@@ -2240,3 +2240,13 @@ C-H23的工程和数学链路都正确：leave-one-out baseline不含本轨迹�
 这使下一步优先级发生变化。继续调LOO系数、PID target或窗口只会在现有前沿上换工作点；risk-cache重新查询也只是用同一个近随机排序critic刷新数值。更有价值的结构路线是把QCPO_refs尚未迁移的核心cost-credit链路单独拿出来：共享recurrent feature上的state-value cost distribution、quantile TD/GAE advantage，以及可选的Weibull density-ratio修正。当前DQCAC仍保留action-conditioned distributional Q；首个最小版本可以只增加state-value cost distribution作为低方差baseline/辅助advantage，不删除Q critic，再做Q-only、V-only、Q+V三路消融。
 
 路线分歧保留如下：①最小改动是训练state-value quantile head并替代K=4动作采样baseline，检验baseline sampling与Q-V一致性；②完整迁移是按QCPO_refs的sorted quantile TD residual做cost-GAE，再用同一个rollout behavior ratio做PPO clip；③若两者都不能提高条件排序，再记录score-weighted actor-gradient cosine和方差最优组合，而不是只看advantage相关。IQN、局部quantile加密、更多N和scalar PID继续保留为消融，但已有证据表明它们解决的是表示分辨率或工作点，不是当前缺失的条件风险信用。
+
+### 13.147 首个关键修复选择QCPO_refs式state distributional value与quantile-GAE（2026-07-18）
+
+当前DQCACBeta并不是缺少PPO importance ratio：多epoch时分母已经正确冻结为rollout behavior probability，更新后保存新probability反而会把目标错误改成逐步近端链。它真正缺的是可用的条件风险信用。C-H18后段action-conditioned critic advantage方差比trajectory标签小约两个数量级，二者相关接近0；LOO只修全局有限batch偏差，无法恢复state/history/action排序。
+
+因此最小关键改动不是继续加quantile点，而是引入QCPO_refs的state-value cost distribution，并从排序后的quantile TD residual递推cost GAE。这个优势在rollout后、任何optimizer step前冻结，与reward GAE和old log-prob处在同一behavior坐标系；Actor继续使用PPO clip。原action-Q distribution保留训练和记录，以便之后做Q-only、V-only或组合消融。
+
+首轮采用head-only是为了可归因：state distribution head读取当前recurrent feature，但其QR与mean-anchor损失不更新MLP/LSTM；只有Actor loss能更新共享表示。公式解析测试、梯度隔离、默认逐位回归、持久化训练smoke与checkpoint重载均已通过。短smoke不能证明收益，只把“代码错误”风险降到可接受水平。
+
+接下来先跑600k seed1机制筛选，但不把600k当最终性能裁决。只要head学习有限、risk advantage不塌缩、PPO比例正确且闭环有合理响应，即使初期reward不高也跑满2M；最终仍按fresh512 outage进入双侧`[0.18,0.22]`后最大化mean reward。head-only若在2M失败，最多再验证一次shared-backbone；IQN、N=64、查询点加密、Weibull和PID小数扫描暂缓，避免用表示细节绕开风险credit根因。

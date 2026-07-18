@@ -2022,3 +2022,21 @@
 - 更关键的机制量：C-H18后段`std(Acritic)≈.00388`、`std(trajectory label)≈.3783`，两者相关约`.0031`；LOO后对应相关约`.00024`。全局LOO基线去掉有限B自包含偏差，却没有保留state/action条件credit；batch-rho只把高方差残差缩到微小critic尺度，不能创造条件排序。
 - 完整W&B对齐曲线在`_runs/profiles/dqc_ch18_vs_ch23_loo_2m_s1_2026-07-18/`；fresh512 CSV/JSON/PNG在`_runs/profiles/dqc_ch18_b40_vs_ch23_loo_2m_s1_test512_e20000_2026-07-18/`。分析脚本已补充LOO与optimizer-minibatch指标，提交`5c70940`；未创建一次性脚本。
 - 下一主线不继续扫描LOO rho或PID小数点。结构性候选优先级为：①迁移QCPO_refs的recurrent state-value cost distribution与quantile-GAE cost advantage，同时保留DQCAC action-conditioned Q作为可消融分支；②若先做较小改动，则加入state-dependent cost-value baseline替代K动作Monte-Carlo baseline；③最后才做score-weighted梯度余弦/方差最优混合。risk-cache重查询只改变同一批内的critic预测，不足以修复当前近零条件相关，降为机制消融。
+
+### E176：QCPO_refs式state-cost distribution与quantile-GAE风险信用实现、工程门（2026-07-18）
+
+- C-H23把当前根因定位为风险credit缺失：后段action-conditioned critic advantage标准差只有约`.00388`，trajectory标签标准差约`.3783`，相关约`.0031`。本轮因此不再扫描PID、quantile数量或IQN，而是迁移QCPO_refs真正影响Actor的链路：recurrent state-value cost distribution、sorted quantile TD residual和backward quantile-GAE。原action-conditioned distributional Q继续训练和记录，作为诊断与后续消融，不在首轮删除。
+- `RecurrentActorValue`新增可选`cost_value_quantiles`与正值cost distribution head；默认0时不创建参数，也不改变任何历史state dict。DQCAC新增`cost_actor_advantage_mode=qcpo_state_quantile_gae`，在behavior rollout冻结的state quantiles上构造one-step QR target、quantile-GAE、mean lambda-return和目标tail quantile advantage。PPO分母仍始终是采样时behavior log-prob，每个epoch只重算当前策略分子；risk advantage也在任何本rollout optimizer update前冻结。
+- 首轮严格使用`cost_state_gradient_mode=head_only`：cost head挂在与QCPO_refs同类的recurrent feature上，但cost loss只更新head，不反向改变共享MLP/LSTM；Actor仍可通过冻结的risk advantage更新主干。这隔离“quantile-GAE credit公式是否有效”，避免同时改变representation。若head-only通过，shared-backbone才作为下一条单独消融；若失败，不能事后把共享梯度混入同一run挽救。
+- state-cost监督按`cost/10`缩放，默认32个uniform quantiles、QR-Huber κ=1、quantile loss系数1、mean anchor系数.5、cost GAE λ=.97、tail probability .30。目标outage仍由PID围绕`.20`控制；tail probability只是QCPO_refs式Actor风险信用的查询位置，不把“越低outage越好”写进目标。首轮不迁移Weibull density ratio，因为那会同时改变优势幅度和分布假设，保留为核心链路通过后的消融。
+- 默认关闭逐位回归已由持久化job `dqc_state_default_reg_s503_20260718`验证：4个checkpoint共172个module tensor leaves、4个running tensor leaves、128个公共运行字段、152个公共checkpoint metrics和215个final JSON leaves，mismatch全部0、最大差0。说明新代码没有改变旧DQCAC的RNG、权重、PID、优化器或独立评估。
+- 解析公式门使用T3/B2/N4、非排序预测、γ=.9、λ=.5和独立手算，one-step quantile target与backward advantage最大误差均0，terminal只保留即时cost。梯度隔离门中state-head参数梯度有限且非零（norm约`9.575`），输入feature、MLP和LSTM梯度全部为None。
+- 启用smoke `dqc_state_qgae_headonly_smoke_s507_20260718`由持久化后台完成，纯训练`21.2s`、exit0；6个网络全部有限，head末梯度norm`.19956`，总/quantile/mean loss为`.14682/.020879/.251875`，预测/目标均值`1.0539/1.0238`，首epoch`max|ratio-1|=9.20e-5`，2个Actor update均完成。独立eval-only重载同样exit0，checkpoint明确包含cost head权重。短smoke只证明公式、梯度与序列接线正常，不作为性能证据。
+
+### E177：C-H24 600k state-quantile-GAE head-only机制筛选预注册（2026-07-18）
+
+- 正式候选回到C-H18 seed1/B40主线：T1000、C20/A8、theta LR`3e-4`、critic LR`1e-3`、LSTM512、observation RMS、GAE-PPO、QR32/MC action-Q、mean anchor、PID target`.175`/window50/Kp1/Ki.1/leak.97/deadband.02。唯一核心替换是Actor风险credit从action-CDF+batch-rho改为E176的state quantile-GAE；旧Q critic仍训练但不驱动该分支Actor。
+- 采用1个40k warmup rollout：它只训练reward/cost critics和新state-cost head，不更新Actor或PID，使随机初始化的state head先获得一批监督。之后14个rollout进入Actor/PID，总环境步600k。这个初始化差异是新head可用所必需，明确记录而不伪装成与C-H18完全单变量；若晋级2M，保持同一warmup配置。
+- 600k只作机制门，不能因早期reward低就判最终性能失败。继续到2M的条件是：全部有限、首epochratio误差`<1e-3`、state-head loss/误差没有持续爆炸、state risk advantage保持非退化方差、Actor/PID对风险信号有可解释响应且PPO不过度持续clip。即使600k reward尚未超过C-H18，也只要机制健康就继续；只有NaN/OOM、序列/ratio断言、head发散、risk advantage塌缩或完全错误方向才提前停止。
+- 600k采用持久化`launch_background.sh`、脱敏W&B online、每200k checkpoint；根据旧C-H18 2M约13.2分钟及新head额外recurrent forward，预计纯训练6--10分钟，内置128评估后总计约8--13分钟。若晋级，2M单seed预计20--30分钟，fresh512约4分钟；通过双侧outage带`[.18,.22]`且reward不降后才扩seed0/2。
+- 若head-only机制健康但2M性能不通过，只允许再做一条QCPO_refs式shared-backbone消融；其余IQN、局部quantile加密、N=64、Weibull和PID细扫全部暂缓。这样本阶段只解决关键问题，不继续铺开低优先级组合。
