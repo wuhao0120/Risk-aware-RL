@@ -1944,3 +1944,15 @@
 - 使用同一压力seed1、持久化后台、脱敏W&B online和B80 checkpoint；依据C-H20实测，纯训练预计15--18分钟、内置128约2分钟，fresh512约4分钟，总计约21--25分钟。C-H18已证明1M可能误杀慢热策略，所以除NaN/Inf/OOM、PPO ratio断言或明显发散外，正式run跑满2M，不因前半段reward低而提前停止。
 - 机制门要求首epoch`max|ratio-1|<1e-3`、全部有限、后段KL/clip相对C-H20明显恢复但不出现持续饱和；由于`ppo_target_kl=0`，若KL爆炸只能按预注册工程故障停止，不能事后用early-stop改变配置。正式性能先要求fresh512 outage进入`[.18,.22]`，再要求reward至少`.94`且目标不低于B40参考`.98955`；低于.18且reward下降仍判过保守。
 - 若seed1同时通过风险和reward门，原样扩seed0/2；若reward恢复但outage高于.22，说明actor补偿只把策略沿高reward--高risk方向推进，停止LR扫描并转optimizer minibatch/闭环设计；若reward仍低，则B80的不足不只是actor step数，停止B80主线，不尝试9e-4或1.2e-3。无论结果如何，都保留为num_envs与optimizer时钟消融。
+
+
+### E169：C-H21 B80 actor学习率补偿——恢复PPO步幅但放大闭环振荡，严格失败（2026-07-18）
+
+- 正式job `DQCAC_DynamicButton_ch21_b80_actorlr6e4_target0175_2m_s1`由`launch_background.sh`持久化完成，exit0；W&B run `irwt6awc` finished并同步3个文件。机械比较C-H20/C-H21各74个`--set`参数，算法差异只有`theta_lr0:.0003→.0006`，其余变化仅为name/group/tag/checkpoint路径。纯训练`934.1s`，25个B80 Actor/PID事件、500个critic step全部完成，无NaN/OOM/ratio错误。
+- 训练闭环出现比C-H20更大的相位循环：1.04M时reward/outage/lambda为`.658/.300/.160`，1.44M反转为`.550/.113/0`，1.92M又冲到`.981/.412/.392`，2M末批为`.991/.338/.379`。这不是单调趋近0.20，而是高LR让Actor越过工作点后由PID滞后纠偏，再反向越过。
+- 后20%训练reward/outage/lambda为`.87687±.10198/.28750±.08216/.17873±.17339`；C-H20为`.74490±.06465/.21500±.04430/.13764±.06005`。reward有所恢复，但outage、lambda方差和周期振幅同时明显增加。后段PPO KL由`.001295→.002437`、clip fraction由`.06133→.12424`、ratio std由`.05062→.06666`，数值已恢复到B40的`.002436/.12936/.06940`量级；机制假设“原B80 actor步幅不足”部分成立，但用LR翻倍补偿不稳定。
+- 内置128为reward/outage `.93770/.27344`。统一eval seed20000的fresh512为reward `.909769`、outage `161/512=.314453`；reward95为`[.87334,.94620]`，outage Wilson95为`[.27574,.35593]`，整个风险区间远高于双侧工作带`[.18,.22]`。严格性能门同时失败：outage不进带，reward也低于最低`.94`。
+- 相对原B80 C-H20，reward差`+.076757`的Welch95为`[+.020983,+.132532]`，outage差`+.087891`的Newcombe95为`[+.033494,+.141611]`；两者都显著增加，说明它沿更高reward--更高risk方向移动，不是前沿支配。相对B40 C-H18，reward差`-.079782`区间`[-.137966,-.021599]`，outage差`+.082031`区间`[+.027439,+.135985]`；候选被B40在两个主指标上同时支配。
+- fresh cost critic仍弱：hard/smooth CDF为`.26514/.26706`而truth为`.31445`，绝对误差`.04932/.04739`；hard Brier/AUC/BSS为`.21803/.5671/-1.14%`，predicted/true mean cost为`10.349/12.254`。相对C-H20，CDF、smooth-CDF、mean-cost和Brier误差分别恶化29.5%/38.4%/43.8%/20.8%；不能把风险超支归因于critic已经给出更准确而Actor单纯更激进。
+- 正式裁决为`reject_stop_lr_scaling_no_seed_expansion`。不试9e-4/1.2e-3，也不因训练末reward接近1而忽略outage。结果支持下一条若继续B80，应使用多个较小optimizer step而非一次更大Adam step，并保持整批PID统计；真正trajectory minibatch必须冻结整批old log-prob、GAE与risk weights，不能把现有只累积梯度的`critic_minibatch_size`误当成optimizer minibatch。
+- 完整W&B history与三run对齐曲线位于`_runs/wandb_export/dqc_ch18_b40_ch20_b80_ch21_b80_actorlr6e4_2m_s1_2026-07-18/`和同名`_runs/profiles/`。fresh比较CSV/JSON/PNG分别位于`_runs/profiles/dqc_ch20_b80_vs_ch21_b80_actorlr6e4_2m_s1_test512_e20000_2026-07-18/`及`dqc_ch18_b40_vs_ch21_b80_actorlr6e4_2m_s1_test512_e20000_2026-07-18/`；三张PNG均已解码验证，未创建临时脚本。

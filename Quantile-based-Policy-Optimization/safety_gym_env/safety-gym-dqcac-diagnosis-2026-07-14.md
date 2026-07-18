@@ -2187,3 +2187,14 @@ C-H21把B80 actor初始学习率从3e-4加到6e-4，其余配置完全冻结。�
 不同时放大critic LR，是因为C-H20的fresh cost critic误差并未改善：CDF误差、mean-cost误差、BSS和crossing总体混合偏坏。若actor-only补偿成功，说明num_envs可以与optimizer时钟配套使用；若reward恢复但outage超支，说明更激进actor只是沿旧reward--risk前沿移动，下一路线应显式解耦sampling batch和optimizer minibatch，或重新设计闭环风险信用，而不是继续扫描学习率。
 
 一条更规范但代码量更大的分歧路线，是B80采样后按trajectory拆为两个B40 PPO minibatch，同时在整批上冻结old log-prob、GAE与risk weights。这能保留B80的风险统计稳定性及B40的optimizer step数，但需要严格处理time-major recurrent state和PPO顺序；先用C-H21判断“时钟补偿”是否值得投入该改造。QCPO_refs默认是单full-batch、8 epochs，不能错误地把多minibatch当作其稳定性来源。
+
+
+### 13.142 用更大学习率补偿大batch时钟会放大PID--Actor过冲（2026-07-18）
+
+C-H21证明C-H20确有Actor更新不足：把B80的actor LR从3e-4加到6e-4后，后段PPO KL、clip fraction和ratio std几乎恢复到B40水平，训练reward均值也由0.745提高到0.877。但恢复的是策略步幅，不是更好的约束前沿；后段outage均值从0.215增到0.288，标准差从0.044增到0.082，lambda标准差约增到原来的2.9倍。
+
+完整轨迹揭示了循环机制。Actor先快速把策略推到高risk区域，PID在窗口、积分和策略响应滞后下才提高lambda；随后多个大PPO步把策略打到outage约0.11的过度保守区，lambda归零；reward梯度重新主导后又冲到outage 0.41。这个循环不是retention guard能修的，因为guard只回滚cost critic，不改变Actor步幅、PID时延或双侧setpoint。
+
+fresh512最终为reward/outage 0.9098/0.3145。相对原B80，reward与outage都显著增加；相对B40，reward显著更低且outage显著更高。因此LR翻倍路线停止，不扩seed。目标仍是先让outage贴近0.20再推高reward，不能因0.910比0.833高就忽略风险超支。
+
+如果继续B80，下一候选应把80条采样统计与optimizer batch解耦：PID和trajectory residual scale继续看完整B80，而每个PPO/critic epoch按trajectory分成两个B40 optimizer step，LR保留3e-4。多个较小step有机会恢复B40的optimizer时钟而不产生6e-4的单步过冲。现有`critic_minibatch_size`只分块backward后执行一次Adam step，不能完成这个实验；新实现必须默认关闭、回归旧路径，并严格处理recurrent time-major切片、hidden/cell、old log-prob和整批冻结risk weight。
