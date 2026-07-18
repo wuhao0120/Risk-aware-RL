@@ -2151,3 +2151,14 @@ C-H18与C-H17 seed2的前1M checkpoint和history逐位相同，新增后1M把fre
 但不能把成功解释为cost distribution已经学准。2M fresh hard-CDF误差约0.050、mean-cost误差3.28、AUC 0.521、BSS -8.1%，比1M多项更差。更合理的机制是reward actor获得足够更新，trajectory二元残差在弱critic上提供了可用的总体风险方向；distributional critic对状态动作的细粒度排序仍没有稳定超过常数基率。
 
 训练batch的末段outage均值0.278、标准差0.100，而final fresh为0.193，说明终点仍受PID周期相位影响。2M结果是真实独立评估，不是小样本假象，但也不是收敛平台证明。因此下一步必须把相同2M预算扩seed0/1并保留1M前缀exact门；只有多seed工作点都在0.20附近且reward稳定，才有资格投入5M与QCPO_refs公平终局。
+
+### 13.138 2M解决了reward训练长度，却放大了风险终点分叉（2026-07-18）
+
+三seed因果前缀审计表明，1M确实会误杀慢热配置：新增后1M令每个seed的fresh mean reward都显著上升，平均从0.856升到1.040，且没有任何seed低于0.80。以后短跑只能用来发现数值错误或明显无效机制；正式性能候选至少需要2M，不能因前300k/1M不漂亮就断言永远学不好。
+
+但训练长度不是当前最终瓶颈。2M outage为0.242/0.266/0.193，平均0.234且方差比1M明显扩大，严格双侧工作带仍只有1/3通过。这里的目标不是最小化outage，而是使真实outage约等于0.20后最大化mean reward：低于0.18且reward下降属于过度保守，高于0.22属于风险预算超支；只有在reward不降低时，更低outage才构成Pareto优势。
+
+这组结果也把retention guard的作用边界钉死了。guard只防cost critic在上一批上遗忘，既不看0.20目标的有符号误差，也不调PID/lambda，更不会恢复reward actor。seed1在2M时总体CDF、mean-cost和BSS已经显著改善，真实outage却升至0.266，说明“总体概率校准较好”仍不足以获得正确的状态动作信用和稳定闭环；开启guard不能解决这个反例。
+
+下一算法实验必须直接处理风险梯度估计，而不是继续扫描PID小数点或追求更低outage。一个候选是把action-conditioned critic estimator与完整trajectory score-function estimator做明确的控制变量/凸组合，并用leave-one-out empirical baseline消除同批自相关；不能简单把全批outage均值当新残差再加到critic advantage，因为那会重复计算风险梯度、改变有效增益。任何实现都必须默认关闭、保持原路径逐位不变，并先用解析梯度/时间主序/PPO冻结回归证明无偏目标和概率分母正确，再投入2M live预算。
+

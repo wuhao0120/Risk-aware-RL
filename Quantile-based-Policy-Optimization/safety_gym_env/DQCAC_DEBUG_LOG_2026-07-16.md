@@ -1864,3 +1864,16 @@
 - 两条都要在1M边界与各自C-H17 checkpoint做公共module/tensor/runtime/metrics exact检查。内部数值有限、reward≥.65且outage在`[.05,.40]`后，无论结果漂亮与否都做fresh512；不根据训练末批挑checkpoint。
 - 2M三seed主报告以seed为重复单位：逐seed原值、sample mean±SD、paired 1M→2M差和合并episode比例并列。严格晋级要求至少2/3 seed outage在`[.18,.22]`、三seed mean outage也在该带、mean reward≥.90且不允许任何seed reward<.80；同时1M→2M reward平均至少+.05，不能靠提高mean outage超过+.01换取。
 - 若严格晋级，C-H18成为2M主候选，再预注册与QCPO_refs统一5M预算；若只在seed2成功或终点随周期分叉，则不直接跑5M，先做末段多checkpoint稳定性/闭环减振。critic AUC/BSS仍作为解释指标，不因策略过门就取消；retention guard、IQN和quantile加密继续作为独立消融，不与长度扩展混合。
+
+### E161：C-H18三seed 2M结果——reward慢热得到确认，但风险命中门失败（2026-07-18）
+
+- seed0/1正式任务均由`launch_background.sh`持久化、独占运行并正常exit0；W&B run分别为`8niycfuh/fhhs0gja`，seed2为`muht6zqr`。三条均为B40×50×T1000=2M、C20/A8、batch-reference rho1、PID target=.175、QR32/MC、LSTM512、obs RMS和GAE-PPO。纯训练耗时分别约793.3/790.5/793.9秒，均低于预估的13--15分钟上沿，全部张量有限。
+- 长度因果门在三个seed上全部通过。每条2M run的1M边界与对应C-H17 run比较，43个公共module leaves、1个lambda tensor、81个runtime/PID leaves和5个rollout metrics差异数均为0、最大绝对差0；配置差异仅为总iteration、checkpoint/W&B名称与预算tag。因此1M→2M变化来自新增训练长度，不是初始化、代码版本、并发或学习率调度差异。
+- fresh512逐seed结果为：seed0 reward/outage `1.17622/124÷512=.24219`，seed1 `1.00524/136÷512=.26563`，seed2 `.93826/99÷512=.19336`。严格`[.18,.22]`仍只有seed2通过；seed0/1分别高于上界.02219/.04563。不能把outage下降或终点相位当作普遍规律。
+- 三seed 2M reward为`1.03991±.12271`，outage为`.23372±.03687`；合并事件`359/1536=.23372`，Wilson95为`[.21324,.25554]`。相对1M的`.85646±.12526/.22396±.00881`，paired reward变化为`+.23541/+.08920/+.22574`，均值`+.18345`；seed-level t95为`[-.01967,.38657]`，n=3仍很宽。paired outage变化为`+.02734/+.04102/-.03906`，均值`+.00977`，t95为`[-.09664,.11617]`。
+- reward慢热证据很强：三个seed的episode-level reward差95%区间均为正，且2M所有seed reward均大于.80；因此后续候选不能只凭100--300k或单个1M弱seed淘汰。但预注册主门失败：只有1/3 seed进风险带，mean outage高于.22，故C-H18不直接晋级5M，也不能与QCPO_refs的正式5M终点作最终排序。
+- critic结果是混合且不支持“多训练就会学准”。seed0 hard-CDF误差从.00806恶化到.07172、mean-cost误差从.071增到2.264、BSS由+2.25%变为-2.90%；seed2同样恶化。seed1却把hard-CDF误差从.06201降到.00366、mean-cost误差从2.915降到.337、BSS升到+0.82%，但真实outage仍高达.26563。即使总体阈值校准较准，也不等于action-conditioned风险排序和PID--actor闭环能命中.20。
+- 三seed末20%训练outage分别约`.265±.084/.308±.059/.278±.100`，都高于内部target .175且持续周期；末段lambda分别约`.289±.088/.461±.073/.313±.142`。batch风险修正/critic标准差比仍逐批约等于1，说明失败不是配平增益漂移，而是有限B40二项反馈、PID记忆、Actor响应滞后及风险credit误差的组合。
+- retention guard不改变这个裁决。它只用上一rollout smooth-Brier选择/回滚cost critic和Adam，不更新PID setpoint、lambda或reward actor；既有guard结果`.579/.141`是低reward过度保守。它保持默认关闭，只作遗忘诊断，不能以更低outage作为成功指标。
+- 完整证据位于`_runs/profiles/dqc_ch18_batchrho1_target0175_b40_2m_multiseed_2026-07-18/`，包括逐seed/聚合CSV、统计JSON和1M--2M比较图；W&B完整history在对应`_runs/wandb_export/`目录。正式裁决为`reject_5m_risk_hit_rate_failed_but_keep_2m_budget`：保留2M作为后续live候选的最低正式性能预算，但先修风险信用或闭环，不盲目延长。
+
