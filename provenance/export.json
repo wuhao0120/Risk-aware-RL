@@ -1,0 +1,24 @@
+{
+  "created_utc": "2026-11-12T16:32:35.475675+00:00",
+  "local_branch": "DCA",
+  "local_head": "39067fcfe05cf9cf6e54c8d0f7df18307b44dafb",
+  "remote": "https://github.com/wuhao0120/Risk-aware-RL.git",
+  "remote_branch": "DCA",
+  "history": "New source-only root commit; original repository untouched",
+  "source_files_unchanged": true,
+  "experiments": [
+    "dynamic-baseline-dca",
+    "dynamic-baseline-qcpo",
+    "dynamic-baseline-tqpo",
+    "dynamic-dca_div25",
+    "dynamic-dca_div200",
+    "dynamic-tqpo_b12",
+    "simplebutton-main_r099_c1_p10-dca",
+    "simplebutton-main_r099_c1_p10-qcpo",
+    "simplebutton-main_r099_c1_p10-tqpo",
+    "simplebutton-main_r099_c1_p20-dca",
+    "simplebutton-main_r099_c1_p20-qcpo",
+    "simplebutton-main_r099_c1_p20-tqpo"
+  ],
+  "excluded": "Other branches, older/cancelled campaigns, checkpoints, results, runtime caches, installed environments and GPU-holder programs"
+}

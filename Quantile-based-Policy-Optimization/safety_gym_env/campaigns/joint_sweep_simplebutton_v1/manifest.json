@@ -1,0 +1,287 @@
+{
+  "campaign": "joint_sweep_simplebutton_v1",
+  "environment": "SimpleButton",
+  "training_run_count": 18,
+  "lineage_count": 18,
+  "result_setting_count": 4,
+  "posthoc_policy_evaluation_count": 72,
+  "execution_order": {
+    "learning_rates": [
+      "2e-4",
+      "4e-4"
+    ],
+    "algorithm_waves": [
+      "QPO",
+      "QCPO",
+      "DQCACBeta"
+    ],
+    "concurrent_training_seeds": [
+      0,
+      1,
+      2
+    ],
+    "maximum_concurrency": 3
+  },
+  "grid": {
+    "actor_lr0": [
+      0.0002,
+      0.0004
+    ],
+    "fresh_training_main_env_steps": 10000000,
+    "frozen_checkpoint_main_env_steps": 5000000,
+    "return_threshold": -0.03,
+    "failure_alpha": 0.2,
+    "gamma": 0.99,
+    "num_envs": 25,
+    "horizon": 1000
+  },
+  "evaluation": {
+    "num_episodes": 1000,
+    "common_reset_seed": 2026080177,
+    "common_action_rng_seed": 2026080177,
+    "policy_roles": [
+      "endpoint",
+      "selected"
+    ],
+    "budget_batches": [
+      200,
+      400
+    ]
+  },
+  "runs": [
+    {
+      "lineage_id": "SimpleButton_2e-4_QPO_s0",
+      "algorithm": "QPO",
+      "seed": 0,
+      "actor_lr0": 0.0002,
+      "policy_identity": "qpo",
+      "wandb_id": "8ef8f4a8",
+      "training_setting": "lr2e-4_main10m",
+      "result_settings": [
+        "lr2e-4_main5m",
+        "lr2e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_2e-4_QPO_s1",
+      "algorithm": "QPO",
+      "seed": 1,
+      "actor_lr0": 0.0002,
+      "policy_identity": "qpo",
+      "wandb_id": "3e533708",
+      "training_setting": "lr2e-4_main10m",
+      "result_settings": [
+        "lr2e-4_main5m",
+        "lr2e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_2e-4_QPO_s2",
+      "algorithm": "QPO",
+      "seed": 2,
+      "actor_lr0": 0.0002,
+      "policy_identity": "qpo",
+      "wandb_id": "e4051334",
+      "training_setting": "lr2e-4_main10m",
+      "result_settings": [
+        "lr2e-4_main5m",
+        "lr2e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_2e-4_QCPO_s0",
+      "algorithm": "QCPO",
+      "seed": 0,
+      "actor_lr0": 0.0002,
+      "policy_identity": "qcpo",
+      "wandb_id": "e6473e5f",
+      "training_setting": "lr2e-4_main10m",
+      "result_settings": [
+        "lr2e-4_main5m",
+        "lr2e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_2e-4_QCPO_s1",
+      "algorithm": "QCPO",
+      "seed": 1,
+      "actor_lr0": 0.0002,
+      "policy_identity": "qcpo",
+      "wandb_id": "712a9ecf",
+      "training_setting": "lr2e-4_main10m",
+      "result_settings": [
+        "lr2e-4_main5m",
+        "lr2e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_2e-4_QCPO_s2",
+      "algorithm": "QCPO",
+      "seed": 2,
+      "actor_lr0": 0.0002,
+      "policy_identity": "qcpo",
+      "wandb_id": "beba482b",
+      "training_setting": "lr2e-4_main10m",
+      "result_settings": [
+        "lr2e-4_main5m",
+        "lr2e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_2e-4_DQCACBeta_s0",
+      "algorithm": "DQCACBeta",
+      "seed": 0,
+      "actor_lr0": 0.0002,
+      "policy_identity": "finite_nstep_v1",
+      "wandb_id": "2870563c",
+      "training_setting": "lr2e-4_main10m",
+      "result_settings": [
+        "lr2e-4_main5m",
+        "lr2e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_2e-4_DQCACBeta_s1",
+      "algorithm": "DQCACBeta",
+      "seed": 1,
+      "actor_lr0": 0.0002,
+      "policy_identity": "finite_nstep_v1",
+      "wandb_id": "e00f7a09",
+      "training_setting": "lr2e-4_main10m",
+      "result_settings": [
+        "lr2e-4_main5m",
+        "lr2e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_2e-4_DQCACBeta_s2",
+      "algorithm": "DQCACBeta",
+      "seed": 2,
+      "actor_lr0": 0.0002,
+      "policy_identity": "finite_nstep_v1",
+      "wandb_id": "8748e0a1",
+      "training_setting": "lr2e-4_main10m",
+      "result_settings": [
+        "lr2e-4_main5m",
+        "lr2e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_4e-4_QPO_s0",
+      "algorithm": "QPO",
+      "seed": 0,
+      "actor_lr0": 0.0004,
+      "policy_identity": "qpo",
+      "wandb_id": "ffd22be5",
+      "training_setting": "lr4e-4_main10m",
+      "result_settings": [
+        "lr4e-4_main5m",
+        "lr4e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_4e-4_QPO_s1",
+      "algorithm": "QPO",
+      "seed": 1,
+      "actor_lr0": 0.0004,
+      "policy_identity": "qpo",
+      "wandb_id": "4c9e8264",
+      "training_setting": "lr4e-4_main10m",
+      "result_settings": [
+        "lr4e-4_main5m",
+        "lr4e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_4e-4_QPO_s2",
+      "algorithm": "QPO",
+      "seed": 2,
+      "actor_lr0": 0.0004,
+      "policy_identity": "qpo",
+      "wandb_id": "c0e86665",
+      "training_setting": "lr4e-4_main10m",
+      "result_settings": [
+        "lr4e-4_main5m",
+        "lr4e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_4e-4_QCPO_s0",
+      "algorithm": "QCPO",
+      "seed": 0,
+      "actor_lr0": 0.0004,
+      "policy_identity": "qcpo",
+      "wandb_id": "7229da52",
+      "training_setting": "lr4e-4_main10m",
+      "result_settings": [
+        "lr4e-4_main5m",
+        "lr4e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_4e-4_QCPO_s1",
+      "algorithm": "QCPO",
+      "seed": 1,
+      "actor_lr0": 0.0004,
+      "policy_identity": "qcpo",
+      "wandb_id": "2d6bc977",
+      "training_setting": "lr4e-4_main10m",
+      "result_settings": [
+        "lr4e-4_main5m",
+        "lr4e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_4e-4_QCPO_s2",
+      "algorithm": "QCPO",
+      "seed": 2,
+      "actor_lr0": 0.0004,
+      "policy_identity": "qcpo",
+      "wandb_id": "3f17e445",
+      "training_setting": "lr4e-4_main10m",
+      "result_settings": [
+        "lr4e-4_main5m",
+        "lr4e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_4e-4_DQCACBeta_s0",
+      "algorithm": "DQCACBeta",
+      "seed": 0,
+      "actor_lr0": 0.0004,
+      "policy_identity": "finite_nstep_v1",
+      "wandb_id": "562d15c9",
+      "training_setting": "lr4e-4_main10m",
+      "result_settings": [
+        "lr4e-4_main5m",
+        "lr4e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_4e-4_DQCACBeta_s1",
+      "algorithm": "DQCACBeta",
+      "seed": 1,
+      "actor_lr0": 0.0004,
+      "policy_identity": "finite_nstep_v1",
+      "wandb_id": "e189233e",
+      "training_setting": "lr4e-4_main10m",
+      "result_settings": [
+        "lr4e-4_main5m",
+        "lr4e-4_main10m"
+      ]
+    },
+    {
+      "lineage_id": "SimpleButton_4e-4_DQCACBeta_s2",
+      "algorithm": "DQCACBeta",
+      "seed": 2,
+      "actor_lr0": 0.0004,
+      "policy_identity": "finite_nstep_v1",
+      "wandb_id": "696107b2",
+      "training_setting": "lr4e-4_main10m",
+      "result_settings": [
+        "lr4e-4_main5m",
+        "lr4e-4_main10m"
+      ]
+    }
+  ]
+}

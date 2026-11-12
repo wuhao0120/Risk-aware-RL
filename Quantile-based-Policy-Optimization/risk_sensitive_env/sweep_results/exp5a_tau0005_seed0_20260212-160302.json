@@ -1,0 +1,79 @@
+{
+  "experiment_name": "exp5a_tau0005",
+  "timestamp": "20260212-160302",
+  "wandb": {
+    "name": "DQCAC_exp5a_tau0005",
+    "group": "dqcac_sweep_20260212_SweepA_tau",
+    "job_type": "sweep",
+    "tags": [
+      "algo:DQCAC",
+      "kind:sweep",
+      "sweep_id:20260212_SweepA",
+      "group:tau",
+      "exp:exp5a_tau0005",
+      "param:tau",
+      "value:tau=0.005"
+    ],
+    "sweep_id": "20260212_SweepA",
+    "param_group": "tau"
+  },
+  "eval": {
+    "mean_return": 49.352851,
+    "quantile_return": -35.170707,
+    "learned_risk": 5.256847,
+    "eval_episodes": 10000
+  },
+  "param_overrides": {
+    "tau": 0.005
+  },
+  "full_params": {
+    "env_name": "RiskSensitiveEnv",
+    "seed": 0,
+    "device": "cuda:0",
+    "max_episode": 100000,
+    "log_interval": 100,
+    "est_interval": 100,
+    "gamma": 0.99,
+    "q_alpha": 0.25,
+    "quantile_threshold": 4,
+    "outer_interval": 10,
+    "init_std": 0.31622776601683794,
+    "theta_a": 3.981071705534973,
+    "theta_b": 10000,
+    "theta_c": 0.9,
+    "q_a": 2.5118864315095797,
+    "q_b": 10000,
+    "q_c": 0.6,
+    "lambda_a": 0.3,
+    "lambda_b": 5000,
+    "lambda_c": 0.6,
+    "emb_dim": [
+      64,
+      64
+    ],
+    "critic_lr": 0.001,
+    "tau": 0.005,
+    "target_update_interval": 100,
+    "num_quantiles": 32,
+    "huber_kappa": 1.0,
+    "density_bandwidth": 0.01,
+    "buffer_capacity": 100000,
+    "batch_size": 64,
+    "min_buffer_size": 1000,
+    "updates_per_episode": 1,
+    "wandb_dir": null,
+    "algo_name": "DQCAC",
+    "wandb_name": "DQCAC_exp5a_tau0005",
+    "wandb_job_type": "sweep",
+    "wandb_group": "dqcac_sweep_20260212_SweepA_tau",
+    "wandb_tags": [
+      "algo:DQCAC",
+      "kind:sweep",
+      "sweep_id:20260212_SweepA",
+      "group:tau",
+      "exp:exp5a_tau0005",
+      "param:tau",
+      "value:tau=0.005"
+    ]
+  }
+}

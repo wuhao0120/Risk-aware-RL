@@ -1,0 +1,74 @@
+{
+  "environment": "SimpleButton",
+  "horizon": 1000,
+  "cost_threshold": 15.0,
+  "allowed_violation_probability": 0.2,
+  "event": "sum(cost)>15",
+  "backend": "mjwarp",
+  "dynamics_profile": "point_velocity_implicitfast_v1",
+  "methods": {
+    "dca": {
+      "seeds": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "training_steps": 10000000,
+      "batch_size": 25000,
+      "num_envs": 25,
+      "evaluation_episodes": 2048,
+      "gamma_reward": 1.0,
+      "gamma_cost": 1.0,
+      "warmup_batches": 20,
+      "main_batches": 380,
+      "num_quantiles": 128,
+      "mean_divisor": 100,
+      "normalization": "1+lambda",
+      "pi": {
+        "ki": 0.2,
+        "kp": 5.0,
+        "ema": 0.8,
+        "cap": 50.0
+      },
+      "critic_updates": 400,
+      "warmup_critic_updates": 100,
+      "replay_episodes": 100
+    },
+    "qcpo": {
+      "seeds": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "training_steps": 10000000,
+      "batch_size": 25000,
+      "num_envs": 25,
+      "evaluation_episodes": 512,
+      "gamma_reward": 1.0,
+      "gamma_cost": 1.0,
+      "main_batches": 400,
+      "num_quantiles": 25
+    },
+    "tqpo": {
+      "seeds": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "training_steps": 10008000,
+      "batch_size": 12000,
+      "num_envs": 12,
+      "evaluation_episodes": 2048,
+      "gamma_reward": 0.99,
+      "gamma_cost": 0.99,
+      "main_batches": 834,
+      "cdf_guard": "len>100 with maxlen100; preserved"
+    }
+  },
+  "configuration_note": "Constructor JSONs initialize inherited recurrent components under their original validation contracts. Final agent constructors apply the scientific settings shown here; saved configuration.actual_* and checkpoint identities record effective settings."
+}

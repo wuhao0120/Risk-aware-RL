@@ -1,0 +1,29 @@
+{
+  "environment": "Dynamic",
+  "reward_gamma": 1,
+  "actor_cost_gamma": 1,
+  "lambda_cost_gamma": 1,
+  "batch": 25,
+  "horizon": 1000,
+  "threshold": 15,
+  "epsilon": 0.2,
+  "methods": [
+    "dca_mean100",
+    "qcpo",
+    "tqpo_fixed"
+  ],
+  "seeds": [
+    0,
+    1
+  ],
+  "steps": 10000000,
+  "checkpoints": [
+    5000000,
+    10000000
+  ],
+  "evaluation_episodes": 2048,
+  "evaluation_seed": 92000000,
+  "selection": "No tuning; compare feasibility and undiscounted reward",
+  "source_parent": "/vepfs-mlp2/c20250510/251204033/Risk-aware-RL/experiment/ICLR_rebuttal_SimpleButton/dca_rawrisk_r1_c1_p10_div25/source",
+  "formal_training_queued": true
+}

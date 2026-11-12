@@ -1,0 +1,61 @@
+{
+  "environment": "Dynamic",
+  "reward_gamma": 1,
+  "actor_cost_gamma": 1,
+  "lambda_cost_gamma": 1,
+  "threshold": 15,
+  "epsilon": 0.2,
+  "horizon": 1000,
+  "seeds": [
+    0,
+    1
+  ],
+  "nominal_steps": 10000000,
+  "evaluation_episodes": 2048,
+  "evaluation_seed": 92000000,
+  "preflight_seed": 71,
+  "groups": [
+    {
+      "key": "tqpo_b12",
+      "method": "tqpo",
+      "batch": 12,
+      "batches": 834,
+      "steps": 10008000,
+      "checkpoints": [
+        5004000,
+        10008000
+      ],
+      "label": "TQPO fixed B12"
+    },
+    {
+      "key": "dca_div25",
+      "method": "dca",
+      "batch": 25,
+      "batches": 400,
+      "steps": 10000000,
+      "checkpoints": [
+        5000000,
+        10000000
+      ],
+      "divisor": 25,
+      "label": "DCA /25 B25"
+    },
+    {
+      "key": "dca_div200",
+      "method": "dca",
+      "batch": 25,
+      "batches": 400,
+      "steps": 10000000,
+      "checkpoints": [
+        5000000,
+        10000000
+      ],
+      "divisor": 200,
+      "label": "DCA /200 B25"
+    }
+  ],
+  "baseline_root": "/root/Documents/Codex/2026-11-12/dca-dynamic/work/dynamic_all1_b25_p20",
+  "changes": "Only DCA actor mean divisor or TQPO batch size; other optimizer, critic and multiplier parameters retained.",
+  "curves": "Per-seed logs, shared environment-step grid, 200k-step smoothing, sample SD across two seeds",
+  "training_runs": 6
+}

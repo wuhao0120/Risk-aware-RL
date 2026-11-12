@@ -1,0 +1,293 @@
+{
+  "campaign": "binding_q2p3_qref_dqc_context_seed0_v1",
+  "git_sha": "f0cdfab4fdf9d4b19626aaa0326eeed726770ddd",
+  "fresh_training": true,
+  "seed0_only_per_user": true,
+  "change_contract": {
+    "parent_policy_identity": "paper_negated_return_eq275_discounted_bh_v2",
+    "policy_identity": "paper_negated_return_eq275_discounted_bh_v2_dqc_finite_context_v1",
+    "qcpo_ref_critic_input": "finite_obs_remaining_actor_h0c0_v1",
+    "horizon_mode": "finite",
+    "critic_time_feature": "remaining_fraction",
+    "critic_actor_context": true,
+    "unchanged": "actor_lstm;discounted_fixed_BH_PPO;reward_GAE;negated_return_quantiles;Weibull;dual;training_budget"
+  },
+  "baseline_reference": {
+    "campaign": "binding_q2p3_simplebutton_seed0_v1",
+    "manifest": "campaigns/binding_q2p3_simplebutton_seed0_v1/manifest.json",
+    "sha256": "d412889140d6ee8b01c6244818ca09fe049fac8856c95b7135c670d1d7ecc672",
+    "git_sha": "2138e196bffd1ca35cf762818ede748b813b8f92",
+    "old_qref_critic_input": "observation_only_v1",
+    "wandb_ids": {
+      "dqc": "dqcg23s0",
+      "qref": "qref23s0",
+      "qcpo": "qcpo23s0"
+    }
+  },
+  "common_setting": {
+    "seed": 0,
+    "environment": "SimpleButton",
+    "actor_lr0": 0.0002,
+    "return_threshold": 2.3,
+    "failure_alpha": 0.2,
+    "gamma": 0.99,
+    "num_envs": 25,
+    "horizon": 1000,
+    "main_batches": 400,
+    "main_env_steps": 10000000,
+    "initialization_env_steps": 0,
+    "actual_env_steps": 10000000,
+    "training_budget_semantics": "main_excludes_initialization_v1",
+    "validation": {
+      "exact_n": 100,
+      "crn_seed": 555,
+      "every_main_batches": 10
+    },
+    "posthoc": {
+      "exact_n": 1000,
+      "crn_seed": 777,
+      "roles": [
+        "endpoint",
+        "selected"
+      ],
+      "budgets": [
+        "main5m",
+        "main10m"
+      ]
+    }
+  },
+  "wandb_sync": {
+    "synced": true,
+    "wandb_id": "qrefctx23s0",
+    "wandb_mode": "online",
+    "git_sha": "f0cdfab4fdf9d4b19626aaa0326eeed726770ddd",
+    "local_run_dirs": [
+      "/vepfs-mlp2/c20250510/251204033/Risk-aware-RL/Quantile-based-Policy-Optimization/safety_gym_env/wandb/run-20260804_122159-qrefctx23s0"
+    ],
+    "command": [
+      "online_stream_then_explicit_wandb_sync"
+    ],
+    "verification": {
+      "method": "wandb_api_finished_full_400_row_history_v1",
+      "remote_state": "finished",
+      "last_step": 399,
+      "history_rows": 400,
+      "final_main_env_steps": 10000000,
+      "explicit_sync_attempts": [
+        {
+          "mode": "include-online",
+          "outcome": "wandb_server_file_stream_500_retried_for_33m_then_terminated"
+        },
+        {
+          "mode": "include-online_append_skip-console",
+          "outcome": "safety_timeout_after_180s"
+        }
+      ],
+      "reason_synced_true": "online SDK completed upload; remote API independently verified all 400 history rows and final summary after both explicit CLI sync attempts"
+    }
+  },
+  "results": {
+    "qref_context": {
+      "campaign": "binding_q2p3_qref_dqc_context_seed0_v1",
+      "git_sha": "f0cdfab4fdf9d4b19626aaa0326eeed726770ddd",
+      "environment": "SimpleButton",
+      "algorithm": "QCPO_REF",
+      "seed": 0,
+      "wandb_id": "qrefctx23s0",
+      "wandb_group": "binding_q2p3_simplebutton_seed0_v1",
+      "wandb_tag": "qcpo-ref-dqc-context-v1-q2p3-lr2e4-main10m-s0",
+      "parent_policy_identity": "paper_negated_return_eq275_discounted_bh_v2",
+      "policy_identity": "paper_negated_return_eq275_discounted_bh_v2_dqc_finite_context_v1",
+      "variant_changes": "critic_input_obs_to_obs_remaining_fraction_detached_actor_h0c0;fresh_seed0_training;all_actor_gae_quantile_weibull_dual_budget_fields_unchanged",
+      "training_budget_semantics": "main_excludes_initialization_v1",
+      "evaluation_protocol": {
+        "name": "exact_n1000_common_random_numbers_v1",
+        "num_episodes": 1000,
+        "environment_seed": 777,
+        "action_rng_seed": 777,
+        "checkpoint_rng_restored": false
+      },
+      "early_0_2m": {
+        "validation_points": 8,
+        "validation_mean_auc_env_steps": 1934363.9330452424,
+        "validation_mean_auc_normalized": 1.1053508188829957,
+        "policy_kl_after_epochs_mean": null,
+        "clip_fraction_mean": 0.07553650030113204,
+        "value_rmse_mean": null,
+        "critic_cdf_mean": null,
+        "cdf_initial_abs_gap_mean": null,
+        "cdf_brier_mean": null
+      },
+      "evaluations": {
+        "main5m": {
+          "endpoint": {
+            "checkpoint": "/vepfs-mlp2/c20250510/251204033/Risk-aware-RL/Quantile-based-Policy-Optimization/safety_gym_env/_runs/binding_q2p3_qref_dqc_context_seed0_v1/checkpoints/qrefctx23s0/main5m/latest.pt",
+            "checkpoint_iteration": 199,
+            "sha256": "69ac5d5f2579999a996d722503b41c0fbf6e897be17df424f4e50de7a5025765",
+            "metrics": {
+              "num_episodes": 1000,
+              "mean": 1.5038997958302498,
+              "reward_std": 0.6430748182573669,
+              "quantile_return": 1.0183327198028564,
+              "worst_5pct": 0.41555177211761474,
+              "minimum_return": 0.07358263432979584,
+              "maximum_return": 6.042981147766113,
+              "return_threshold": 2.3,
+              "failure_count": 913,
+              "empirical_prob": 0.913,
+              "constraint_residual": 0.7130000000000001,
+              "constraint_margin": -0.7130000000000001,
+              "feasible": false,
+              "wilson95_low": 0.8939135189433066,
+              "wilson95_high": 0.928925578547625,
+              "ties_at_threshold": 0,
+              "near_threshold_radius": 0.023,
+              "near_threshold_count": 8,
+              "quantile_margin_to_threshold": -1.2816672801971434,
+              "quantile_q_est": 1.0183327198028564,
+              "quantile_constraint_prob": 0.913,
+              "diagnostic_environment_cost_discounted_mean": 5.646324109793517,
+              "diagnostic_environment_cost_raw_mean": 81.007,
+              "diagnostic_environment_cost_quantile_linear": 51.0,
+              "diagnostic_reward_critic_calibration": null,
+              "diagnostic_reward_critic_failure_probability": null,
+              "diagnostic_reward_critic_mean": null,
+              "diagnostic_reward_critic_std": null,
+              "return_variance": 0.4135452218767455
+            },
+            "step_clocks": {
+              "main_env_steps": 5000000,
+              "initialization_env_steps": 0,
+              "actual_env_steps": 5000000
+            }
+          },
+          "selected": {
+            "checkpoint": "/vepfs-mlp2/c20250510/251204033/Risk-aware-RL/Quantile-based-Policy-Optimization/safety_gym_env/_runs/binding_q2p3_qref_dqc_context_seed0_v1/checkpoints/qrefctx23s0/main5m/best.pt",
+            "checkpoint_iteration": 199,
+            "sha256": "3d3aff1864e6334586a859908a610b18410e43e386c5909027b3082ed72db790",
+            "metrics": {
+              "num_episodes": 1000,
+              "mean": 1.5038997958302498,
+              "reward_std": 0.6430748182573669,
+              "quantile_return": 1.0183327198028564,
+              "worst_5pct": 0.41555177211761474,
+              "minimum_return": 0.07358263432979584,
+              "maximum_return": 6.042981147766113,
+              "return_threshold": 2.3,
+              "failure_count": 913,
+              "empirical_prob": 0.913,
+              "constraint_residual": 0.7130000000000001,
+              "constraint_margin": -0.7130000000000001,
+              "feasible": false,
+              "wilson95_low": 0.8939135189433066,
+              "wilson95_high": 0.928925578547625,
+              "ties_at_threshold": 0,
+              "near_threshold_radius": 0.023,
+              "near_threshold_count": 8,
+              "quantile_margin_to_threshold": -1.2816672801971434,
+              "quantile_q_est": 1.0183327198028564,
+              "quantile_constraint_prob": 0.913,
+              "diagnostic_environment_cost_discounted_mean": 5.646324109793517,
+              "diagnostic_environment_cost_raw_mean": 81.007,
+              "diagnostic_environment_cost_quantile_linear": 51.0,
+              "diagnostic_reward_critic_calibration": null,
+              "diagnostic_reward_critic_failure_probability": null,
+              "diagnostic_reward_critic_mean": null,
+              "diagnostic_reward_critic_std": null,
+              "return_variance": 0.4135452218767455
+            },
+            "step_clocks": {
+              "main_env_steps": 5000000,
+              "initialization_env_steps": 0,
+              "actual_env_steps": 5000000
+            }
+          }
+        },
+        "main10m": {
+          "endpoint": {
+            "checkpoint": "/vepfs-mlp2/c20250510/251204033/Risk-aware-RL/Quantile-based-Policy-Optimization/safety_gym_env/_runs/binding_q2p3_qref_dqc_context_seed0_v1/checkpoints/qrefctx23s0/live/latest.pt",
+            "checkpoint_iteration": 399,
+            "sha256": "299bcad7eda52488501ef516c9b43a83a398c22cf1c2df592e35ce08f7247640",
+            "metrics": {
+              "num_episodes": 1000,
+              "mean": 2.4225914818197487,
+              "reward_std": 0.7207825571865664,
+              "quantile_return": 1.929691982269287,
+              "worst_5pct": 1.2308460476994514,
+              "minimum_return": 0.24661849439144135,
+              "maximum_return": 7.442510604858398,
+              "return_threshold": 2.3,
+              "failure_count": 506,
+              "empirical_prob": 0.506,
+              "constraint_residual": 0.306,
+              "constraint_margin": -0.306,
+              "feasible": false,
+              "wilson95_low": 0.47504885836338107,
+              "wilson95_high": 0.5369052205347923,
+              "ties_at_threshold": 0,
+              "near_threshold_radius": 0.023,
+              "near_threshold_count": 38,
+              "quantile_margin_to_threshold": -0.37030801773071276,
+              "quantile_q_est": 1.929691982269287,
+              "quantile_constraint_prob": 0.506,
+              "diagnostic_environment_cost_discounted_mean": 7.317199325011112,
+              "diagnostic_environment_cost_raw_mean": 113.55,
+              "diagnostic_environment_cost_quantile_linear": 89.0,
+              "diagnostic_reward_critic_calibration": null,
+              "diagnostic_reward_critic_failure_probability": null,
+              "diagnostic_reward_critic_mean": null,
+              "diagnostic_reward_critic_std": null,
+              "return_variance": 0.5195274947444058
+            },
+            "step_clocks": {
+              "main_env_steps": 10000000,
+              "initialization_env_steps": 0,
+              "actual_env_steps": 10000000
+            }
+          },
+          "selected": {
+            "checkpoint": "/vepfs-mlp2/c20250510/251204033/Risk-aware-RL/Quantile-based-Policy-Optimization/safety_gym_env/_runs/binding_q2p3_qref_dqc_context_seed0_v1/checkpoints/qrefctx23s0/live/best.pt",
+            "checkpoint_iteration": 399,
+            "sha256": "06c7063692baa438c0e58158173568c45961518115763db4108ddb4eb1bf62b8",
+            "metrics": {
+              "num_episodes": 1000,
+              "mean": 2.4225914818197487,
+              "reward_std": 0.7207825571865664,
+              "quantile_return": 1.929691982269287,
+              "worst_5pct": 1.2308460476994514,
+              "minimum_return": 0.24661849439144135,
+              "maximum_return": 7.442510604858398,
+              "return_threshold": 2.3,
+              "failure_count": 506,
+              "empirical_prob": 0.506,
+              "constraint_residual": 0.306,
+              "constraint_margin": -0.306,
+              "feasible": false,
+              "wilson95_low": 0.47504885836338107,
+              "wilson95_high": 0.5369052205347923,
+              "ties_at_threshold": 0,
+              "near_threshold_radius": 0.023,
+              "near_threshold_count": 38,
+              "quantile_margin_to_threshold": -0.37030801773071276,
+              "quantile_q_est": 1.929691982269287,
+              "quantile_constraint_prob": 0.506,
+              "diagnostic_environment_cost_discounted_mean": 7.317199325011112,
+              "diagnostic_environment_cost_raw_mean": 113.55,
+              "diagnostic_environment_cost_quantile_linear": 89.0,
+              "diagnostic_reward_critic_calibration": null,
+              "diagnostic_reward_critic_failure_probability": null,
+              "diagnostic_reward_critic_mean": null,
+              "diagnostic_reward_critic_std": null,
+              "return_variance": 0.5195274947444058
+            },
+            "step_clocks": {
+              "main_env_steps": 10000000,
+              "initialization_env_steps": 0,
+              "actual_env_steps": 10000000
+            }
+          }
+        }
+      }
+    }
+  }
+}

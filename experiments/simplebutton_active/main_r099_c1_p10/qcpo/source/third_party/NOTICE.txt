@@ -1,0 +1,6 @@
+TQPO and rlpyt reference files are redistributed under their accompanying licenses.
+TQPO commit: bdcd03fe1144ecf2018ec889ea9aad4eb5a9dc89
+rlpyt commit: f04f23db1eb7b5915d88401fca67869968a07a37
+QCPO adapted mathematical routines: commit 9e633849154e7f2471bf98709bcc8ba83514708e.
+The corresponding licenses and upstream attribution are retained.
+Source provenance records original snapshots and changes in this artifact.

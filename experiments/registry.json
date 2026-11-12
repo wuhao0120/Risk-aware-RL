@@ -1,0 +1,310 @@
+{
+  "dynamic-baseline-dca": {
+    "source": "experiments/dynamic_all1_b25_p20/dca/source",
+    "environment": "Dynamic",
+    "method": "dca",
+    "reward_gamma": 1.0,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.2,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 25,
+    "batches": 400,
+    "arm": "schemeb_raw_mean100_lambda_norm",
+    "divisor": 100,
+    "seeds": [
+      0,
+      1
+    ],
+    "checkpoints": [
+      5000000,
+      10000000
+    ],
+    "status": "baseline"
+  },
+  "dynamic-baseline-qcpo": {
+    "source": "experiments/dynamic_all1_b25_p20/qcpo/source",
+    "environment": "Dynamic",
+    "method": "qcpo",
+    "reward_gamma": 1.0,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.2,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 25,
+    "batches": 400,
+    "arm": null,
+    "divisor": null,
+    "seeds": [
+      0,
+      1
+    ],
+    "checkpoints": [
+      5000000,
+      10000000
+    ],
+    "status": "baseline"
+  },
+  "dynamic-baseline-tqpo": {
+    "source": "experiments/dynamic_all1_b25_p20/tqpo/source",
+    "environment": "Dynamic",
+    "method": "tqpo",
+    "reward_gamma": 1.0,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.2,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 25,
+    "batches": 400,
+    "arm": null,
+    "divisor": null,
+    "seeds": [
+      0,
+      1
+    ],
+    "checkpoints": [
+      5000000,
+      10000000
+    ],
+    "status": "baseline",
+    "supports_batches": true
+  },
+  "dynamic-dca_div25": {
+    "source": "experiments/dynamic_scale_batch_followup/dca_div25/source",
+    "environment": "Dynamic",
+    "method": "dca",
+    "reward_gamma": 1.0,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.2,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 25,
+    "batches": 400,
+    "arm": "schemeb_raw_mean25_lambda_norm",
+    "divisor": 25,
+    "seeds": [
+      0,
+      1
+    ],
+    "checkpoints": [
+      5000000,
+      10000000
+    ],
+    "status": "current"
+  },
+  "dynamic-dca_div200": {
+    "source": "experiments/dynamic_scale_batch_followup/dca_div200/source",
+    "environment": "Dynamic",
+    "method": "dca",
+    "reward_gamma": 1.0,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.2,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 25,
+    "batches": 400,
+    "arm": "schemeb_raw_mean200_lambda_norm",
+    "divisor": 200,
+    "seeds": [
+      0,
+      1
+    ],
+    "checkpoints": [
+      5000000,
+      10000000
+    ],
+    "status": "current"
+  },
+  "dynamic-tqpo_b12": {
+    "source": "experiments/dynamic_scale_batch_followup/tqpo_b12/source",
+    "environment": "Dynamic",
+    "method": "tqpo",
+    "reward_gamma": 1.0,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.2,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 12,
+    "batches": 834,
+    "arm": null,
+    "divisor": null,
+    "seeds": [
+      0,
+      1
+    ],
+    "checkpoints": [
+      5004000,
+      10008000
+    ],
+    "status": "current",
+    "supports_batches": true
+  },
+  "simplebutton-main_r099_c1_p10-dca": {
+    "source": "experiments/simplebutton_active/main_r099_c1_p10/dca/source",
+    "environment": "SimpleButton",
+    "method": "dca",
+    "reward_gamma": 0.99,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.1,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 12,
+    "batches": 834,
+    "arm": "schemeb_raw_mean25_lambda_norm",
+    "divisor": 25,
+    "seeds": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "checkpoints": [
+      5004000,
+      10008000
+    ],
+    "status": "current",
+    "supports_batches": false
+  },
+  "simplebutton-main_r099_c1_p10-qcpo": {
+    "source": "experiments/simplebutton_active/main_r099_c1_p10/qcpo/source",
+    "environment": "SimpleButton",
+    "method": "qcpo",
+    "reward_gamma": 0.99,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.1,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 12,
+    "batches": 834,
+    "arm": null,
+    "divisor": null,
+    "seeds": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "checkpoints": [
+      5004000,
+      10008000
+    ],
+    "status": "current",
+    "supports_batches": false
+  },
+  "simplebutton-main_r099_c1_p10-tqpo": {
+    "source": "experiments/simplebutton_active/main_r099_c1_p10/tqpo/source",
+    "environment": "SimpleButton",
+    "method": "tqpo",
+    "reward_gamma": 0.99,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.1,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 12,
+    "batches": 834,
+    "arm": null,
+    "divisor": null,
+    "seeds": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "checkpoints": [
+      5004000,
+      10008000
+    ],
+    "status": "current",
+    "supports_batches": false
+  },
+  "simplebutton-main_r099_c1_p20-dca": {
+    "source": "experiments/simplebutton_active/main_r099_c1_p20/dca/source",
+    "environment": "SimpleButton",
+    "method": "dca",
+    "reward_gamma": 0.99,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.2,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 12,
+    "batches": 834,
+    "arm": "schemeb_raw_mean25_lambda_norm",
+    "divisor": 25,
+    "seeds": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "checkpoints": [
+      5004000,
+      10008000
+    ],
+    "status": "current",
+    "supports_batches": false
+  },
+  "simplebutton-main_r099_c1_p20-qcpo": {
+    "source": "experiments/simplebutton_active/main_r099_c1_p20/qcpo/source",
+    "environment": "SimpleButton",
+    "method": "qcpo",
+    "reward_gamma": 0.99,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.2,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 12,
+    "batches": 834,
+    "arm": null,
+    "divisor": null,
+    "seeds": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "checkpoints": [
+      5004000,
+      10008000
+    ],
+    "status": "current",
+    "supports_batches": false
+  },
+  "simplebutton-main_r099_c1_p20-tqpo": {
+    "source": "experiments/simplebutton_active/main_r099_c1_p20/tqpo/source",
+    "environment": "SimpleButton",
+    "method": "tqpo",
+    "reward_gamma": 0.99,
+    "cost_gamma": 1.0,
+    "dual_gamma": 1.0,
+    "epsilon": 0.2,
+    "threshold": 15,
+    "horizon": 1000,
+    "batch": 12,
+    "batches": 834,
+    "arm": null,
+    "divisor": null,
+    "seeds": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "checkpoints": [
+      5004000,
+      10008000
+    ],
+    "status": "current",
+    "supports_batches": false
+  }
+}

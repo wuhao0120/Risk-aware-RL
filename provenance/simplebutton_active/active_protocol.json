@@ -1,0 +1,10 @@
+{
+  "user_scope": "SimpleButton only: reward gamma .99, actor cost1, lambda cost1, eps.1/.2; B12 DCA, QCPO, fixed TQPO;4seeds",
+  "total_results": 24,
+  "pending_new_qcpo_training": false,
+  "cancelled_reward_gamma1": true,
+  "cancelled_all_discounted": true,
+  "dynamic_stopped": true,
+  "adopt_current_jobs_without_interruption": true,
+  "time": "2026-11-12T04:11:04.487879+00:00"
+}
